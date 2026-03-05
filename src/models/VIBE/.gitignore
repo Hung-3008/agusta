@@ -1,0 +1,31 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+
+# Virtual environments
+*.venv
+
+# IDE and editor files
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# Data files
+data/
+runs/
+
+# ignore env script
+env.sh
+*/wandb/*
+*/checkpoints/*
+*/submissions/*
+*/job_logs/*
+*.out*
+*.out
+*.err*
+*.err
