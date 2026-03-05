@@ -157,7 +157,7 @@ def extract_features_for_clip(
     np.ndarray
         Features with shape (num_layers, dim, num_timepoints_at_2Hz)
     """
-    from moviepy.editor import VideoFileClip
+    from moviepy import VideoFileClip
 
     logger.info("Processing: %s", video_path)
 

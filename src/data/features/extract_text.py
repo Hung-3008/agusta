@@ -340,7 +340,7 @@ def list_transcript_splits(stimuli_dir: str, movie_type: str, stimulus_type: str
 
 def get_video_duration(stimuli_dir: str, movie_type: str, stimulus_type: str, split_name: str) -> float | None:
     """Try to get the video duration for a matching movie split."""
-    from moviepy.editor import VideoFileClip
+    from moviepy import VideoFileClip
 
     movie_dir = os.path.join(stimuli_dir, "movies", movie_type, stimulus_type)
     mkv_path = os.path.join(movie_dir, f"{split_name}.mkv")
