@@ -126,10 +126,10 @@ class LlamaExtractor:
             for j, target_word in enumerate(batch_words):
                 hidden_state = hidden_states[:, j]  # (num_layers, tokens, dim)
 
-                # Remove padding
-                n_pads = (inputs["input_ids"][j].cpu() == self.pad_id).sum().item()
-                if n_pads:
-                    hidden_state = hidden_state[:, :-n_pads]
+                # Remove padding using attention_mask (correct for both
+                # left-padding and right-padding tokenizers like LLaMA)
+                mask = inputs["attention_mask"][j].cpu().bool()
+                hidden_state = hidden_state[:, mask]  # (num_layers, real_tokens, dim)
 
                 # Select tokens corresponding to the target word
                 # (last N tokens where N = number of tokens in the target word)
@@ -199,7 +199,8 @@ def build_word_contexts(df: pd.DataFrame, max_context_words: int = 200) -> tuple
 
         # Split text into words if it contains multiple words
         text_words = str(text).strip().split()
-        for w in text_words:
+        n_words_in_row = len(text_words)
+        for widx, w in enumerate(text_words):
             w = w.strip()
             if not w:
                 continue
@@ -207,8 +208,15 @@ def build_word_contexts(df: pd.DataFrame, max_context_words: int = 200) -> tuple
             context = " ".join(all_words_so_far[-max_context_words:])
             words.append(w)
             contexts.append(context)
-            word_onsets.append(float(onset))
-            word_durations.append(float(dur) if not pd.isna(dur) else 0.0)
+            # Distribute onsets evenly when a row contains multiple words
+            if n_words_in_row > 1 and not pd.isna(dur) and dur > 0:
+                word_onset = onset + dur * widx / n_words_in_row
+                word_dur = dur / n_words_in_row
+            else:
+                word_onset = onset
+                word_dur = float(dur) if not pd.isna(dur) else 0.0
+            word_onsets.append(float(word_onset))
+            word_durations.append(word_dur)
 
     return words, contexts, word_onsets, word_durations
 
@@ -258,22 +266,10 @@ def align_to_timepoints(
         if bin_features:
             output[:, :, t] = np.mean(bin_features, axis=0)
 
-    # Forward-fill NaN values (carry last word embedding until new words appear)
-    for l in range(num_layers):
-        for d in range(dim):
-            series = output[l, d, :]
-            # Find first non-NaN and fill before it with zeros
-            non_nan_idx = np.where(~np.isnan(series))[0]
-            if len(non_nan_idx) > 0:
-                first_valid = non_nan_idx[0]
-                series[:first_valid] = 0.0
-                # Forward fill
-                for t in range(1, num_timepoints):
-                    if np.isnan(series[t]):
-                        series[t] = series[t - 1]
-            else:
-                series[:] = 0.0
-            output[l, d, :] = series
+    # Fill empty time bins with zeros — silence periods should have zero
+    # text features (matches original TimedArray(aggregation="sum") behavior
+    # which starts from zeros for bins without word events)
+    np.nan_to_num(output, nan=0.0, copy=False)
 
     return output.astype(np.float32)
 
