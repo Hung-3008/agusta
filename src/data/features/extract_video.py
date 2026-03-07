@@ -110,10 +110,14 @@ def extract_features_for_clip(
 ) -> np.ndarray:
     """Extract V-JEPA 2 features for a single video clip.
 
-    Optimizations vs original:
-    1. Uses decord at 16fps (not moviepy at 30fps) → ~14GB vs 27GB RAM
-    2. Precomputes all frame indices upfront as numpy operations
-    3. Deduplicates frames within each batch (adjacent timepoints share ~87%)
+    Uses lazy per-batch frame reading to keep RAM usage low (~2-3GB instead
+    of loading entire video which can exceed 80GB+ for long clips).
+
+    For each batch of timepoints:
+      1. Compute which raw frame indices are needed (64 per timepoint)
+      2. Deduplicate (adjacent timepoints share ~87% of frames)
+      3. Read only unique frames from disk via decord seek
+      4. Assemble per-timepoint frame arrays and run GPU inference
 
     Parameters
     ----------
@@ -136,22 +140,6 @@ def extract_features_for_clip(
     duration = total_frames / native_fps
     logger.info("  Video: %.1fs, %.1f fps, %d frames", duration, native_fps, total_frames)
 
-    # Pre-read frames at reduced fps; 32fps gives margin for V-JEPA's 16fps need
-    target_fps = min(native_fps, 32.0)
-    step = max(1, round(native_fps / target_fps))
-    read_indices = list(range(0, total_frames, step))
-    num_read = len(read_indices)
-
-    logger.info("  Pre-reading %d frames at ~%.0f fps (step=%d)...",
-                num_read, native_fps / step, step)
-    all_frames = vr.get_batch(read_indices).asnumpy()  # (N, H, W, 3)
-    frame_times = np.array(read_indices, dtype=np.float64) / native_fps
-    logger.info("  Pre-read %d frames (%.1f MB in RAM)",
-                num_read, all_frames.nbytes / 1e6)
-
-    # Free the video reader
-    del vr
-
     # Number of output timepoints at SAMPLE_FREQ Hz
     num_timepoints = max(1, int(duration * SAMPLE_FREQ))
     times = np.linspace(0, duration, num_timepoints + 1)[1:]
@@ -161,12 +149,16 @@ def extract_features_for_clip(
                          for k in reversed(range(extractor.num_frames))])
 
     # Precompute ALL frame indices at once via numpy broadcasting
-    # Shape: (num_timepoints, NUM_FRAMES)
+    # wanted_times[t, f] = the timestamp of frame f for timepoint t
     wanted_times = times[:, None] - subtimes[None, :]  # (T, 64)
-    # Map wanted times to indices in all_frames via searchsorted
-    frame_idx = np.searchsorted(frame_times, wanted_times.ravel(), side='right') - 1
-    frame_idx = np.clip(frame_idx, 0, num_read - 1).reshape(num_timepoints, NUM_FRAMES)
-    logger.info("  Precomputed %d × %d frame index matrix", *frame_idx.shape)
+    # Map wanted times → raw frame indices (clipped to valid range)
+    raw_frame_idx = np.clip(
+        np.round(wanted_times * native_fps).astype(np.int64),
+        0, total_frames - 1,
+    )  # (num_timepoints, NUM_FRAMES)
+
+    logger.info("  Precomputed %d × %d frame index matrix", *raw_frame_idx.shape)
+    logger.info("  Using LAZY per-batch frame reading (low RAM)")
 
     output = None
     num_batches = (num_timepoints + batch_timepoints - 1) // batch_timepoints
@@ -178,10 +170,19 @@ def extract_features_for_clip(
         leave=False,
     ):
         batch_end = min(batch_start + batch_timepoints, num_timepoints)
-        batch_idx = frame_idx[batch_start:batch_end]  # (B, 64)
+        batch_idx = raw_frame_idx[batch_start:batch_end]  # (B, 64)
 
-        # Gather frames using precomputed indices (fast numpy indexing)
-        batch_frames_list = [all_frames[batch_idx[i]] for i in range(batch_end - batch_start)]
+        # --- Deduplicate: read each unique frame only once ---
+        unique_indices = np.unique(batch_idx)
+        frames_batch = vr.get_batch(unique_indices.tolist()).asnumpy()  # (U, H, W, 3)
+        # Build lookup: raw_frame_index → position in frames_batch
+        idx_to_pos = {idx: pos for pos, idx in enumerate(unique_indices)}
+
+        # Assemble per-timepoint frame arrays using the lookup
+        batch_frames_list = []
+        for i in range(batch_end - batch_start):
+            positions = [idx_to_pos[fi] for fi in batch_idx[i]]
+            batch_frames_list.append(frames_batch[positions])  # (64, H, W, 3)
 
         # Batched forward pass
         hidden = extractor.extract_hidden_states(batch_frames_list)  # (B, L, D)
@@ -193,11 +194,11 @@ def extract_features_for_clip(
         output[batch_start:batch_end] = embds
 
         # Cleanup
-        del batch_frames_list, hidden, embds
+        del batch_frames_list, frames_batch, hidden, embds
         if batch_start % (batch_timepoints * 10) == 0:
             torch.cuda.empty_cache()
 
-    del all_frames
+    del vr
     gc.collect()
 
     # Transpose: (T, L, D) → (L, D, T)
