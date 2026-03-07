@@ -1,0 +1,79 @@
+# =============================================================================
+# Data Configuration for Sliding Window fMRI Encoding
+# =============================================================================
+
+# --- Paths ---
+data_root: "Data"  # relative to project root
+
+fmri:
+  dir: "algonauts_2025.competitors/fmri"
+  # File pattern: {dir}/{subject}/func/{subject}_task-{task}_..._bold.h5
+  # Friends file has suffix: _desc-s123456_bold.h5 (all sessions merged)
+  # Movie10 file has suffix: _bold.h5
+  atlas: "Schaefer18_parcel-1000Par7Net"
+  n_voxels: 1000
+  tr: 1.49  # seconds
+
+features:
+  dir: "features"
+  sample_freq: 2.0  # Hz — all features are extracted at this rate
+  modalities:
+    video:
+      subdir: "video"
+      file_pattern: "{movie_type}_{stimulus_type}_features_vjepa2.h5"
+      h5_key: "video"
+    audio:
+      subdir: "audio"
+      file_pattern: "{movie_type}_{stimulus_type}_features_w2vbert.h5"
+      h5_key: "audio"
+    text:
+      subdir: "text"
+      file_pattern: "{movie_type}_{stimulus_type}_features_llama3.h5"
+      h5_key: "text"
+    # Unified multimodal features from Qwen2.5-Omni-7B
+    omni:
+      subdir: "omni"
+      file_pattern: "{movie_type}_{stimulus_type}_features_qwen_omni.h5"
+      h5_key: "omni"
+      tr_aligned: true  # already 1 sample per TR, no resampling needed
+
+# --- Sliding Window Parameters ---
+sliding_window:
+  context_duration: 14.9   # seconds (= 10 TRs), covers HRF delays 4-12s
+  stride: 1.49             # seconds (= 1 TR)
+  # No fixed HRF delay — model learns temporal relationships
+
+# --- Subjects ---
+subjects:
+  - "sub-01"
+  - "sub-02"
+  - "sub-03"
+  - "sub-05"
+
+# --- Dataset Splits ---
+splits:
+  # Friends s1-s6 → train, s7 → test (no fMRI available)
+  friends:
+    train: ["s1", "s2", "s3", "s4", "s5", "s6"]
+    test: ["s7"]
+  movie10:
+    train: ["bourne", "wolf", "life", "figures"]
+
+# Train/val split ratio (from train set, random by clip)
+val_ratio: 0.1
+
+# --- Preprocessing ---
+preprocessing:
+  fmri:
+    standardize: "zscore_sample"  # per-clip z-score (matches nilearn)
+    detrend: false
+    high_pass: null
+  features:
+    layer_indices: null  # null = use all layers; or list like [0.5, 0.75, 1.0]
+
+# --- DataLoader ---
+dataloader:
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
