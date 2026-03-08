@@ -14,6 +14,7 @@ Design principles:
 import hashlib
 import logging
 import random
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
@@ -26,6 +27,55 @@ import yaml
 from torch.utils.data import DataLoader, Dataset
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# LRU Cache with byte-level size limit
+# =============================================================================
+
+class LRUCache:
+    """Thread-unsafe LRU cache with a hard byte-size cap.
+
+    Entries are numpy arrays; size is tracked via array.nbytes.
+    Oldest entries are evicted when total size exceeds max_bytes.
+    """
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self._cache: OrderedDict = OrderedDict()
+        self._nbytes: dict = {}
+        self._total: int = 0
+
+    def get(self, key):
+        if key not in self._cache:
+            return None
+        self._cache.move_to_end(key)   # mark as recently used
+        return self._cache[key]
+
+    def put(self, key, value):
+        size = value.nbytes
+        if key in self._cache:
+            self._total -= self._nbytes.pop(key)
+            del self._cache[key]
+        # Evict LRU entries until there is room
+        while self._cache and self._total + size > self.max_bytes:
+            old_key, _ = self._cache.popitem(last=False)
+            self._total -= self._nbytes.pop(old_key)
+        self._cache[key] = value
+        self._nbytes[key] = size
+        self._total += size
+
+    def __contains__(self, key):
+        return key in self._cache
+
+    @property
+    def used_gb(self) -> float:
+        return self._total / 1e9
+
+    def clear(self):
+        self._cache.clear()
+        self._nbytes.clear()
+        self._total = 0
 
 
 # =============================================================================
@@ -49,6 +99,12 @@ def resolve_paths(cfg: dict, project_root: str | Path) -> dict:
     cfg["_data_root"] = str(project_root / cfg["data_root"])
     cfg["_fmri_dir"] = str(project_root / cfg["data_root"] / cfg["fmri"]["dir"])
     cfg["_features_dir"] = str(project_root / cfg["data_root"] / cfg["features"]["dir"])
+    # Optional NPY features directory (faster loading than H5)
+    npy_subdir = cfg["features"].get("npy_dir")
+    if npy_subdir:
+        cfg["_features_npy_dir"] = str(project_root / cfg["data_root"] / npy_subdir)
+    else:
+        cfg["_features_npy_dir"] = None
     return cfg
 
 
@@ -116,12 +172,17 @@ def load_fmri_clip(
     # Data from h5 is always (n_trs, n_voxels) — transpose to (n_voxels, n_trs)
     data = data.T
 
+    # Replace any NaN/Inf in raw data before normalization
+    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+
     # Z-score normalize per clip (matches nilearn standardize="zscore_sample")
     if standardize:
         mean = data.mean(axis=1, keepdims=True)
         std = data.std(axis=1, keepdims=True)
         std = np.where(std < 1e-8, 1.0, std)
         data = (data - mean) / std
+        # Clamp any residual NaNs (e.g. all-zero voxels)
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
 
     return data
 
@@ -137,6 +198,7 @@ def load_feature_clip(
     movie_type: str,
     stimulus_type: str,
     clip_name: str,
+    layer_aggregation: str = "last",
 ) -> np.ndarray:
     """Load pre-extracted features for a single clip.
 
@@ -145,24 +207,25 @@ def load_feature_clip(
     features_dir : str
         Root features directory.
     modality : str
-        Modality name: 'video', 'audio', 'text'.
+        Modality name: 'video', 'audio', 'text', 'omni'.
     modality_cfg : dict
         Modality config from data.yaml.
-    movie_type : str
-        E.g. 'friends', 'movie10'.
-    stimulus_type : str
-        E.g. 's1', 'bourne'.
-    clip_name : str
-        Clip stem name, e.g. 'friends_s01e01a'.
+    movie_type, stimulus_type, clip_name : str
+        E.g. 'friends', 's1', 'friends_s01e01a'.
+    layer_aggregation : str
+        How to aggregate/select across layers: 'last' or 'mean'.
 
     Returns
     -------
     np.ndarray
-        Shape (n_layers, dim, n_timepoints) at 2Hz, float32.
+        Shape (1, dim, n_timepoints) at sample_freq, float32.
+        For omni (data_format: tr_tokens_dim): shape is (1, dim, n_trs) after
+        mean-pooling tokens.
     """
     subdir = modality_cfg["subdir"]
     pattern = modality_cfg["file_pattern"]
     h5_key = modality_cfg["h5_key"]
+    data_format = modality_cfg.get("data_format", "layers_dim_tr")
 
     filename = pattern.format(movie_type=movie_type, stimulus_type=stimulus_type)
     h5_path = Path(features_dir) / subdir / filename
@@ -171,12 +234,69 @@ def load_feature_clip(
         raise FileNotFoundError(f"Feature file not found: {h5_path}")
 
     with h5py.File(h5_path, "r") as f:
-        if clip_name not in f:
-            raise KeyError(f"Clip '{clip_name}' not found in {h5_path}. "
-                           f"Available: {list(f.keys())[:5]}...")
-        data = f[clip_name][h5_key][:].astype(np.float32)
+        # Try exact clip_name first, then prefixed variants
+        # (text extractor uses 'movie10_bourne01' while others use 'bourne01')
+        actual_key = None
+        candidates = [
+            clip_name,
+            f"{movie_type}_{clip_name}",   # e.g. 'movie10_bourne01'
+        ]
+        for cand in candidates:
+            if cand in f:
+                actual_key = cand
+                break
+        if actual_key is None:
+            raise KeyError(
+                f"Clip '{clip_name}' not found in {h5_path}. "
+                f"Tried: {candidates}. Available: {list(f.keys())[:5]}..."
+            )
+        data = f[actual_key][h5_key][:].astype(np.float32)
 
-    return data  # (n_layers, dim, n_timepoints)
+    if data_format == "tr_tokens_dim":
+        # omni: shape (n_trs, n_tokens, dim) → mean-pool tokens → (n_trs, dim)
+        # Transpose to (1, dim, n_trs) to match standard format
+        T, N, D = data.shape
+        data = data.mean(axis=1)  # (n_trs, dim)
+        data = data.T[np.newaxis]  # (1, dim, n_trs)
+    else:
+        # Standard: (n_layers, dim, n_timepoints)
+        # Apply layer aggregation to get (1, dim, n_timepoints)
+        if layer_aggregation == "last":
+            data = data[-1:, :, :]   # keep last layer: (1, dim, T)
+        elif layer_aggregation == "mean":
+            data = data.mean(axis=0, keepdims=True)  # (1, dim, T)
+        # else: keep all layers as-is
+
+    return np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)  # (1, dim, n_timepoints)
+
+
+def load_feature_clip_npy(
+    features_npy_dir: str,
+    modality: str,
+    modality_cfg: dict,
+    movie_type: str,
+    stimulus_type: str,
+    clip_name: str,
+) -> np.ndarray | None:
+    """Load pre-converted NPY feature for a single clip.
+
+    NPY files are produced by convert_h5_to_npy.py with layer mean-pooling.
+    Shape on disk: (dim, n_timepoints), float32.
+    Returns (1, dim, n_timepoints) to match H5 loader output, or None if not found.
+    """
+    subdir = modality_cfg["subdir"]
+    pattern = modality_cfg["file_pattern"]
+    # stem of H5 filename without extension, e.g. 'friends_s1_features_vjepa2'
+    h5_stem = pattern.format(
+        movie_type=movie_type, stimulus_type=stimulus_type
+    ).replace(".h5", "")
+
+    npy_path = Path(features_npy_dir) / subdir / h5_stem / f"{clip_name}.npy"
+    if not npy_path.exists():
+        return None
+
+    data = np.load(npy_path)  # (dim, n_trs)
+    return data[np.newaxis]   # (1, dim, n_trs)
 
 
 def resample_features_to_tr(
@@ -190,7 +310,7 @@ def resample_features_to_tr(
     Parameters
     ----------
     features : np.ndarray
-        Shape (n_layers, dim, n_timepoints_at_feature_freq).
+        Shape (1, dim, n_timepoints_at_feature_freq).
     feature_freq : float
         Original sampling frequency (Hz), e.g. 2.0.
     tr : float
@@ -201,7 +321,7 @@ def resample_features_to_tr(
     Returns
     -------
     np.ndarray
-        Shape (n_layers, dim, n_trs), resampled to TR grid.
+        Shape (1, dim, n_trs), resampled to TR grid.
     """
     L, D, T_orig = features.shape
 
@@ -225,20 +345,18 @@ def _clip_name_to_fmri_key(clip_name: str, task: str) -> str:
     """Convert clip stem name to fMRI h5 key.
 
     Examples:
-        friends_s01e01a (task=friends) → 01a
+        friends_s01e01a (task=friends) → s01e01a
         movie10_bourne01 (task=movie10) → bourne01
     """
     if task == "friends":
-        # friends_s01e01a → extract "01a" (season + episode + chunk part)
-        # Format: friends_s{SS}e{EE}{chunk}
-        parts = clip_name.split("_s")[-1]  # e.g. "01e01a"
-        season = parts[:2]  # "01"
-        rest = parts[2:]    # "e01a"
-        ep_chunk = rest[1:]  # "01a" (skip 'e')
-        return ep_chunk
+        # friends_s01e01a → s01e01a
+        prefix = "friends_"
+        if clip_name.startswith(prefix):
+            return clip_name[len(prefix):]
+        return clip_name
     else:
         # movie10_bourne01  → bourne01
-        prefix = f"movie10_"
+        prefix = "movie10_"
         if clip_name.startswith(prefix):
             return clip_name[len(prefix):]
         return clip_name
@@ -343,6 +461,7 @@ class SlidingWindowDataset(Dataset):
         cfg: dict,
         split: str = "train",
         modalities: list[str] | None = None,
+        max_cache_gb: float = 10.0,
     ):
         """
         Parameters
@@ -353,12 +472,16 @@ class SlidingWindowDataset(Dataset):
             Dataset split: 'train', 'val', or 'test'.
         modalities : list[str] or None
             Which modalities to load. None = all available.
+        max_cache_gb : float
+            Maximum RAM to use for the LRU data cache (default 10 GB).
+            Oldest clip data is evicted when the limit is exceeded.
         """
         self.cfg = cfg
         self.split = split
         self.tr = cfg["fmri"]["tr"]
         self.n_voxels = cfg["fmri"]["n_voxels"]
         self.feature_freq = cfg["features"]["sample_freq"]
+        self.layer_aggregation = cfg["features"].get("layer_aggregation", "last")
 
         sw = cfg["sliding_window"]
         self.context_duration = sw["context_duration"]
@@ -372,6 +495,7 @@ class SlidingWindowDataset(Dataset):
 
         self.fmri_dir = cfg["_fmri_dir"]
         self.features_dir = cfg["_features_dir"]
+        self.features_npy_dir = cfg.get("_features_npy_dir")  # None if not configured
         self.standardize = cfg["preprocessing"]["fmri"]["standardize"] == "zscore_sample"
 
         # Subject name → integer ID mapping
@@ -395,9 +519,10 @@ class SlidingWindowDataset(Dataset):
             self.context_trs, self.context_duration, self.stride,
         )
 
-        # Caches for loaded data (keyed by clip index)
-        self._fmri_cache: dict[int, np.ndarray] = {}
-        self._feature_cache: dict[tuple[int, str], np.ndarray] = {}
+        # Unified LRU cache for fMRI and features (size-bounded)
+        self._cache = LRUCache(max_bytes=int(max_cache_gb * 1e9))
+        npy_status = f"NPY dir: {self.features_npy_dir}" if self.features_npy_dir else "H5 fallback only"
+        logger.info("LRU data cache: max %.1f GB | %s", max_cache_gb, npy_status)
 
     def _build_sample_index(self) -> list[tuple[int, int]]:
         """Build flattened list of (clip_idx, target_tr) tuples.
@@ -439,63 +564,85 @@ class SlidingWindowDataset(Dataset):
             return None
 
     def _load_fmri(self, clip_idx: int) -> np.ndarray:
-        """Load fMRI for clip (cached)."""
-        if clip_idx not in self._fmri_cache:
+        """Load fMRI for clip (LRU cached)."""
+        key = ("fmri", clip_idx)
+        cached = self._cache.get(key)
+        if cached is None:
             info = self.clip_index[clip_idx]
-            self._fmri_cache[clip_idx] = load_fmri_clip(
+            cached = load_fmri_clip(
                 self.fmri_dir, info["subject"], info["task"],
                 info["fmri_key"], standardize=self.standardize,
             )
-        return self._fmri_cache[clip_idx]
+            self._cache.put(key, cached)
+        return cached
 
     def _load_features(self, clip_idx: int, modality: str) -> np.ndarray:
-        """Load and resample features for clip (cached).
+        """Load and resample features for clip (LRU cached).
 
-        Returns array with shape (n_layers, dim, n_trs) for all modalities.
-        Handles both 2Hz features and TR-aligned features (omni).
+        Returns array with shape (1, dim, n_trs).
         """
-        cache_key = (clip_idx, modality)
-        if cache_key not in self._feature_cache:
-            info = self.clip_index[clip_idx]
-            mod_cfg = self.cfg["features"]["modalities"][modality]
-            raw = load_feature_clip(
-                self.features_dir, modality, mod_cfg,
+        key = ("feat", clip_idx, modality)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+
+        info = self.clip_index[clip_idx]
+        mod_cfg = self.cfg["features"]["modalities"][modality]
+
+        # ── NPY fast path (pre-converted, already mean-pooled, on TR grid) ──
+        if self.features_npy_dir:
+            raw = load_feature_clip_npy(
+                self.features_npy_dir, modality, mod_cfg,
                 info["movie_type"], info["stimulus_type"], info["clip_name"],
+            )  # (1, dim, n_trs) or None
+            if raw is not None:
+                # NPY is already on TR grid; just trim/pad to match fMRI n_trs
+                fmri = self._load_fmri(clip_idx)
+                n_trs = fmri.shape[1]
+                T_feat = raw.shape[2]
+                if T_feat > n_trs:
+                    raw = raw[:, :, :n_trs]
+                elif T_feat < n_trs:
+                    pad = np.zeros((1, raw.shape[1], n_trs - T_feat), dtype=raw.dtype)
+                    raw = np.concatenate([raw, pad], axis=2)
+                self._cache.put(key, raw)
+                return raw
+
+        # ── H5 fallback (with layer aggregation + TR resampling) ──
+        raw = load_feature_clip(
+            self.features_dir, modality, mod_cfg,
+            info["movie_type"], info["stimulus_type"], info["clip_name"],
+            layer_aggregation=self.layer_aggregation,
+        )  # shape: (1, dim, T)
+
+        fmri = self._load_fmri(clip_idx)
+        n_trs = fmri.shape[1]
+
+        data_format = mod_cfg.get("data_format", "layers_dim_tr")
+        if data_format == "tr_tokens_dim":
+            # omni: already on TR grid after load_feature_clip; trim/pad to n_trs
+            T_feat = raw.shape[2]
+            if T_feat > n_trs:
+                resampled = raw[:, :, :n_trs]
+            elif T_feat < n_trs:
+                pad = np.zeros(
+                    (1, raw.shape[1], n_trs - T_feat), dtype=raw.dtype)
+                resampled = np.concatenate([raw, pad], axis=2)
+            else:
+                resampled = raw
+        else:
+            # 2Hz features: resample to TR grid
+            resampled = resample_features_to_tr(
+                raw, self.feature_freq, self.tr, n_trs
             )
 
-            fmri = self._load_fmri(clip_idx)
-            n_trs = fmri.shape[1]
-
-            if mod_cfg.get("tr_aligned", False):
-                # Omni features: (n_TRs, n_layers, hidden_dim)
-                # Transpose to (n_layers, hidden_dim, n_TRs) for consistency
-                if raw.ndim == 3 and raw.shape[0] != raw.shape[2]:
-                    resampled = raw.transpose(1, 2, 0)  # (L, D, T)
-                else:
-                    resampled = raw
-                # Trim or pad to match fMRI TRs
-                if resampled.shape[2] > n_trs:
-                    resampled = resampled[:, :, :n_trs]
-                elif resampled.shape[2] < n_trs:
-                    pad = np.zeros(
-                        (resampled.shape[0], resampled.shape[1],
-                         n_trs - resampled.shape[2]),
-                        dtype=resampled.dtype,
-                    )
-                    resampled = np.concatenate([resampled, pad], axis=2)
-            else:
-                # 2Hz features: (n_layers, dim, n_timepoints) → resample
-                resampled = resample_features_to_tr(
-                    raw, self.feature_freq, self.tr, n_trs
-                )
-
-            self._feature_cache[cache_key] = resampled
-        return self._feature_cache[cache_key]
+        self._cache.put(key, resampled)
+        return resampled
 
     def clear_cache(self):
         """Clear all cached data."""
-        self._fmri_cache.clear()
-        self._feature_cache.clear()
+        self._cache.clear()
+        logger.info("LRU cache cleared")
 
     def __len__(self) -> int:
         return len(self._samples)
@@ -593,7 +740,8 @@ def build_dataloaders(
 
     dl_cfg = cfg.get("dataloader", {})
     batch_size = dl_cfg.get("batch_size", 64)
-    num_workers = dl_cfg.get("num_workers", 4)
+    num_workers = dl_cfg.get("num_workers", 0)
+    max_cache_gb = dl_cfg.get("max_cache_gb", 10.0)
     pin_memory = dl_cfg.get("pin_memory", True)
     prefetch = dl_cfg.get("prefetch_factor", 2)
 
@@ -601,6 +749,7 @@ def build_dataloaders(
     for split in splits:
         dataset = SlidingWindowDataset(
             cfg=cfg, split=split, modalities=modalities,
+            max_cache_gb=max_cache_gb,
         )
         if len(dataset) == 0:
             logger.warning("Empty dataset for split '%s', skipping", split)

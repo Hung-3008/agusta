@@ -1,79 +1,86 @@
 # =============================================================================
-# Data Configuration for Sliding Window fMRI Encoding
+# Data configuration for SlidingWindowDataset
 # =============================================================================
 
-# --- Paths ---
-data_root: "Data"  # relative to project root
+data_root: Data/algonauts_2025.competitors
 
+# fMRI parameters
 fmri:
-  dir: "algonauts_2025.competitors/fmri"
-  # File pattern: {dir}/{subject}/func/{subject}_task-{task}_..._bold.h5
-  # Friends file has suffix: _desc-s123456_bold.h5 (all sessions merged)
-  # Movie10 file has suffix: _bold.h5
-  atlas: "Schaefer18_parcel-1000Par7Net"
-  n_voxels: 1000
-  tr: 1.49  # seconds
+  dir: fmri                           # relative to data_root
+  tr: 1.49                            # Repetition time in seconds
+  n_voxels: 1000                      # Number of voxels (Schaefer 1000 parcels)
 
+# Feature extraction parameters
 features:
-  dir: "features"
-  sample_freq: 2.0  # Hz — all features are extracted at this rate
+  dir: ../features                     # relative to data_root → Data/features
+  npy_dir: ../features_npy             # activated: faster np.load() vs h5py
+  sample_freq: 2.0                     # Features extracted at 2 Hz (except omni which is per-TR)
+
+  # layer_aggregation: how to reduce across the layers dimension
+  # Options: "last" (use last layer), "mean" (mean across layers)
+  layer_aggregation: last
+
   modalities:
     video:
-      subdir: "video"
+      subdir: video
       file_pattern: "{movie_type}_{stimulus_type}_features_vjepa2.h5"
-      h5_key: "video"
+      h5_key: video
+      dim: 1408                        # dim of last layer (41 layers total)
     audio:
-      subdir: "audio"
+      subdir: audio
       file_pattern: "{movie_type}_{stimulus_type}_features_w2vbert.h5"
-      h5_key: "audio"
+      h5_key: audio
+      dim: 1024                        # dim of last layer (25 layers total)
     text:
-      subdir: "text"
+      subdir: text
       file_pattern: "{movie_type}_{stimulus_type}_features_llama3.h5"
-      h5_key: "text"
-    # Unified multimodal features from Qwen2.5-Omni-7B
+      h5_key: text
+      dim: 3072                        # dim of last layer (29 layers total)
     omni:
-      subdir: "omni"
+      subdir: omni
       file_pattern: "{movie_type}_{stimulus_type}_features_qwen_omni.h5"
-      h5_key: "omni"
-      tr_aligned: true  # already 1 sample per TR, no resampling needed
+      h5_key: omni
+      dim: 3584                        # dim per token; 5 tokens → mean-pooled to 3584
+      data_format: tr_tokens_dim       # special: shape is (n_trs, n_tokens, dim) not (n_layers, dim, n_trs)
+      sample_freq: tr                  # sampled at TR not 2Hz
 
-# --- Sliding Window Parameters ---
+# Sliding window parameters
 sliding_window:
-  context_duration: 14.9   # seconds (= 10 TRs), covers HRF delays 4-12s
-  stride: 1.49             # seconds (= 1 TR)
-  # No fixed HRF delay — model learns temporal relationships
+  context_duration: 14.9              # seconds (10 TRs)
+  stride: 1.49                        # seconds (1 TR)
 
-# --- Subjects ---
+# Subjects available
 subjects:
-  - "sub-01"
-  - "sub-02"
-  - "sub-03"
-  - "sub-05"
+  - sub-01
+  - sub-02
+  - sub-03
+  - sub-05
 
-# --- Dataset Splits ---
+# Train / val / test splits
+# Stimulus files are grouped by task → split → stimulus_type
 splits:
-  # Friends s1-s6 → train, s7 → test (no fMRI available)
   friends:
-    train: ["s1", "s2", "s3", "s4", "s5", "s6"]
-    test: ["s7"]
-  movie10:
-    train: ["bourne", "wolf", "life", "figures"]
+    train:
+      - s1
+      - s2
+      - s3
+      - s4
+      - s5
+      - s6
+    test:
+      - s7
 
-# Train/val split ratio (from train set, random by clip)
-val_ratio: 0.1
+val_ratio: 0.1  # 10% of train is used as val (deterministic / hash-based)
 
-# --- Preprocessing ---
+# Preprocessing
 preprocessing:
   fmri:
-    standardize: "zscore_sample"  # per-clip z-score (matches nilearn)
-    detrend: false
-    high_pass: null
-  features:
-    layer_indices: null  # null = use all layers; or list like [0.5, 0.75, 1.0]
+    standardize: zscore_sample
 
-# --- DataLoader ---
+# DataLoader
 dataloader:
-  batch_size: 64
-  num_workers: 4
+  batch_size: 48
+  num_workers: 0     # 0 = single-process; avoids LRU cache duplication across workers
+  max_cache_gb: 10.0 # max RAM for LRU feature+fMRI cache (GB)
   pin_memory: true
   prefetch_factor: 2
