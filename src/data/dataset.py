@@ -199,6 +199,7 @@ def load_feature_clip(
     stimulus_type: str,
     clip_name: str,
     layer_aggregation: str = "last",
+    keep_tokens: bool = False,
 ) -> np.ndarray:
     """Load pre-extracted features for a single clip.
 
@@ -214,13 +215,15 @@ def load_feature_clip(
         E.g. 'friends', 's1', 'friends_s01e01a'.
     layer_aggregation : str
         How to aggregate/select across layers: 'last' or 'mean'.
+    keep_tokens : bool
+        If True and data_format is tr_tokens_dim (omni), keep all tokens
+        instead of mean-pooling. Returns (n_tokens, dim, n_trs).
 
     Returns
     -------
     np.ndarray
-        Shape (1, dim, n_timepoints) at sample_freq, float32.
-        For omni (data_format: tr_tokens_dim): shape is (1, dim, n_trs) after
-        mean-pooling tokens.
+        Standard: shape (1, dim, n_timepoints) at sample_freq, float32.
+        Omni keep_tokens: shape (n_tokens, dim, n_trs), float32.
     """
     subdir = modality_cfg["subdir"]
     pattern = modality_cfg["file_pattern"]
@@ -253,11 +256,15 @@ def load_feature_clip(
         data = f[actual_key][h5_key][:].astype(np.float32)
 
     if data_format == "tr_tokens_dim":
-        # omni: shape (n_trs, n_tokens, dim) → mean-pool tokens → (n_trs, dim)
-        # Transpose to (1, dim, n_trs) to match standard format
-        T, N, D = data.shape
-        data = data.mean(axis=1)  # (n_trs, dim)
-        data = data.T[np.newaxis]  # (1, dim, n_trs)
+        # omni: shape (n_trs, n_tokens, dim)
+        if keep_tokens:
+            # Keep all tokens: (n_trs, n_tokens, dim) → (n_tokens, dim, n_trs)
+            data = data.transpose(1, 2, 0)  # (n_tokens, dim, n_trs)
+        else:
+            # Mean-pool tokens: (n_trs, n_tokens, dim) → (1, dim, n_trs)
+            T, N, D = data.shape
+            data = data.mean(axis=1)  # (n_trs, dim)
+            data = data.T[np.newaxis]  # (1, dim, n_trs)
     else:
         # Standard: (n_layers, dim, n_timepoints)
         # Apply layer aggregation to get (1, dim, n_timepoints)
@@ -277,12 +284,17 @@ def load_feature_clip_npy(
     movie_type: str,
     stimulus_type: str,
     clip_name: str,
+    keep_tokens: bool = False,
 ) -> np.ndarray | None:
     """Load pre-converted NPY feature for a single clip.
 
     NPY files are produced by convert_h5_to_npy.py with layer mean-pooling.
     Shape on disk: (dim, n_timepoints), float32.
     Returns (1, dim, n_timepoints) to match H5 loader output, or None if not found.
+
+    For omni with keep_tokens:
+      If NPY was converted with --keep_omni_tokens, shape is (n_tokens, dim, n_trs).
+      If NPY is old format (dim, n_trs), returns None to trigger H5 fallback.
     """
     subdir = modality_cfg["subdir"]
     pattern = modality_cfg["file_pattern"]
@@ -295,7 +307,16 @@ def load_feature_clip_npy(
     if not npy_path.exists():
         return None
 
-    data = np.load(npy_path)  # (dim, n_trs)
+    data = np.load(npy_path)  # (dim, n_trs) or (n_tokens, dim, n_trs)
+
+    if keep_tokens:
+        # Expect (n_tokens, dim, n_trs) from --keep_omni_tokens conversion
+        if data.ndim == 3:
+            return data  # already (n_tokens, dim, n_trs)
+        else:
+            # Old mean-pooled format (dim, n_trs) — cannot use for keep_tokens
+            return None
+
     return data[np.newaxis]   # (1, dim, n_trs)
 
 
@@ -498,6 +519,12 @@ class SlidingWindowDataset(Dataset):
         self.features_npy_dir = cfg.get("_features_npy_dir")  # None if not configured
         self.standardize = cfg["preprocessing"]["fmri"]["standardize"] == "zscore_sample"
 
+        # Track which modalities use keep_tokens (e.g., omni)
+        self._keep_tokens: dict[str, bool] = {}
+        for mod in self.modalities:
+            mod_cfg = cfg["features"]["modalities"].get(mod, {})
+            self._keep_tokens[mod] = mod_cfg.get("keep_tokens", False)
+
         # Subject name → integer ID mapping
         self.subject_to_id = {
             s: i for i, s in enumerate(cfg["subjects"])
@@ -588,13 +615,15 @@ class SlidingWindowDataset(Dataset):
 
         info = self.clip_index[clip_idx]
         mod_cfg = self.cfg["features"]["modalities"][modality]
+        keep_tokens = self._keep_tokens.get(modality, False)
 
         # ── NPY fast path (pre-converted, already mean-pooled, on TR grid) ──
         if self.features_npy_dir:
             raw = load_feature_clip_npy(
                 self.features_npy_dir, modality, mod_cfg,
                 info["movie_type"], info["stimulus_type"], info["clip_name"],
-            )  # (1, dim, n_trs) or None
+                keep_tokens=keep_tokens,
+            )  # (1, dim, n_trs) or (n_tokens, dim, n_trs) or None
             if raw is not None:
                 # NPY is already on TR grid; just trim/pad to match fMRI n_trs
                 fmri = self._load_fmri(clip_idx)
@@ -613,7 +642,8 @@ class SlidingWindowDataset(Dataset):
             self.features_dir, modality, mod_cfg,
             info["movie_type"], info["stimulus_type"], info["clip_name"],
             layer_aggregation=self.layer_aggregation,
-        )  # shape: (1, dim, T)
+            keep_tokens=keep_tokens,
+        )  # shape: (1, dim, T) or (n_tokens, dim, T) for omni keep_tokens
 
         fmri = self._load_fmri(clip_idx)
         n_trs = fmri.shape[1]
@@ -672,16 +702,31 @@ class SlidingWindowDataset(Dataset):
         for mod in self.modalities:
             try:
                 feat = self._load_features(clip_idx, mod)  # (L, D, T)
+                keep_tokens = self._keep_tokens.get(mod, False)
                 # Crop context window
                 feat_window = feat[:, :, ctx_start:ctx_end]  # (L, D, context_trs)
-                # Flatten layers: (L, D, T) → (T, L*D)
-                L, D, T = feat_window.shape
-                feat_flat = feat_window.reshape(L * D, T).T  # (context_trs, L*D)
+
+                if keep_tokens:
+                    # Omni keep_tokens: (N_tokens, D, ctx) → (ctx * N_tokens, D)
+                    # Interleave: for each timestep, all N tokens appear sequentially
+                    N, D, T = feat_window.shape
+                    # permute to (T, N, D) then reshape to (T*N, D)
+                    feat_flat = feat_window.transpose(2, 0, 1).reshape(T * N, D)
+                else:
+                    # Standard: (L, D, T) → (T, L*D)
+                    L, D, T = feat_window.shape
+                    feat_flat = feat_window.reshape(L * D, T).T  # (context_trs, L*D)
+
                 features[mod] = torch.from_numpy(feat_flat)
             except (FileNotFoundError, KeyError) as e:
                 logger.debug("Missing %s for clip %s: %s", mod, clip_info["clip_name"], e)
                 # Return zeros for missing modalities
-                features[mod] = torch.zeros(self.context_trs, 1)
+                if self._keep_tokens.get(mod, False):
+                    n_tokens = self.cfg["features"]["modalities"][mod].get("n_tokens", 5)
+                    dim = self.cfg["features"]["modalities"][mod]["dim"]
+                    features[mod] = torch.zeros(self.context_trs * n_tokens, dim)
+                else:
+                    features[mod] = torch.zeros(self.context_trs, 1)
 
         # Load fMRI target (single TR)
         fmri = self._load_fmri(clip_idx)  # (n_voxels, n_trs)

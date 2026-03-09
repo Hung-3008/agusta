@@ -30,10 +30,12 @@ model:
     video: 1408       # V-JEPA2 last layer
     audio: 1024       # Wav2VecBert last layer
     text: 3072        # LLaMA3.2 last layer
-    omni: 3584        # Qwen2.5-Omni (mean-pooled tokens)
+    omni: 3584        # Qwen2.5-Omni (5 tokens/TR, kept individually)
   encoder_dim: 1024
   encoder_depth: 2
   encoder_heads: 8
+  feature_patches: 4            # Split each non-omni feature D into 4 patches/TR
+  omni_keep_tokens: true        # Keep all 5 omni tokens per TR (no mean-pool)
   cond_dim: 1024
 
 training:

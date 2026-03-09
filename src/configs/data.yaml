@@ -40,7 +40,9 @@ features:
       subdir: omni
       file_pattern: "{movie_type}_{stimulus_type}_features_qwen_omni.h5"
       h5_key: omni
-      dim: 3584                        # dim per token; 5 tokens → mean-pooled to 3584
+      dim: 3584                        # dim per token
+      n_tokens: 5                      # tokens per TR from Qwen Omni
+      keep_tokens: true                # keep all 5 tokens per TR (no mean-pooling)
       data_format: tr_tokens_dim       # special: shape is (n_trs, n_tokens, dim) not (n_layers, dim, n_trs)
       sample_freq: tr                  # sampled at TR not 2Hz
 

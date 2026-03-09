@@ -84,6 +84,9 @@ class BrainFlowV2Config:
     encoder_dim: int = 1024    # Output dimension of the multimodal encoder
     encoder_depth: int = 2     # Depth of the transformer encoder
     encoder_heads: int = 8
+    feature_patches: int = 1   # Split each non-omni feature vector into P patches per TR
+                               # P=4 → video(10,1408) becomes (40,352), increasing tokens 4×
+    omni_keep_tokens: bool = False  # If True, omni tokens are not mean-pooled (5 tokens/TR)
 
     # Conditioning
     cond_dim: int = 512        # internal conditioning dimension
@@ -98,20 +101,46 @@ class MultimodalFeatureEncoder(nn.Module):
     """
     Trainable Multimodal Feature Encoder f_φ.
 
-    Input:  dict of features e.g. {"video": (B, T, D_v), "omni": (B, T, D_o)}
+    Input:  dict of features e.g. {"video": (B, T, D_v), "omni": (B, T*N, D_o)}
     Output: representation r (B, D_encoder) - cls token, and patch_tokens
+
+    Feature Patchification:
+      For non-omni modalities, each feature vector D is split into P patches
+      of size D//P, creating P tokens per TR. This increases sequence length
+      and lets attention learn sub-feature relationships.
+
+    Omni Token Retention:
+      When omni_keep_tokens=True, omni features arrive as (B, T*N_tokens, D)
+      from the data loader (already expanded), so no patchification is applied.
     """
 
     def __init__(self, config: BrainFlowV2Config):
         super().__init__()
         self.config = config
         self.embed_dim = config.encoder_dim
+        P = config.feature_patches
+
+        # Track how many patches each modality produces per TR
+        self.patches_per_modality: Dict[str, int] = {}
 
         # Projections for each modality to common embed_dim
-        self.projections = nn.ModuleDict({
-            modality: nn.Linear(dim, self.embed_dim)
-            for modality, dim in config.feature_dims.items()
-        })
+        # Non-omni: project patch_dim (= D // P) → embed_dim
+        # Omni:     project full D → embed_dim (tokens already expanded)
+        self.projections = nn.ModuleDict()
+        for modality, dim in config.feature_dims.items():
+            if modality == "omni":
+                # Omni tokens are already individual — no patchification
+                self.projections[modality] = nn.Linear(dim, self.embed_dim)
+                self.patches_per_modality[modality] = 1
+            else:
+                patch_dim = dim // P
+                if dim % P != 0:
+                    raise ValueError(
+                        f"Feature dim {dim} for '{modality}' is not divisible "
+                        f"by feature_patches={P}. Choose P that divides all dims."
+                    )
+                self.projections[modality] = nn.Linear(patch_dim, self.embed_dim)
+                self.patches_per_modality[modality] = P
 
         # Cross-modal Transformer Encoder
         # Note: norm_first=True disables nested tensor optimization in PyTorch
@@ -142,29 +171,42 @@ class MultimodalFeatureEncoder(nn.Module):
 
     def forward(self, features_dict):
         """
-        features_dict: dict of tensors (B, T, D)
+        features_dict: dict of tensors
+            Non-omni: (B, T, D) where T = context_trs
+            Omni (keep_tokens): (B, T*N_tokens, D) where N_tokens = 5
         Returns:
             cls_token: (B, embed_dim) — global representation
-            patch_tokens: (B, N_patches, embed_dim) — spatial/temporal features
+            patch_tokens: (B, N_total, embed_dim) — all projected tokens
         """
         B = next(iter(features_dict.values())).shape[0]
         
         projected_seqs = []
         for modality, x in features_dict.items():
-            if modality in self.projections:
-                x_proj = self.projections[modality](x)
-                x_proj = x_proj + self.modality_embeds[modality]
-                projected_seqs.append(x_proj)
+            if modality not in self.projections:
+                continue
+
+            P = self.patches_per_modality[modality]
+
+            if P > 1:
+                # Feature Patchification: (B, T, D) → (B, T*P, D//P)
+                B_, T, D = x.shape
+                x = x.reshape(B_, T * P, D // P)
+
+            # Project to embed_dim: (B, T_expanded, patch_dim) → (B, T_expanded, embed_dim)
+            x_proj = self.projections[modality](x)
+            # Add modality embedding (broadcasts across all tokens)
+            x_proj = x_proj + self.modality_embeds[modality]
+            projected_seqs.append(x_proj)
                 
         if not projected_seqs:
             raise ValueError("No matching modalities found in features_dict")
             
-        # Concatenate along time dimension
-        seq = torch.cat(projected_seqs, dim=1) # (B, sum(T), embed_dim)
+        # Concatenate along token dimension
+        seq = torch.cat(projected_seqs, dim=1)  # (B, total_tokens, embed_dim)
         
         # Add CLS token
-        cls_tokens = self.cls_token.expand(B, -1, -1) # (B, 1, embed_dim)
-        seq = torch.cat((cls_tokens, seq), dim=1) # (B, 1+sum(T), embed_dim)
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, embed_dim)
+        seq = torch.cat((cls_tokens, seq), dim=1)  # (B, 1+total_tokens, embed_dim)
         
         # Pass through transformer
         out_seq = self.transformer(seq)

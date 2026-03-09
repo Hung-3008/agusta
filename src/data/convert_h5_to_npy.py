@@ -52,22 +52,29 @@ MODALITY_CONFIGS = {
 }
 
 
-def convert_clip(data: np.ndarray, data_format: str, aggregation: str) -> np.ndarray:
+def convert_clip(data: np.ndarray, data_format: str, aggregation: str,
+                 keep_tokens: bool = False) -> np.ndarray:
     """
-    Convert raw H5 clip data to (dim, n_trs) array.
+    Convert raw H5 clip data to output array.
 
     Args:
         data: raw array from H5
         data_format: 'layers_dim_tr' or 'tr_tokens_dim'
         aggregation: 'mean' or 'last' (only for layers_dim_tr)
+        keep_tokens: if True, keep individual tokens for tr_tokens_dim
+                     output shape: (n_tokens, dim, n_trs) instead of (dim, n_trs)
 
     Returns:
-        np.ndarray of shape (dim, n_trs), float32
+        np.ndarray of shape (dim, n_trs) or (n_tokens, dim, n_trs), float32
     """
     if data_format == "tr_tokens_dim":
-        # omni: (n_trs, n_tokens, dim) → mean-pool tokens → (n_trs, dim) → (dim, n_trs)
-        pooled = data.mean(axis=1)   # (n_trs, dim)
-        return pooled.T.astype(np.float32)  # (dim, n_trs)
+        if keep_tokens:
+            # (n_trs, n_tokens, dim) → (n_tokens, dim, n_trs)
+            return data.transpose(1, 2, 0).astype(np.float32)
+        else:
+            # (n_trs, n_tokens, dim) → mean-pool tokens → (dim, n_trs)
+            pooled = data.mean(axis=1)   # (n_trs, dim)
+            return pooled.T.astype(np.float32)  # (dim, n_trs)
     else:
         # layers_dim_tr: (n_layers, dim, n_trs)
         if aggregation == "last":
@@ -81,6 +88,7 @@ def convert_modality(
     out_root: Path,
     modality: str,
     aggregation: str = "mean",
+    keep_omni_tokens: bool = False,
     dry_run: bool = False,
     overwrite: bool = False,
 ) -> dict:
@@ -131,7 +139,10 @@ def convert_modality(
                     print(f"    ERROR reading {clip_name}: {e}")
                     continue
 
-                converted = convert_clip(raw, cfg["data_format"], aggregation)
+                converted = convert_clip(
+                    raw, cfg["data_format"], aggregation,
+                    keep_tokens=(keep_omni_tokens and modality == "omni"),
+                )
                 # Replace NaN/Inf with 0
                 converted = np.nan_to_num(converted, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -185,6 +196,11 @@ def main():
         "--overwrite", action="store_true",
         help="Overwrite existing NPY files"
     )
+    parser.add_argument(
+        "--keep_omni_tokens", action="store_true",
+        help="Keep individual omni tokens instead of mean-pooling. "
+             "Output shape: (n_tokens, dim, n_trs) instead of (dim, n_trs)"
+    )
     args = parser.parse_args()
 
     feat_root = Path(args.feat_root)
@@ -195,6 +211,7 @@ def main():
     print(f"  Destination: {out_root}")
     print(f"  Modalities:  {args.modalities}")
     print(f"  Aggregation: {args.aggregation}")
+    print(f"  Keep omni:   {args.keep_omni_tokens}")
     print(f"  Overwrite:   {args.overwrite}")
     print(f"  Dry run:     {args.dry_run}")
     print()
@@ -207,6 +224,7 @@ def main():
         stats = convert_modality(
             feat_root, out_root, modality,
             aggregation=args.aggregation,
+            keep_omni_tokens=args.keep_omni_tokens,
             dry_run=args.dry_run,
             overwrite=args.overwrite,
         )

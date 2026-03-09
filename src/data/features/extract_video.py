@@ -133,8 +133,8 @@ def extract_features_for_clip(
 
     logger.info("Processing: %s (batch=%d)", video_path, batch_timepoints)
 
-    # Open video with decord
-    vr = VideoReader(video_path, ctx=cpu(0))
+    # Open video with decord, extracting at scale needed by model to save RAM
+    vr = VideoReader(video_path, ctx=cpu(0), width=256, height=256)
     total_frames = len(vr)
     native_fps = vr.get_avg_fps()
     duration = total_frames / native_fps

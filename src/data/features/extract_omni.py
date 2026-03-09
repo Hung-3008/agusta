@@ -382,11 +382,21 @@ def list_movie_splits(stimuli_dir: str, movie_type: str, stimulus_type: str) -> 
 def find_transcript(
     stimuli_dir: str, movie_type: str, stimulus_type: str, split_name: str,
 ) -> str | None:
-    """Find matching transcript TSV for a movie split."""
+    """Find matching transcript TSV for a movie split.
+
+    Handles two naming conventions:
+      - Friends: {split_name}.tsv  (e.g. friends_s01e01a.tsv)
+      - Movie10: {movie_type}_{split_name}.tsv  (e.g. movie10_bourne01.tsv)
+    """
     tsv_dir = os.path.join(stimuli_dir, "transcripts", movie_type, stimulus_type)
+    # Try exact match first (friends)
     tsv_path = os.path.join(tsv_dir, f"{split_name}.tsv")
     if os.path.exists(tsv_path):
         return tsv_path
+    # Try with movie_type prefix (movie10)
+    tsv_path_prefixed = os.path.join(tsv_dir, f"{movie_type}_{split_name}.tsv")
+    if os.path.exists(tsv_path_prefixed):
+        return tsv_path_prefixed
     return None
 
 
