@@ -13,6 +13,7 @@ Design principles:
 
 import hashlib
 import logging
+from tqdm import tqdm
 import random
 from collections import OrderedDict
 from functools import lru_cache
@@ -548,8 +549,71 @@ class SlidingWindowDataset(Dataset):
 
         # Unified LRU cache for fMRI and features (size-bounded)
         self._cache = LRUCache(max_bytes=int(max_cache_gb * 1e9))
+        # RAM store: populated by preload_to_ram() for zero-HDD-IO training
+        self._ram_store: dict = {}
         npy_status = f"NPY dir: {self.features_npy_dir}" if self.features_npy_dir else "H5 fallback only"
         logger.info("LRU data cache: max %.1f GB | %s", max_cache_gb, npy_status)
+
+    def preload_to_ram(self) -> None:
+        """Preload ALL clip features and fMRI into RAM.
+
+        Features are deduplicated across subjects (same clip = same features),
+        reducing memory from ~57GB to ~15GB. Only fMRI varies per subject.
+        """
+        unique_clips = set()
+        for clip_idx, _ in self._samples:
+            unique_clips.add(clip_idx)
+
+        total_bytes = 0
+        feat_dedup: dict[tuple, np.ndarray] = {}  # (movie_type, stim, clip, mod) → array
+
+        logger.info("Preloading %d clips × %d modalities + fMRI to RAM "
+                    "(dedup features across subjects)...",
+                    len(unique_clips), len(self.modalities))
+
+        for clip_idx in tqdm(sorted(unique_clips),
+                             desc=f"  Preload [{self.split}]", leave=True):
+            info = self.clip_index[clip_idx]
+
+            # ── fMRI: unique per subject-clip (no dedup) ──
+            fmri_key = ("fmri", clip_idx)
+            if fmri_key not in self._ram_store:
+                try:
+                    data = load_fmri_clip(
+                        self.fmri_dir, info["subject"], info["task"],
+                        info["fmri_key"], standardize=self.standardize,
+                    )
+                    self._ram_store[fmri_key] = data
+                    total_bytes += data.nbytes
+                except Exception as e:
+                    logger.warning("Failed to preload fMRI clip %d: %s",
+                                   clip_idx, e)
+
+            # ── Features: dedup by (movie_type, stim, clip_name, mod) ──
+            dedup_id = (info["movie_type"], info["stimulus_type"],
+                        info["clip_name"])
+            for mod in self.modalities:
+                feat_key = ("feat", clip_idx, mod)
+                dedup_full = (*dedup_id, mod)
+
+                if dedup_full in feat_dedup:
+                    # Reuse existing array (zero-copy reference)
+                    self._ram_store[feat_key] = feat_dedup[dedup_full]
+                else:
+                    try:
+                        data = self._load_features(clip_idx, mod)
+                        feat_dedup[dedup_full] = data
+                        self._ram_store[feat_key] = data
+                        total_bytes += data.nbytes
+                    except Exception as e:
+                        logger.warning("Failed to preload %s clip %d: %s",
+                                       mod, clip_idx, e)
+
+        # Clear LRU cache — data is now in RAM store
+        self._cache = LRUCache(max_bytes=0)
+        n_dedup = len(feat_dedup)
+        logger.info("  Preloaded %.2f GB into RAM (%d entries, %d unique features)",
+                    total_bytes / 1e9, len(self._ram_store), n_dedup)
 
     def _build_sample_index(self) -> list[tuple[int, int]]:
         """Build flattened list of (clip_idx, target_tr) tuples.
@@ -591,8 +655,11 @@ class SlidingWindowDataset(Dataset):
             return None
 
     def _load_fmri(self, clip_idx: int) -> np.ndarray:
-        """Load fMRI for clip (LRU cached)."""
+        """Load fMRI for clip (RAM store or LRU cached)."""
         key = ("fmri", clip_idx)
+        # RAM store takes priority (populated by preload_to_ram)
+        if key in self._ram_store:
+            return self._ram_store[key]
         cached = self._cache.get(key)
         if cached is None:
             info = self.clip_index[clip_idx]
@@ -609,6 +676,9 @@ class SlidingWindowDataset(Dataset):
         Returns array with shape (1, dim, n_trs).
         """
         key = ("feat", clip_idx, modality)
+        # RAM store takes priority (populated by preload_to_ram)
+        if key in self._ram_store:
+            return self._ram_store[key]
         cached = self._cache.get(key)
         if cached is not None:
             return cached
@@ -632,7 +702,7 @@ class SlidingWindowDataset(Dataset):
                 if T_feat > n_trs:
                     raw = raw[:, :, :n_trs]
                 elif T_feat < n_trs:
-                    pad = np.zeros((1, raw.shape[1], n_trs - T_feat), dtype=raw.dtype)
+                    pad = np.zeros((raw.shape[0], raw.shape[1], n_trs - T_feat), dtype=raw.dtype)
                     raw = np.concatenate([raw, pad], axis=2)
                 self._cache.put(key, raw)
                 return raw
@@ -656,7 +726,7 @@ class SlidingWindowDataset(Dataset):
                 resampled = raw[:, :, :n_trs]
             elif T_feat < n_trs:
                 pad = np.zeros(
-                    (1, raw.shape[1], n_trs - T_feat), dtype=raw.dtype)
+                    (raw.shape[0], raw.shape[1], n_trs - T_feat), dtype=raw.dtype)
                 resampled = np.concatenate([raw, pad], axis=2)
             else:
                 resampled = raw
@@ -810,3 +880,15 @@ def build_dataloaders(
         )
 
     return loaders
+
+
+def preload_datasets_to_ram(loaders: dict) -> None:
+    """Preload all features and fMRI data into RAM for all datasets in loaders.
+
+    Call this once after build_dataloaders() to eliminate HDD I/O during training.
+    Requires sufficient RAM to hold all NPY/fMRI data (~25GB for full dataset).
+    """
+    for split, loader in loaders.items():
+        dataset = loader.dataset
+        if hasattr(dataset, 'preload_to_ram'):
+            dataset.preload_to_ram()

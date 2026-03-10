@@ -27,7 +27,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
-from src.data.dataset import build_dataloaders
+from src.data.dataset import build_dataloaders, preload_datasets_to_ram
 
 from torchcfm.conditional_flow_matching import (
     ConditionalFlowMatcher,
@@ -347,6 +347,9 @@ def main():
     val_loader = loaders.get("val", [])
     logger.info(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
+    # ── Preload all data to RAM (eliminates HDD I/O during training) ──
+    preload_datasets_to_ram(loaders)
+
     # ── Model ──
     model = BrainFlowV2(BrainFlowV2Config(**model_cfg)).to(device)
     ema_model = copy.deepcopy(model) if use_ema else None
@@ -446,6 +449,12 @@ def main():
 
     # Precompute ROI index tensors was here, removed.
 
+    # ── Mixed Precision (AMP) ──
+    use_amp = (device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    if use_amp:
+        logger.info("Mixed Precision (AMP) enabled — FP16 training")
+
     for epoch in range(start_epoch, num_epochs + 1):
         model.train()
 
@@ -493,58 +502,57 @@ def main():
             else:
                 t, xt, ut = fm.sample_location_and_conditional_flow(x0, x1)
 
-            # Forward: predict velocity
-            # First, get representation for all
-            cls_token, patch_tokens = model.encoder(features_dict)
-            # cls_token: (B, enc_dim), patch_tokens: (B, N, enc_dim)
-            if drop_mask.any():
-                cls_token = cls_token.clone()
-                patch_tokens = patch_tokens.clone()
-                cls_token[drop_mask] = 0.0
-                patch_tokens[drop_mask] = 0.0
+            # Forward with AMP autocast
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                # Forward: predict velocity
+                cls_token, patch_tokens = model.encoder(features_dict)
+                if drop_mask.any():
+                    cls_token = cls_token.clone()
+                    patch_tokens = patch_tokens.clone()
+                    cls_token[drop_mask] = 0.0
+                    patch_tokens[drop_mask] = 0.0
 
-            # Manually compute forward with pre-computed representations
-            t_emb = timestep_embedding(
-                t * 1000, model.config.hidden_dim).to(device)
-            c = model.cond_mlp(cls_token, t_emb)
+                t_emb = timestep_embedding(
+                    t * 1000, model.config.hidden_dim).to(device)
+                c = model.cond_mlp(cls_token, t_emb)
 
-            # Context for cross-attention
-            context = None
-            if model.use_cross_attention:
-                context = model.context_norm(
-                    model.context_proj(patch_tokens))
+                context = None
+                if model.use_cross_attention:
+                    context = model.context_norm(
+                        model.context_proj(patch_tokens))
 
-            x_patches = model._patchify(xt)
-            x_tokens = model.patch_embed(x_patches)
-            # Positional embedding (learnable, V2)
-            x_tokens = x_tokens + model.patch_pos_embed
+                x_patches = model._patchify(xt)
+                x_tokens = model.patch_embed(x_patches)
+                x_tokens = x_tokens + model.patch_pos_embed
 
-            for block in model.blocks:
-                x_tokens = block(x_tokens, c, context)
+                for block in model.blocks:
+                    x_tokens = block(x_tokens, c, context)
 
-            mod_params = model.final_adaLN(c)
-            shift, scale = mod_params.chunk(2, dim=-1)
-            x_out = modulate(
-                model.final_layer_norm(x_tokens), shift, scale)
-            x_out = model.output_proj(x_out)
-            v_pred = model._unpatchify(x_out)
+                mod_params = model.final_adaLN(c)
+                shift, scale = mod_params.chunk(2, dim=-1)
+                x_out = modulate(
+                    model.final_layer_norm(x_tokens), shift, scale)
+                x_out = model.output_proj(x_out)
+                v_pred = model._unpatchify(x_out)
 
-            # Loss
-            loss, loss_info = compute_velocity_loss(
-                v_pred, ut, t=t,
-                loss_type=velocity_loss_type,
-                huber_c=huber_c,
-                timestep_weight_type=timestep_weight_type,
-                direction_weight=direction_weight,
-                magnitude_weight=magnitude_weight,
-            )
+                # Loss
+                loss, loss_info = compute_velocity_loss(
+                    v_pred, ut, t=t,
+                    loss_type=velocity_loss_type,
+                    huber_c=huber_c,
+                    timestep_weight_type=timestep_weight_type,
+                    direction_weight=direction_weight,
+                    magnitude_weight=magnitude_weight,
+                )
 
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             gn = torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 grad_clip if grad_clip > 0 else float('inf'))
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             if use_ema:
                 ema_update(model, ema_model, ema_decay)
 

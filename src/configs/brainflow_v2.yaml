@@ -12,8 +12,8 @@ data:
     - omni
 
 dataloader:
-  batch_size: 48
-  num_workers: 4
+  batch_size: 256
+  num_workers: 0
 
 model:
   n_voxels: 1000
@@ -39,14 +39,14 @@ model:
   cond_dim: 1024
 
 training:
-  batch_size: 48
+  batch_size: 512
   lr: 0.0003
   encoder_lr: 0.0001      # Adjust for transformer encoder
   num_epochs: 300
   warmup_epochs: 20
   grad_clip: 1.0
   weight_decay: 0.1
-  ema_decay: 0.999
+  ema_decay: 0.99
   use_ema: true
   eval_interval: 10    # evaluate every 10 epochs (was 5, saves ~14min per 5ep)
   patience: 40

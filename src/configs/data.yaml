@@ -54,9 +54,9 @@ sliding_window:
 # Subjects available
 subjects:
   - sub-01
-  - sub-02
-  - sub-03
-  - sub-05
+  #- sub-02
+  #- sub-03
+  #- sub-05
 
 # Train / val / test splits
 # Stimulus files are grouped by task → split → stimulus_type
@@ -81,7 +81,7 @@ preprocessing:
 
 # DataLoader
 dataloader:
-  batch_size: 48
+  batch_size: 256
   num_workers: 0     # 0 = single-process; avoids LRU cache duplication across workers
   max_cache_gb: 10.0 # max RAM for LRU feature+fMRI cache (GB)
   pin_memory: true
