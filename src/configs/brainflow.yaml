@@ -47,11 +47,16 @@ sliding_window:
 
 subjects:
   - sub-01
+  - sub-02
+  - sub-03
+  - sub-05
 
 splits:
   friends:
     train: [s1, s2, s3, s4, s5, s6]
     test: [s7]
+  movie10:
+    train: [bourne, wolf, life, figures]
 
 val_ratio: 0.1
 

@@ -140,24 +140,28 @@ def compute_velocity_loss(v_pred, ut, t=None, loss_type="mse",
 class BrainFlowODEWrapper(torch.nn.Module):
     """ODE wrapper for BrainFlow: noise → fMRI voxels."""
 
-    def __init__(self, model, features_dict, cfg_scale=1.0):
+    def __init__(self, model, features_dict, subject_id, cfg_scale=1.0):
         super().__init__()
         self.model = model
         self.features_dict = features_dict
+        self.subject_id = subject_id
         self.cfg_scale = cfg_scale
 
     def forward(self, t, x):
         B = x.shape[0]
         t_batch = t.expand(B)
         if self.cfg_scale == 1.0:
-            return self.model(t_batch, x, self.features_dict)
+            return self.model(
+                t_batch, x, self.features_dict, self.subject_id)
         else:
             return self.model.forward_with_cfg(
-                t_batch, x, self.features_dict, self.cfg_scale)
+                t_batch, x, self.features_dict, self.subject_id,
+                self.cfg_scale)
 
 
 @torch.no_grad()
-def stochastic_euler_sample(model, x0, features_dict, T, cfg_scale=1.0):
+def stochastic_euler_sample(model, x0, features_dict, subject_id, T,
+                           cfg_scale=1.0):
     """FlowNP-style stochastic Euler sampling."""
     z = x0
     B = z.shape[0]
@@ -165,10 +169,10 @@ def stochastic_euler_sample(model, x0, features_dict, T, cfg_scale=1.0):
         tt = i / T
         t_batch = torch.full((B,), tt, device=z.device)
         if cfg_scale == 1.0:
-            v_pred = model(t_batch, z, features_dict)
+            v_pred = model(t_batch, z, features_dict, subject_id)
         else:
             v_pred = model.forward_with_cfg(
-                t_batch, z, features_dict, cfg_scale)
+                t_batch, z, features_dict, subject_id, cfg_scale)
         alpha = 1 + tt * (1 - tt)
         sigma = 0.2 * (tt * (1 - tt)) ** 0.5
         z = z + (alpha * v_pred + sigma * torch.randn_like(z)) / T
@@ -195,11 +199,12 @@ def validate(model, val_loader, fm, device, ode_steps=50,
     for batch in val_loader:
         fmri = batch["fmri"].to(device)
         features_dict = {k: v.to(device) for k, v in batch["features"].items()}
+        subject_id = batch["subject_id"].to(device)
 
         # Flow loss
         x0 = torch.randn_like(fmri)
         t, xt, ut = fm.sample_location_and_conditional_flow(x0, fmri)
-        v_pred = model(t, xt, features_dict)
+        v_pred = model(t, xt, features_dict, subject_id)
 
         flow_loss = F.mse_loss(v_pred, ut)
         total_flow_loss += flow_loss.item()
@@ -214,10 +219,11 @@ def validate(model, val_loader, fm, device, ode_steps=50,
             x0_trial = torch.randn_like(fmri)
             if sampler == "stochastic_euler":
                 fmri_trial = stochastic_euler_sample(
-                    model, x0_trial, features_dict, T=ode_steps,
-                    cfg_scale=cfg_scale)
+                    model, x0_trial, features_dict, subject_id,
+                    T=ode_steps, cfg_scale=cfg_scale)
             else:
-                ode_fn = BrainFlowODEWrapper(model, features_dict, cfg_scale)
+                ode_fn = BrainFlowODEWrapper(
+                    model, features_dict, subject_id, cfg_scale)
                 t_span = torch.linspace(0, 1, ode_steps, device=device)
                 traj = odeint(ode_fn, x0_trial, t_span, method="midpoint")
                 fmri_trial = traj[-1]
@@ -338,7 +344,8 @@ def main():
     preload_datasets_to_ram(loaders)
 
     # ── Model ──
-    model = BrainFlow(BrainFlowConfig(**model_cfg)).to(device)
+    model = BrainFlow(BrainFlowConfig(
+        **model_cfg, n_subjects=len(cfg["subjects"]))).to(device)
     ema_model = copy.deepcopy(model) if use_ema else None
     pc = model.param_count()
     logger.info(
@@ -463,6 +470,7 @@ def main():
             fmri = batch["fmri"].to(device)
             features_dict = {
                 k: v.to(device) for k, v in batch["features"].items()}
+            subject_id = batch["subject_id"].to(device)
             B = fmri.shape[0]
 
             x1 = fmri
@@ -487,7 +495,8 @@ def main():
 
             # Forward with AMP autocast — uses model.forward_with_dgs
             with torch.amp.autocast("cuda", enabled=use_amp):
-                v_pred = model.forward_with_dgs(t, xt, features_dict, drop_mask)
+                v_pred = model.forward_with_dgs(
+                    t, xt, features_dict, subject_id, drop_mask)
 
                 # Loss
                 loss, loss_info = compute_velocity_loss(

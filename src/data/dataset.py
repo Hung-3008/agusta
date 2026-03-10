@@ -135,6 +135,7 @@ def load_fmri_clip(
     task: str,
     clip_key: str,
     standardize: bool = True,
+    run: int | None = None,
 ) -> np.ndarray:
     """Load and preprocess fMRI data for a single clip.
 
@@ -147,9 +148,12 @@ def load_fmri_clip(
     task : str
         Task name: 'friends' or 'movie10'.
     clip_key : str
-        H5 key for the clip, e.g. '01a', 'bourne01_run-1'.
+        H5 key for the clip, e.g. '01a', 'bourne01'.
     standardize : bool
         Whether to z-score the data per clip.
+    run : int or None
+        For movie10 life/figures clips with multiple runs, specify 1 or 2.
+        None means no run disambiguation (friends or single-run movie10).
 
     Returns
     -------
@@ -163,9 +167,13 @@ def load_fmri_clip(
     with h5py.File(fmri_path, "r") as f:
         # Find matching key (h5 keys may have prefixes)
         matched = [k for k in f.keys() if clip_key in k]
+        # Disambiguate by run if specified
+        if run is not None and len(matched) > 1:
+            run_str = f"run-{run}"
+            matched = [k for k in matched if run_str in k]
         if len(matched) != 1:
             raise ValueError(
-                f"Expected 1 match for '{clip_key}' in {fmri_path}, "
+                f"Expected 1 match for '{clip_key}' (run={run}) in {fmri_path}, "
                 f"got {len(matched)}: {matched}"
             )
         data = f[matched[0]][:].astype(np.float32)
@@ -391,13 +399,52 @@ def _deterministic_split(uid: str, val_ratio: float = 0.1) -> str:
     return "val" if rng.random() < val_ratio else "train"
 
 
+def _enumerate_fmri_runs(
+    fmri_dir: str, subject: str, task: str, clip_key: str,
+) -> list[int | None]:
+    """Find which runs exist for a clip_key in the fMRI h5.
+
+    For friends and single-run movie10 clips (bourne, wolf), returns [None].
+    For movie10 life/figures clips with run-1/run-2, returns [1, 2] etc.
+    Returns empty list if clip not found at all.
+    """
+    fmri_path = _get_fmri_filepath(fmri_dir, subject, task)
+    if not fmri_path.exists():
+        return []
+
+    with h5py.File(fmri_path, "r") as f:
+        matched = [k for k in f.keys() if clip_key in k]
+
+    if not matched:
+        return []
+    if len(matched) == 1:
+        return [None]  # single match, no run disambiguation needed
+
+    # Multiple matches: extract run numbers
+    runs = []
+    for k in matched:
+        if "run-" in k:
+            # e.g. 'ses-006_task-life01_run-1' → 1
+            run_str = k.split("run-")[-1]
+            try:
+                runs.append(int(run_str))
+            except ValueError:
+                runs.append(None)
+        else:
+            runs.append(None)
+    return sorted(r for r in runs if r is not None) or [None]
+
+
 def build_clip_index(
     cfg: dict,
 ) -> list[dict]:
     """Build index of all available (subject, clip) pairs.
 
     Returns a list of dicts with keys:
-        subject, task, movie_type, stimulus_type, clip_name, fmri_key, split
+        subject, task, movie_type, stimulus_type, clip_name, fmri_key, split, run
+
+    For movie10 clips with multiple fMRI runs (life/figures), each run
+    produces a separate index entry (same features, different fMRI scan).
     """
     fmri_dir = cfg["_fmri_dir"]
     features_dir = cfg["_features_dir"]
@@ -444,15 +491,27 @@ def build_clip_index(
                         if not fmri_path.exists():
                             continue
 
-                        index.append({
-                            "subject": subject,
-                            "task": task,
-                            "movie_type": task,
-                            "stimulus_type": stim_type,
-                            "clip_name": clip_name,
-                            "fmri_key": fmri_key,
-                            "split": clip_split,
-                        })
+                        # Enumerate runs (movie10 life/figures may have run-1/run-2)
+                        if split_name == "test":
+                            # Test clips have no fMRI — just add one entry
+                            runs = [None]
+                        else:
+                            runs = _enumerate_fmri_runs(
+                                fmri_dir, subject, task, fmri_key)
+                            if not runs:
+                                continue
+
+                        for run in runs:
+                            index.append({
+                                "subject": subject,
+                                "task": task,
+                                "movie_type": task,
+                                "stimulus_type": stim_type,
+                                "clip_name": clip_name,
+                                "fmri_key": fmri_key,
+                                "split": clip_split,
+                                "run": run,
+                            })
 
     logger.info(
         "Built clip index: %d entries (%d subjects × clips)",
@@ -643,8 +702,13 @@ class SlidingWindowDataset(Dataset):
             fmri_path = _get_fmri_filepath(
                 self.fmri_dir, clip_info["subject"], clip_info["task"]
             )
+            run = clip_info.get("run")
             with h5py.File(fmri_path, "r") as f:
                 matched = [k for k in f.keys() if clip_info["fmri_key"] in k]
+                # Disambiguate by run if specified
+                if run is not None and len(matched) > 1:
+                    run_str = f"run-{run}"
+                    matched = [k for k in matched if run_str in k]
                 if len(matched) != 1:
                     return None
                 shape = f[matched[0]].shape
@@ -666,6 +730,7 @@ class SlidingWindowDataset(Dataset):
             cached = load_fmri_clip(
                 self.fmri_dir, info["subject"], info["task"],
                 info["fmri_key"], standardize=self.standardize,
+                run=info.get("run"),
             )
             self._cache.put(key, cached)
         return cached

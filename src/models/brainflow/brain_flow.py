@@ -53,6 +53,64 @@ def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+# ─── Subject-Specific Layers ─────────────────────────────────────────────────
+
+
+class SubjectLayers(nn.Module):
+    """Per-subject linear projection (adapted from TRIDE).
+
+    Maintains separate weight matrices for each subject, enabling
+    subject-specific mapping from shared representation to brain space.
+
+    Parameters
+    ----------
+    in_channels : int
+        Input feature dimension.
+    out_channels : int
+        Output dimension (e.g., patch_size).
+    n_subjects : int
+        Number of subjects.
+    bias : bool
+        Whether to include a per-subject bias.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int,
+                 n_subjects: int, bias: bool = True):
+        super().__init__()
+        self.weights = nn.Parameter(
+            torch.empty(n_subjects, in_channels, out_channels))
+        self.bias = (
+            nn.Parameter(torch.empty(n_subjects, out_channels))
+            if bias else None
+        )
+        # Init: scaled normal (same as TRIDE)
+        self.weights.data.normal_()
+        self.weights.data *= 1 / in_channels ** 0.5
+        if self.bias is not None:
+            self.bias.data.normal_()
+            self.bias.data *= 1 / in_channels ** 0.5
+
+    def forward(self, x: torch.Tensor, subjects: torch.Tensor) -> torch.Tensor:
+        """Apply subject-specific linear projection.
+
+        Args:
+            x: (B, N, C_in) — input tokens
+            subjects: (B,) — integer subject indices
+
+        Returns:
+            (B, N, C_out)
+        """
+        weights = self.weights[subjects]      # (B, C_in, C_out)
+        out = torch.bmm(x, weights)           # (B, N, C_out)
+        if self.bias is not None:
+            out = out + self.bias[subjects].unsqueeze(1)  # (B, 1, C_out)
+        return out
+
+    def __repr__(self):
+        S, C, D = self.weights.shape
+        return f"SubjectLayers({C}, {D}, n_subjects={S})"
+
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 
@@ -80,6 +138,9 @@ class BrainFlowConfig:
     # Conditioning
     cond_dim: int = 512
     use_cross_attention: bool = True
+
+    # Subject-specific
+    n_subjects: int = 4
 
 
 # ─── Multimodal Feature Encoder ──────────────────────────────────────────────
@@ -401,25 +462,27 @@ class BrainFlow(nn.Module):
             nn.SiLU(), nn.Linear(D, 2 * D))
         nn.init.zeros_(self.final_adaLN[1].weight)
         nn.init.zeros_(self.final_adaLN[1].bias)
-        self.output_proj = nn.Linear(D, config.patch_size)
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        # Subject-specific output projection
+        self.output_proj = SubjectLayers(
+            in_channels=D, out_channels=config.patch_size,
+            n_subjects=config.n_subjects, bias=True,
+        )
 
         self._init_weights()
 
     def _init_weights(self):
-        """Xavier init for velocity network (not encoder)."""
+        """Xavier init for velocity network (not encoder, not SubjectLayers)."""
         for name, m in self.named_modules():
             if name.startswith('encoder'):
                 continue
+            if isinstance(m, SubjectLayers):
+                continue  # SubjectLayers has its own init
             if isinstance(m, nn.Linear):
                 if m.weight.requires_grad:
                     nn.init.xavier_uniform_(m.weight)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
-        # Re-zero output proj and adaLN
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        # Re-zero adaLN outputs for zero-init residual
         nn.init.zeros_(self.final_adaLN[1].weight)
         nn.init.zeros_(self.final_adaLN[1].bias)
 
@@ -471,13 +534,14 @@ class BrainFlow(nn.Module):
 
         return c, context
 
-    def _velocity_head(self, x_t, c, context):
+    def _velocity_head(self, x_t, c, context, subject_id):
         """Shared velocity network: patchify → DiT blocks → unpatchify.
 
         Args:
             x_t: (B, n_voxels)
             c: (B, D) conditioning
             context: (B, M, D) or None
+            subject_id: (B,) integer subject indices
 
         Returns:
             v_pred: (B, n_voxels)
@@ -491,11 +555,11 @@ class BrainFlow(nn.Module):
         mod_params = self.final_adaLN(c)
         shift, scale = mod_params.chunk(2, dim=-1)
         x_out = modulate(self.final_layer_norm(x_tokens), shift, scale)
-        x_out = self.output_proj(x_out)
+        x_out = self.output_proj(x_out, subject_id)
 
         return self._unpatchify(x_out)
 
-    def forward(self, t, x_t, features_dict, drop_repr=False):
+    def forward(self, t, x_t, features_dict, subject_id, drop_repr=False):
         """
         Predict velocity v(x_t, t | features_dict).
 
@@ -503,6 +567,7 @@ class BrainFlow(nn.Module):
             t: (B,) timestep values in [0, 1]
             x_t: (B, n_voxels) point on the probability path
             features_dict: dict of input features
+            subject_id: (B,) integer subject indices
             drop_repr: if True, zero out representation (for CFG)
 
         Returns:
@@ -510,9 +575,9 @@ class BrainFlow(nn.Module):
         """
         c, context = self._encode_and_condition(
             t, features_dict, drop_repr=drop_repr)
-        return self._velocity_head(x_t, c, context)
+        return self._velocity_head(x_t, c, context, subject_id)
 
-    def forward_with_dgs(self, t, x_t, features_dict, drop_mask):
+    def forward_with_dgs(self, t, x_t, features_dict, subject_id, drop_mask):
         """
         Forward pass with per-sample DGS (Dynamic Guidance Switching).
 
@@ -520,6 +585,7 @@ class BrainFlow(nn.Module):
             t: (B,) timestep values
             x_t: (B, n_voxels)
             features_dict: multimodal features
+            subject_id: (B,) integer subject indices
             drop_mask: (B,) bool tensor — True to zero representation
 
         Returns:
@@ -527,15 +593,18 @@ class BrainFlow(nn.Module):
         """
         c, context = self._encode_and_condition(
             t, features_dict, drop_mask=drop_mask)
-        return self._velocity_head(x_t, c, context)
+        return self._velocity_head(x_t, c, context, subject_id)
 
-    def forward_with_cfg(self, t, x_t, features_dict, cfg_scale=1.0):
+    def forward_with_cfg(self, t, x_t, features_dict, subject_id,
+                         cfg_scale=1.0):
         """Classifier-free guidance inference."""
         if cfg_scale == 1.0:
-            return self.forward(t, x_t, features_dict)
+            return self.forward(t, x_t, features_dict, subject_id)
 
-        v_cond = self.forward(t, x_t, features_dict, drop_repr=False)
-        v_uncond = self.forward(t, x_t, features_dict, drop_repr=True)
+        v_cond = self.forward(
+            t, x_t, features_dict, subject_id, drop_repr=False)
+        v_uncond = self.forward(
+            t, x_t, features_dict, subject_id, drop_repr=True)
         return v_uncond + cfg_scale * (v_cond - v_uncond)
 
     def get_encoder_params(self):
