@@ -819,7 +819,7 @@ class SlidingWindowDataset(Dataset):
 # =============================================================================
 
 def build_dataloaders(
-    config_path: str | Path,
+    config_or_path: str | Path | dict,
     project_root: str | Path | None = None,
     splits: list[str] | None = None,
     modalities: list[str] | None = None,
@@ -828,8 +828,10 @@ def build_dataloaders(
 
     Parameters
     ----------
-    config_path : str or Path
-        Path to data.yaml config file.
+    config_or_path : str, Path, or dict
+        Path to YAML config file, or a pre-loaded config dict.
+        When a dict is passed, it must contain the same structure as data.yaml
+        (data_root, fmri, features, etc.).
     project_root : str, Path, or None
         Project root directory. If None, inferred from config path.
     splits : list[str] or None
@@ -842,13 +844,18 @@ def build_dataloaders(
     dict[str, DataLoader]
         Mapping from split name to DataLoader.
     """
-    config_path = Path(config_path)
-    if project_root is None:
-        # src/configs/data.yaml → project root is 2 levels up from configs
-        project_root = config_path.resolve().parent.parent.parent
-
-    cfg = load_config(config_path)
-    cfg = resolve_paths(cfg, project_root)
+    if isinstance(config_or_path, dict):
+        cfg = config_or_path
+        if project_root is None:
+            raise ValueError(
+                "project_root is required when passing a config dict")
+        cfg = resolve_paths(cfg, project_root)
+    else:
+        config_path = Path(config_or_path)
+        if project_root is None:
+            project_root = config_path.resolve().parent.parent.parent
+        cfg = load_config(config_path)
+        cfg = resolve_paths(cfg, project_root)
 
     if splits is None:
         splits = ["train", "val"]

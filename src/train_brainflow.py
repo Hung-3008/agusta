@@ -1,18 +1,12 @@
 """
-BrainFlow V2 — FlowFM-Style Training Script.
+BrainFlow — FlowFM-Style Training Script.
 
 Direct flow matching from N(0,I) to fMRI voxel space, conditioned on
-raw images via a trainable ViT encoder (FlowFM architecture).
-
-Key differences from train_brainflow.py (V1):
-  - Loads raw images instead of pre-extracted DINOv2 features
-  - Jointly trains ViT encoder + velocity network
-  - Separate learning rates for encoder vs velocity
-  - DGS operates on representation r (zero-out ViT output)
+multimodal features via a trainable encoder (FlowFM architecture).
 
 Usage:
-    python -m src.train_brainflow_v2 --config src/configs/subj01/brainflow_v2.yaml
-    python -m src.train_brainflow_v2 --config src/configs/subj01/brainflow_v2.yaml --debug
+    python -m src.train_brainflow --config src/configs/brainflow.yaml
+    python -m src.train_brainflow --config src/configs/brainflow.yaml --debug
 """
 
 import argparse
@@ -27,6 +21,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
+from pathlib import Path
 from src.data.dataset import build_dataloaders, preload_datasets_to_ram
 
 from torchcfm.conditional_flow_matching import (
@@ -34,15 +29,7 @@ from torchcfm.conditional_flow_matching import (
     ExactOptimalTransportConditionalFlowMatcher,
 )
 
-from src.models.brainflow.brain_flow_v2 import (
-    BrainFlowV2, BrainFlowV2Config, timestep_embedding, modulate,
-)
-
-
-# ─── Dataset ──────────────────────────────────────────────────────────────────
-
-
-# FmriImageDataset removed. Using SlidingWindowDataset instead.
+from src.models.brainflow.brain_flow import BrainFlow, BrainFlowConfig
 
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
@@ -70,7 +57,6 @@ def ema_update(source, target, decay):
     with torch.no_grad():
         for s, t in zip(source.parameters(), target.parameters()):
             t.data.mul_(decay).add_(s.data, alpha=1 - decay)
-        # Also copy buffers (e.g. BatchNorm running stats)
         for s, t in zip(source.buffers(), target.buffers()):
             t.data.copy_(s.data)
 
@@ -151,8 +137,8 @@ def compute_velocity_loss(v_pred, ut, t=None, loss_type="mse",
 # ─── ODE Wrapper ─────────────────────────────────────────────────────────────
 
 
-class BrainFlowV2ODEWrapper(torch.nn.Module):
-    """ODE wrapper for BrainFlowV2: noise → fMRI voxels."""
+class BrainFlowODEWrapper(torch.nn.Module):
+    """ODE wrapper for BrainFlow: noise → fMRI voxels."""
 
     def __init__(self, model, features_dict, cfg_scale=1.0):
         super().__init__()
@@ -196,7 +182,7 @@ def stochastic_euler_sample(model, x0, features_dict, T, cfg_scale=1.0):
 def validate(model, val_loader, fm, device, ode_steps=50,
              cfg_scale=1.0, num_trials=1,
              sampler="ode"):
-    """Validate BrainFlowV2 — generate fMRI directly from images."""
+    """Validate BrainFlow — generate fMRI from features."""
     if sampler == "ode":
         from torchdiffeq import odeint
 
@@ -209,7 +195,6 @@ def validate(model, val_loader, fm, device, ode_steps=50,
     for batch in val_loader:
         fmri = batch["fmri"].to(device)
         features_dict = {k: v.to(device) for k, v in batch["features"].items()}
-        # Target is fMRI
 
         # Flow loss
         x0 = torch.randn_like(fmri)
@@ -223,7 +208,7 @@ def validate(model, val_loader, fm, device, ode_steps=50,
         cos = F.cosine_similarity(v_pred, ut, dim=-1).mean().item()
         all_v_cos.append(cos)
 
-        # Generation: noise → fMRI directly
+        # Generation: noise → fMRI
         fmri_gen = torch.zeros_like(fmri)
         for _ in range(num_trials):
             x0_trial = torch.randn_like(fmri)
@@ -232,7 +217,7 @@ def validate(model, val_loader, fm, device, ode_steps=50,
                     model, x0_trial, features_dict, T=ode_steps,
                     cfg_scale=cfg_scale)
             else:
-                ode_fn = BrainFlowV2ODEWrapper(model, features_dict, cfg_scale)
+                ode_fn = BrainFlowODEWrapper(model, features_dict, cfg_scale)
                 t_span = torch.linspace(0, 1, ode_steps, device=device)
                 traj = odeint(ode_fn, x0_trial, t_span, method="midpoint")
                 fmri_trial = traj[-1]
@@ -264,7 +249,7 @@ def validate(model, val_loader, fm, device, ode_steps=50,
 
 def main():
     parser = argparse.ArgumentParser(
-        "BrainFlow V2 — FlowFM-Style Direct Flow Matching")
+        "BrainFlow — FlowFM-Style Direct Flow Matching")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument(
@@ -280,7 +265,6 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    data_cfg = cfg["data"]
     model_cfg = cfg["model"]
     train_cfg = cfg["training"]
 
@@ -299,9 +283,7 @@ def main():
     eval_interval = 1 if args.debug else train_cfg.get("eval_interval", 5)
     sampler = train_cfg.get("sampler", "ode")
     freeze_encoder_epochs = train_cfg.get("freeze_encoder_epochs", 0)
-    log_interval = train_cfg.get("log_interval", 200)  # log every N batches
-
-
+    log_interval = train_cfg.get("log_interval", 200)
 
     # Flow options
     use_ot = train_cfg.get("use_ot", True)
@@ -318,8 +300,7 @@ def main():
     direction_weight = train_cfg.get("direction_weight", 1.0)
     magnitude_weight = train_cfg.get("magnitude_weight", 0.1)
 
-
-    output_dir = cfg.get("output_dir", "results/brainflow_v2")
+    output_dir = cfg.get("output_dir", "results/brainflow")
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "config.yaml"), "w") as f:
         yaml.dump(cfg, f, default_flow_style=False)
@@ -333,29 +314,35 @@ def main():
         handlers=[logging.StreamHandler(),
                   logging.FileHandler(log_file, mode='w')],
     )
-    logger = logging.getLogger('brainflow_v2')
+    logger = logging.getLogger('brainflow')
     logger.info(f"Config: {cfg}")
     logger.info(f"Device: {device}")
 
-    # ── Data ──
-    # build_dataloaders uses a separate data.yaml in the same configs directory
-    data_yaml_path = os.path.join(
-        os.path.dirname(args.config), "data.yaml")
-    modalities = data_cfg.get("modalities", ["video", "audio", "text", "omni"])
-    loaders = build_dataloaders(data_yaml_path, modalities=modalities)
+    # ── Data (unified config — no separate data.yaml) ──
+    project_root = Path(args.config).resolve().parent.parent.parent
+    modalities = list(cfg["features"]["modalities"].keys())
+
+    # Override dataloader batch_size from training config
+    if "dataloader" not in cfg:
+        cfg["dataloader"] = {}
+    cfg["dataloader"]["batch_size"] = batch_size
+
+    loaders = build_dataloaders(
+        cfg, project_root=project_root, modalities=modalities)
     train_loader = loaders.get("train", [])
     val_loader = loaders.get("val", [])
-    logger.info(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    logger.info(
+        f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-    # ── Preload all data to RAM (eliminates HDD I/O during training) ──
+    # ── Preload all data to RAM ──
     preload_datasets_to_ram(loaders)
 
     # ── Model ──
-    model = BrainFlowV2(BrainFlowV2Config(**model_cfg)).to(device)
+    model = BrainFlow(BrainFlowConfig(**model_cfg)).to(device)
     ema_model = copy.deepcopy(model) if use_ema else None
     pc = model.param_count()
     logger.info(
-        f"BrainFlowV2: encoder={pc['encoder_M']:.1f}M "
+        f"BrainFlow: encoder={pc['encoder_M']:.1f}M "
         f"cond={pc['cond_M']:.2f}M ctx={pc['ctx_proj_M']:.2f}M "
         f"blocks={pc['blocks_M']:.1f}M "
         f"embed={pc['embed_M']:.2f}M output={pc['output_M']:.3f}M "
@@ -408,7 +395,8 @@ def main():
             f"  Resumed epoch={ckpt['epoch']} | best_pcc={best_pcc:.4f} "
             f"| continuing from epoch {start_epoch}")
     elif resume_path:
-        logger.warning(f"  Checkpoint not found at {resume_path}, training from scratch")
+        logger.warning(
+            f"  Checkpoint not found at {resume_path}, training from scratch")
     logger.info(
         f"Optimizer: encoder_lr={encoder_lr:.2e}, velocity_lr={lr:.2e}")
 
@@ -420,14 +408,11 @@ def main():
         "val_flow_loss", "val_v_cos",
         "val_fmri_mse", "val_fmri_pcc", "val_fmri_spcc",
     ]
-    # On resume: append to existing CSV. On fresh start: write header.
     is_resuming = (start_epoch > 1)
     with open(history_path, "a" if is_resuming else "w", newline="") as f:
         if not is_resuming:
             csv.DictWriter(f, fieldnames=fields).writeheader()
 
-    best_pcc = best_pcc  # already set above (from checkpoint or default -1.0)
-    patience_counter = patience_counter  # already set above
     patience = train_cfg.get("patience", 200)
 
     # ── Training ──
@@ -438,7 +423,7 @@ def main():
         f"Training {num_epochs} epochs, eval every {eval_interval} "
         f"| {ts_info}")
     logger.info(
-        f"BRAINFLOW V2 (FlowFM) | OT={use_ot} "
+        f"BRAINFLOW | OT={use_ot} "
         f"CFG_drop={cfg_drop_prob} Sampler={sampler} "
         f"freeze_enc={freeze_encoder_epochs}ep")
     logger.info(
@@ -446,8 +431,6 @@ def main():
         f"t_weight={timestep_weight_type}"
         + (f" | huber_c={huber_c}"
            if velocity_loss_type == "pseudo_huber" else ""))
-
-    # Precompute ROI index tensors was here, removed.
 
     # ── Mixed Precision (AMP) ──
     use_amp = (device.type == "cuda")
@@ -478,13 +461,13 @@ def main():
 
         for batch_idx, batch in enumerate(train_loader):
             fmri = batch["fmri"].to(device)
-            features_dict = {k: v.to(device) for k, v in batch["features"].items()}
+            features_dict = {
+                k: v.to(device) for k, v in batch["features"].items()}
             B = fmri.shape[0]
 
-            # Per-ROI Soft Target bypassed since feature dataset maps to continuous TR.
             x1 = fmri
 
-            # ─── Flow Matching: x0=noise, x1=soft_target ──────────────────
+            # ─── Flow Matching: x0=noise, x1=fmri ────────────────────────
             x0 = torch.randn_like(x1)
 
             # DGS: Dynamic Guidance Switching on representation
@@ -502,38 +485,9 @@ def main():
             else:
                 t, xt, ut = fm.sample_location_and_conditional_flow(x0, x1)
 
-            # Forward with AMP autocast
+            # Forward with AMP autocast — uses model.forward_with_dgs
             with torch.amp.autocast("cuda", enabled=use_amp):
-                # Forward: predict velocity
-                cls_token, patch_tokens = model.encoder(features_dict)
-                if drop_mask.any():
-                    cls_token = cls_token.clone()
-                    patch_tokens = patch_tokens.clone()
-                    cls_token[drop_mask] = 0.0
-                    patch_tokens[drop_mask] = 0.0
-
-                t_emb = timestep_embedding(
-                    t * 1000, model.config.hidden_dim).to(device)
-                c = model.cond_mlp(cls_token, t_emb)
-
-                context = None
-                if model.use_cross_attention:
-                    context = model.context_norm(
-                        model.context_proj(patch_tokens))
-
-                x_patches = model._patchify(xt)
-                x_tokens = model.patch_embed(x_patches)
-                x_tokens = x_tokens + model.patch_pos_embed
-
-                for block in model.blocks:
-                    x_tokens = block(x_tokens, c, context)
-
-                mod_params = model.final_adaLN(c)
-                shift, scale = mod_params.chunk(2, dim=-1)
-                x_out = modulate(
-                    model.final_layer_norm(x_tokens), shift, scale)
-                x_out = model.output_proj(x_out)
-                v_pred = model._unpatchify(x_out)
+                v_pred = model.forward_with_dgs(t, xt, features_dict, drop_mask)
 
                 # Loss
                 loss, loss_info = compute_velocity_loss(
@@ -583,7 +537,7 @@ def main():
 
         logger.info(
             f"Ep {epoch:4d}/{num_epochs} ({ep_time:.1f}s) "
-            f"[BRAINFLOW_V2] | loss={avg_total:.5f} | "
+            f"[BRAINFLOW] | loss={avg_total:.5f} | "
             f"lr_enc={current_lrs[0]:.2e} lr_vel={current_lrs[1]:.2e} "
             f"grad={avg_grad:.4f}")
 
@@ -609,18 +563,16 @@ def main():
             with open(history_path, "a", newline="") as f:
                 csv.DictWriter(f, fieldnames=fields).writerow(row)
 
-            spcc = val["val_fmri_spcc"]
-            is_best = spcc > best_pcc
+            pcc = val["val_fmri_pcc"]
+            is_best = pcc > best_pcc
             logger.info(
                 f"  VAL | v_cos={val['val_v_cos']:.4f} | "
                 f"f_mse={val['val_fmri_mse']:.4f} "
-                f"f_pcc={val['val_fmri_pcc']:.4f} "
-                f"f_spcc={spcc:.4f}{'  ★' if is_best else ''}")
-
-            # Per-ROI PCC logging removed.
+                f"f_pcc={pcc:.4f}{'  ★' if is_best else ''} "
+                f"f_spcc={val['val_fmri_spcc']:.4f}")
 
             if is_best:
-                best_pcc = spcc
+                best_pcc = pcc
                 patience_counter = 0
                 save_dict = {
                     "epoch": epoch,
@@ -631,7 +583,7 @@ def main():
                 }
                 torch.save(save_dict,
                            os.path.join(output_dir, "best_model.pt"))
-                logger.info(f"  ★ Saved best (PCC={best_pcc:.4f})")
+                logger.info(f"  ★ Saved best (voxel-PCC={best_pcc:.4f})")
             else:
                 patience_counter += 1
 
@@ -639,7 +591,7 @@ def main():
                 logger.info(f"  Early stopping at epoch {epoch}")
                 break
 
-        # Save latest.pt every epoch (enables resume at any point)
+        # Save latest.pt every epoch
         save_dict = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -651,12 +603,12 @@ def main():
             save_dict["ema_state_dict"] = ema_model.state_dict()
         torch.save(save_dict, os.path.join(output_dir, "latest.pt"))
 
-        # Save periodic snapshot (every save_every epochs)
+        # Save periodic snapshot
         if epoch % train_cfg.get("save_every", 50) == 0:
             torch.save(save_dict,
                        os.path.join(output_dir, f"ckpt_ep{epoch:04d}.pt"))
 
-    logger.info(f"Done! Best PCC: {best_pcc:.4f}")
+    logger.info(f"Done! Best voxel-PCC: {best_pcc:.4f}")
 
 
 if __name__ == "__main__":
