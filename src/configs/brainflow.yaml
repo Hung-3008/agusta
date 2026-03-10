@@ -60,6 +60,10 @@ splits:
 
 val_ratio: 0.1
 
+# subject_mode: 'single' = per-subject fMRI with SubjectLayers (4x data)
+#               'avg' = average fMRI across subjects (1x data, no SubjectLayers)
+subject_mode: single
+
 preprocessing:
   fmri:
     standardize: zscore_sample
@@ -129,4 +133,4 @@ dataloader:
   pin_memory: true
   prefetch_factor: 2
 
-output_dir: results/subj01/brainflow
+output_dir: results/brainflow_multi

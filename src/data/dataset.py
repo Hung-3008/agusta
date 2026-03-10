@@ -314,7 +314,11 @@ def load_feature_clip_npy(
 
     npy_path = Path(features_npy_dir) / subdir / h5_stem / f"{clip_name}.npy"
     if not npy_path.exists():
-        return None
+        # Fallback: try with movie_type prefix (text extractor uses 'movie10_bourne01')
+        alt_name = f"{movie_type}_{clip_name}"
+        npy_path = Path(features_npy_dir) / subdir / h5_stem / f"{alt_name}.npy"
+        if not npy_path.exists():
+            return None
 
     data = np.load(npy_path)  # (dim, n_trs) or (n_tokens, dim, n_trs)
 
@@ -445,6 +449,9 @@ def build_clip_index(
 
     For movie10 clips with multiple fMRI runs (life/figures), each run
     produces a separate index entry (same features, different fMRI scan).
+
+    When subject_mode='avg', creates 1 entry per clip (with averaged fMRI
+    across subjects) instead of per-subject entries.
     """
     fmri_dir = cfg["_fmri_dir"]
     features_dir = cfg["_features_dir"]
@@ -452,6 +459,7 @@ def build_clip_index(
     splits_cfg = cfg["splits"]
     val_ratio = cfg.get("val_ratio", 0.1)
     modalities = cfg["features"]["modalities"]
+    subject_mode = cfg.get("subject_mode", "single")
 
     index = []
 
@@ -485,37 +493,62 @@ def build_clip_index(
                             clip_name, val_ratio=val_ratio
                         )
 
-                    for subject in subjects:
-                        # Verify fMRI exists for this subject
-                        fmri_path = _get_fmri_filepath(fmri_dir, subject, task)
-                        if not fmri_path.exists():
+                    if subject_mode == "avg" and split_name != "test":
+                        # Avg mode: 1 entry per clip, average fMRI across subjects
+                        # Find subjects that have fMRI for this clip
+                        avail_subjects = []
+                        for subj in subjects:
+                            fmri_path = _get_fmri_filepath(fmri_dir, subj, task)
+                            if fmri_path.exists():
+                                avail_subjects.append(subj)
+                        if not avail_subjects:
                             continue
 
-                        # Enumerate runs (movie10 life/figures may have run-1/run-2)
-                        if split_name == "test":
-                            # Test clips have no fMRI — just add one entry
-                            runs = [None]
-                        else:
-                            runs = _enumerate_fmri_runs(
-                                fmri_dir, subject, task, fmri_key)
-                            if not runs:
+                        # For avg mode, use run=None (average all runs too)
+                        index.append({
+                            "subject": "avg",
+                            "all_subjects": avail_subjects,
+                            "task": task,
+                            "movie_type": task,
+                            "stimulus_type": stim_type,
+                            "clip_name": clip_name,
+                            "fmri_key": fmri_key,
+                            "split": clip_split,
+                            "run": None,
+                        })
+                    else:
+                        # Single mode: 1 entry per (subject, clip)
+                        for subject in subjects:
+                            fmri_path = _get_fmri_filepath(
+                                fmri_dir, subject, task)
+                            if not fmri_path.exists():
                                 continue
 
-                        for run in runs:
-                            index.append({
-                                "subject": subject,
-                                "task": task,
-                                "movie_type": task,
-                                "stimulus_type": stim_type,
-                                "clip_name": clip_name,
-                                "fmri_key": fmri_key,
-                                "split": clip_split,
-                                "run": run,
-                            })
+                            # Enumerate runs
+                            if split_name == "test":
+                                runs = [None]
+                            else:
+                                runs = _enumerate_fmri_runs(
+                                    fmri_dir, subject, task, fmri_key)
+                                if not runs:
+                                    continue
 
+                            for run in runs:
+                                index.append({
+                                    "subject": subject,
+                                    "task": task,
+                                    "movie_type": task,
+                                    "stimulus_type": stim_type,
+                                    "clip_name": clip_name,
+                                    "fmri_key": fmri_key,
+                                    "split": clip_split,
+                                    "run": run,
+                                })
+
+    mode_str = f"mode={subject_mode}"
     logger.info(
-        "Built clip index: %d entries (%d subjects × clips)",
-        len(index), len(subjects),
+        "Built clip index: %d entries (%s, %d subjects)",
+        len(index), mode_str, len(subjects),
     )
     return index
 
@@ -585,10 +618,16 @@ class SlidingWindowDataset(Dataset):
             mod_cfg = cfg["features"]["modalities"].get(mod, {})
             self._keep_tokens[mod] = mod_cfg.get("keep_tokens", False)
 
+        # Subject mode
+        self.subject_mode = cfg.get("subject_mode", "single")
+
         # Subject name → integer ID mapping
-        self.subject_to_id = {
-            s: i for i, s in enumerate(cfg["subjects"])
-        }
+        if self.subject_mode == "avg":
+            self.subject_to_id = {"avg": 0}
+        else:
+            self.subject_to_id = {
+                s: i for i, s in enumerate(cfg["subjects"])
+            }
 
         # Build clip index & sample index
         clip_index = build_clip_index(cfg)
@@ -638,10 +677,7 @@ class SlidingWindowDataset(Dataset):
             fmri_key = ("fmri", clip_idx)
             if fmri_key not in self._ram_store:
                 try:
-                    data = load_fmri_clip(
-                        self.fmri_dir, info["subject"], info["task"],
-                        info["fmri_key"], standardize=self.standardize,
-                    )
+                    data = self._load_fmri(clip_idx)
                     self._ram_store[fmri_key] = data
                     total_bytes += data.nbytes
                 except Exception as e:
@@ -698,9 +734,14 @@ class SlidingWindowDataset(Dataset):
 
     def _get_clip_n_trs(self, clip_info: dict) -> int | None:
         """Get number of TRs for a clip by peeking at fMRI data."""
+        if clip_info.get("subject") == "avg":
+            # Avg mode: use first available subject
+            subject = clip_info["all_subjects"][0]
+        else:
+            subject = clip_info["subject"]
         try:
             fmri_path = _get_fmri_filepath(
-                self.fmri_dir, clip_info["subject"], clip_info["task"]
+                self.fmri_dir, subject, clip_info["task"]
             )
             run = clip_info.get("run")
             with h5py.File(fmri_path, "r") as f:
@@ -709,8 +750,9 @@ class SlidingWindowDataset(Dataset):
                 if run is not None and len(matched) > 1:
                     run_str = f"run-{run}"
                     matched = [k for k in matched if run_str in k]
-                if len(matched) != 1:
+                if len(matched) < 1:
                     return None
+                # For avg mode, just use first match
                 shape = f[matched[0]].shape
                 # shape is always (n_trs, n_voxels) from h5
                 return shape[0]
@@ -727,13 +769,42 @@ class SlidingWindowDataset(Dataset):
         cached = self._cache.get(key)
         if cached is None:
             info = self.clip_index[clip_idx]
-            cached = load_fmri_clip(
-                self.fmri_dir, info["subject"], info["task"],
-                info["fmri_key"], standardize=self.standardize,
-                run=info.get("run"),
-            )
+            if info.get("subject") == "avg":
+                cached = self._load_fmri_avg(info)
+            else:
+                cached = load_fmri_clip(
+                    self.fmri_dir, info["subject"], info["task"],
+                    info["fmri_key"], standardize=self.standardize,
+                    run=info.get("run"),
+                )
             self._cache.put(key, cached)
         return cached
+
+    def _load_fmri_avg(self, clip_info: dict) -> np.ndarray:
+        """Load and average fMRI across all subjects (and runs) for a clip."""
+        all_subjects = clip_info["all_subjects"]
+        fmri_list = []
+        for subj in all_subjects:
+            # Enumerate runs for this subject (handles life/figures run-1/run-2)
+            runs = _enumerate_fmri_runs(
+                self.fmri_dir, subj, clip_info["task"], clip_info["fmri_key"])
+            for run in runs:
+                try:
+                    data = load_fmri_clip(
+                        self.fmri_dir, subj, clip_info["task"],
+                        clip_info["fmri_key"], standardize=self.standardize,
+                        run=run,
+                    )
+                    fmri_list.append(data)
+                except Exception as e:
+                    logger.debug("Skip %s run=%s for avg: %s", subj, run, e)
+        if not fmri_list:
+            raise ValueError(
+                f"No fMRI data for avg: {clip_info['fmri_key']}")
+        # Average across subjects: all should be (n_voxels, n_trs)
+        min_trs = min(d.shape[1] for d in fmri_list)
+        stacked = np.stack([d[:, :min_trs] for d in fmri_list], axis=0)
+        return stacked.mean(axis=0)  # (n_voxels, n_trs)
 
     def _load_features(self, clip_idx: int, modality: str) -> np.ndarray:
         """Load and resample features for clip (LRU cached).
@@ -835,17 +906,23 @@ class SlidingWindowDataset(Dataset):
         # Load features for each modality
         features = {}
         for mod in self.modalities:
+            expected_dim = self.cfg["features"]["modalities"][mod]["dim"]
             try:
                 feat = self._load_features(clip_idx, mod)  # (L, D, T)
                 keep_tokens = self._keep_tokens.get(mod, False)
+
+                # Validate feature dimension
+                if feat.shape[1] != expected_dim:
+                    raise ValueError(
+                        f"{mod} dim mismatch: got {feat.shape[1]}, "
+                        f"expected {expected_dim}")
+
                 # Crop context window
                 feat_window = feat[:, :, ctx_start:ctx_end]  # (L, D, context_trs)
 
                 if keep_tokens:
                     # Omni keep_tokens: (N_tokens, D, ctx) → (ctx * N_tokens, D)
-                    # Interleave: for each timestep, all N tokens appear sequentially
                     N, D, T = feat_window.shape
-                    # permute to (T, N, D) then reshape to (T*N, D)
                     feat_flat = feat_window.transpose(2, 0, 1).reshape(T * N, D)
                 else:
                     # Standard: (L, D, T) → (T, L*D)
@@ -853,15 +930,14 @@ class SlidingWindowDataset(Dataset):
                     feat_flat = feat_window.reshape(L * D, T).T  # (context_trs, L*D)
 
                 features[mod] = torch.from_numpy(feat_flat)
-            except (FileNotFoundError, KeyError) as e:
-                logger.debug("Missing %s for clip %s: %s", mod, clip_info["clip_name"], e)
-                # Return zeros for missing modalities
+            except Exception as e:
+                logger.debug("Missing/bad %s for clip %s: %s", mod, clip_info["clip_name"], e)
+                # Return zeros for missing/corrupted modalities
                 if self._keep_tokens.get(mod, False):
                     n_tokens = self.cfg["features"]["modalities"][mod].get("n_tokens", 5)
-                    dim = self.cfg["features"]["modalities"][mod]["dim"]
-                    features[mod] = torch.zeros(self.context_trs * n_tokens, dim)
+                    features[mod] = torch.zeros(self.context_trs * n_tokens, expected_dim)
                 else:
-                    features[mod] = torch.zeros(self.context_trs, 1)
+                    features[mod] = torch.zeros(self.context_trs, expected_dim)
 
         # Load fMRI target (single TR)
         fmri = self._load_fmri(clip_idx)  # (n_voxels, n_trs)

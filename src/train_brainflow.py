@@ -344,8 +344,9 @@ def main():
     preload_datasets_to_ram(loaders)
 
     # ── Model ──
+    n_subjects = 1 if cfg.get("subject_mode", "single") == "avg" else len(cfg["subjects"])
     model = BrainFlow(BrainFlowConfig(
-        **model_cfg, n_subjects=len(cfg["subjects"]))).to(device)
+        **model_cfg, n_subjects=n_subjects)).to(device)
     ema_model = copy.deepcopy(model) if use_ema else None
     pc = model.param_count()
     logger.info(
