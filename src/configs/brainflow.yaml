@@ -1,136 +1,139 @@
-# ═══════════════════════════════════════════════════════════════════════════════
-# BrainFlow — Unified Configuration
-# ═══════════════════════════════════════════════════════════════════════════════
+# =====================================================================
+# BrainFlow: Conditional Flow Matching for fMRI generation
+# =====================================================================
+# Data configuration for SlidingWindowDataset
+# Model + Training hyperparameters
+# =====================================================================
 
-# ── Data ──
-data_root: Data/algonauts_2025.competitors
+# --- Data paths (relative to project root) ---
+data_root: Data
 
 fmri:
-  dir: fmri
+  dir: algonauts_2025.competitors/fmri
   tr: 1.49
   n_voxels: 1000
 
 features:
-  dir: ../features
-  npy_dir: ../features_npy
-  sample_freq: 2.0
-  layer_aggregation: last
+  dir: features                    # H5 features (fallback)
+  npy_dir: features_npy            # NPY features (primary, faster)
+  npy_only: true                   # NPY-only mode: skip H5 entirely
+  sample_freq: 2.0                 # extraction rate for unimodal features
+  layer_aggregation: mean          # NPY already mean-pooled, this only applies to H5
+
   modalities:
     video:
       subdir: video
       file_pattern: "{movie_type}_{stimulus_type}_features_vjepa2.h5"
+      npy_pattern: "{movie_type}_{stimulus_type}_features_vjepa2"
       h5_key: video
       dim: 1408
     audio:
       subdir: audio
       file_pattern: "{movie_type}_{stimulus_type}_features_w2vbert.h5"
+      npy_pattern: "{movie_type}_{stimulus_type}_features_w2vbert"
       h5_key: audio
       dim: 1024
     text:
       subdir: text
       file_pattern: "{movie_type}_{stimulus_type}_features_llama3.h5"
+      npy_pattern: "{movie_type}_{stimulus_type}_features_llama3"
       h5_key: text
       dim: 3072
     omni:
       subdir: omni
       file_pattern: "{movie_type}_{stimulus_type}_features_qwen_omni.h5"
+      npy_pattern: "{movie_type}_{stimulus_type}_features_qwen_omni"
       h5_key: omni
-      dim: 3584
-      n_tokens: 5
-      keep_tokens: true
       data_format: tr_tokens_dim
-      sample_freq: tr
+      dim: 3584
+      keep_tokens: false   # mean-pool tokens → (1, 3584, n_trs)
 
-sliding_window:
-  context_duration: 14.9
-  stride: 1.49
-
+# --- Subjects ---
 subjects:
   - sub-01
   - sub-02
   - sub-03
   - sub-05
 
+subject_mode: single     # 'single' or 'avg'
+
+# --- Splits ---
 splits:
   friends:
     train: [s1, s2, s3, s4, s5, s6]
     test: [s7]
-  movie10:
-    train: [bourne, wolf, life, figures]
 
 val_ratio: 0.1
 
-# subject_mode: 'single' = per-subject fMRI with SubjectLayers (4x data)
-#               'avg' = average fMRI across subjects (1x data, no SubjectLayers)
-subject_mode: single
+# --- Sliding window ---
+sliding_window:
+  context_duration: 14.9   # seconds (~10 TRs)
+  stride: 1.49             # seconds (1 TR stride)
 
+# --- Preprocessing ---
 preprocessing:
   fmri:
     standardize: zscore_sample
 
-# ── Model ──
+# --- DataLoader ---
+dataloader:
+  batch_size: 256
+  val_batch_size: 256
+  num_workers: 0
+  max_cache_gb: 12.0
+  pin_memory: true
+  prefetch_factor: 2
+
+# =====================================================================
+# Model config
+# =====================================================================
 model:
-  n_voxels: 1000
-  patch_size: 100
-  hidden_dim: 768
-  depth: 12
-  num_heads: 12
-  mlp_ratio: 4.0
-  dropout: 0.1
-  drop_path_rate: 0.1
-  feature_dims:
+  # Feature Encoder
+  modality_dims:
     video: 1408
     audio: 1024
     text: 3072
     omni: 3584
-  encoder_dim: 1024
-  encoder_depth: 2
-  encoder_heads: 8
-  feature_patches: 4
-  cond_dim: 1024
+  encoder_hidden_dim: 1024
+  n_transformer_layers: 4
+  n_heads: 8
+  modality_dropout: 0.3
 
-# ── Training ──
+  # Velocity Network
+  n_voxels: 1000
+  velocity_hidden_dim: 2048
+  n_velocity_blocks: 8
+  time_embed_dim: 256
+  n_subjects: 4
+  dropout: 0.1
+
+# =====================================================================
+# Training config
+# =====================================================================
 training:
-  batch_size: 512
-  lr: 0.0003
-  encoder_lr: 0.0001
-  num_epochs: 300
-  warmup_epochs: 20
+  n_epochs: 300
+  lr: 1.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
   grad_clip: 1.0
-  weight_decay: 0.1
-  ema_decay: 0.99
-  use_ema: true
-  eval_interval: 10
-  patience: 40
-  save_every: 50
+  ema_decay: 0.999
+  cfm_sigma: 0.0           # OT-CFM noise level (0 = deterministic interpolant)
+  cfm_method: otcfm         # otcfm | icfm | fm | si
 
-  # Flow matching
-  use_ot: false
-  sigma: 0.05
-  timestep_sampling: logit_normal
-  logit_normal_mu: 0.0
-  logit_normal_sigma: 1.0
+  # Mixed precision
+  use_amp: true
 
-  # DGS (Dynamic Guidance Switching)
-  cfg_drop_prob: 0.4
-  cfg_scale: 1.0
+  # Preload data to RAM (eliminates HDD I/O)
+  preload_to_ram: true
 
-  # Sampling
-  ode_steps: 20
-  num_trials: 1
-  sampler: ode
-  log_interval: 200
+  # Logging
+  log_every_n_steps: 50
+  val_every_n_epochs: 10
+  save_top_k: 3
 
-  # Velocity loss
-  velocity_loss_type: pseudo_huber
-  huber_c: 0.1
-  timestep_weight_type: cosine
+  # Inference / sampling during validation
+  n_sample_steps: 20          # ODE integration steps
+  sample_method: euler         # euler | midpoint
 
-# ── DataLoader ──
-dataloader:
-  num_workers: 0
-  max_cache_gb: 10.0
-  pin_memory: true
-  prefetch_factor: 2
-
-output_dir: results/brainflow_multi
+# --- Output ---
+output_dir: outputs/brainflow

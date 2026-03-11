@@ -396,11 +396,19 @@ def _clip_name_to_fmri_key(clip_name: str, task: str) -> str:
         return clip_name
 
 
-def _deterministic_split(uid: str, val_ratio: float = 0.1) -> str:
-    """Deterministically assign a clip to train or val based on hash."""
+def _deterministic_split(uid: str, val_ratio: float = 0.1, seed: float = 0.0) -> str:
+    """Deterministically assign a clip to train or val based on hash.
+
+    Matches TRIBE's DeterministicSplitter exactly:
+      ratios = {'train': 1 - val_ratio, 'val': val_ratio}, seed = 0.0
+    """
     hashed = int(hashlib.sha256(uid.encode()).hexdigest(), 16)
-    rng = random.Random(hashed)
-    return "val" if rng.random() < val_ratio else "train"
+    rng = random.Random(hashed + seed)
+    score = rng.random()
+    # CDF-based split: train first, then val
+    if score < (1.0 - val_ratio):
+        return "train"
+    return "val"
 
 
 def _enumerate_fmri_runs(
@@ -463,6 +471,10 @@ def build_clip_index(
 
     index = []
 
+    # NPY-only mode: discover clips from NPY dirs instead of H5 files
+    npy_only = cfg.get("features", {}).get("npy_only", False)
+    features_npy_dir = cfg.get("_features_npy_dir")
+
     for task, task_splits in splits_cfg.items():
         for split_name, stim_types in task_splits.items():
             for stim_type in stim_types:
@@ -470,17 +482,42 @@ def build_clip_index(
                 # Use the first available modality to discover clip names
                 first_mod = next(iter(modalities))
                 mod_cfg = modalities[first_mod]
-                filename = mod_cfg["file_pattern"].format(
-                    movie_type=task, stimulus_type=stim_type
-                )
-                feat_path = Path(features_dir) / mod_cfg["subdir"] / filename
 
-                if not feat_path.exists():
-                    logger.warning("Feature file missing, skipping: %s", feat_path)
-                    continue
+                clip_names = None
 
-                with h5py.File(feat_path, "r") as f:
-                    clip_names = list(f.keys())
+                # NPY-only: enumerate .npy files in the NPY directory
+                if npy_only and features_npy_dir:
+                    npy_pattern = mod_cfg.get("npy_pattern")
+                    if npy_pattern:
+                        npy_dirname = npy_pattern.format(
+                            movie_type=task, stimulus_type=stim_type
+                        )
+                    else:
+                        # Fallback: derive from H5 filename
+                        h5_name = mod_cfg["file_pattern"].format(
+                            movie_type=task, stimulus_type=stim_type
+                        )
+                        npy_dirname = h5_name.replace(".h5", "")
+                    npy_dir_path = Path(features_npy_dir) / mod_cfg["subdir"] / npy_dirname
+                    if npy_dir_path.exists():
+                        clip_names = sorted(
+                            p.stem for p in npy_dir_path.glob("*.npy")
+                        )
+                    else:
+                        logger.warning("NPY dir missing, skipping: %s", npy_dir_path)
+                        continue
+
+                # H5 fallback
+                if clip_names is None:
+                    filename = mod_cfg["file_pattern"].format(
+                        movie_type=task, stimulus_type=stim_type
+                    )
+                    feat_path = Path(features_dir) / mod_cfg["subdir"] / filename
+                    if not feat_path.exists():
+                        logger.warning("Feature file missing, skipping: %s", feat_path)
+                        continue
+                    with h5py.File(feat_path, "r") as f:
+                        clip_names = list(f.keys())
 
                 for clip_name in clip_names:
                     fmri_key = _clip_name_to_fmri_key(clip_name, task)
@@ -1008,6 +1045,9 @@ def build_dataloaders(
     pin_memory = dl_cfg.get("pin_memory", True)
     prefetch = dl_cfg.get("prefetch_factor", 2)
 
+    val_batch_size = dl_cfg.get("val_batch_size",
+                                 cfg.get("training", {}).get("val_batch_size", batch_size))
+
     loaders = {}
     for split in splits:
         dataset = SlidingWindowDataset(
@@ -1017,9 +1057,10 @@ def build_dataloaders(
         if len(dataset) == 0:
             logger.warning("Empty dataset for split '%s', skipping", split)
             continue
+        bs = batch_size if split == "train" else val_batch_size
         loaders[split] = DataLoader(
             dataset,
-            batch_size=batch_size,
+            batch_size=bs,
             shuffle=(split == "train"),
             num_workers=num_workers,
             pin_memory=pin_memory,
