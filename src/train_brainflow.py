@@ -27,7 +27,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import pearsonr
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler
+from torch.amp import autocast
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -107,7 +108,7 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=use_amp):
+        with autocast('cuda', enabled=use_amp):
             # ── Compute x0 (deterministic prior) ──────────────────────────────
             x0 = model.prior_encoder(features)   # (B, 1000)
             x1 = fmri
@@ -190,7 +191,7 @@ def validate(
         fmri        = batch["fmri"].to(device, non_blocking=True).float()
         subject_id  = batch["subject_id"].to(device, non_blocking=True)
 
-        with autocast(enabled=use_amp):
+        with autocast('cuda', enabled=use_amp):
             x0 = model.prior_encoder(features)
             x1 = fmri
             
@@ -297,6 +298,7 @@ def main():
     n_epochs       = train_cfg["n_epochs"]
     steps_per_epoch = len(train_loader)
     total_steps    = n_epochs * steps_per_epoch
+    total_steps    = max(1, total_steps)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=train_cfg["lr"],
@@ -306,7 +308,7 @@ def main():
     )
 
     use_amp = train_cfg.get("use_amp", True) and device.type == "cuda"
-    scaler  = GradScaler(enabled=use_amp)
+    scaler  = GradScaler('cuda', enabled=use_amp)
     lambda_prior = train_cfg.get("lambda_prior", 0.5)
 
     # ── Resume ────────────────────────────────────────────────────────────────
