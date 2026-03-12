@@ -2,19 +2,25 @@
 """
 Convert pre-extracted H5 feature files → per-clip NPY files.
 
-Layer aggregation: mean across all layers (default) or last layer.
+Layer aggregation:
+  mean  — mean across all layers (default)
+  last  — use last layer only
+  cat   — concatenate last N layers (use --n_layers to control N)
+
 For omni (tr_tokens_dim format): mean-pool tokens.
 
 Output structure mirrors H5 but as flat per-clip npy files:
   Data/features_npy/{modality}/{movie_type}_{stimulus_type}/{clip_name}.npy
 
 Shape after conversion:
-  video/audio/text: (dim, n_trs)   — layers mean-pooled
-  omni:             (dim, n_trs)   — tokens mean-pooled
+  mean/last: (dim, n_trs)
+  cat:       (N*dim, n_trs)  — N = n_layers
+  omni:      (dim, n_trs)    — tokens mean-pooled
 
 Usage:
   python src/data/convert_h5_to_npy.py
   python src/data/convert_h5_to_npy.py --aggregation last
+  python src/data/convert_h5_to_npy.py --aggregation cat --n_layers 4
   python src/data/convert_h5_to_npy.py --modalities video audio
   python src/data/convert_h5_to_npy.py --dry_run
 """
@@ -53,19 +59,20 @@ MODALITY_CONFIGS = {
 
 
 def convert_clip(data: np.ndarray, data_format: str, aggregation: str,
-                 keep_tokens: bool = False) -> np.ndarray:
+                 keep_tokens: bool = False, n_layers: int = 4) -> np.ndarray:
     """
     Convert raw H5 clip data to output array.
 
     Args:
         data: raw array from H5
         data_format: 'layers_dim_tr' or 'tr_tokens_dim'
-        aggregation: 'mean' or 'last' (only for layers_dim_tr)
+        aggregation: 'mean', 'last', or 'cat' (only for layers_dim_tr)
         keep_tokens: if True, keep individual tokens for tr_tokens_dim
                      output shape: (n_tokens, dim, n_trs) instead of (dim, n_trs)
+        n_layers: number of last layers to concatenate (only for aggregation='cat')
 
     Returns:
-        np.ndarray of shape (dim, n_trs) or (n_tokens, dim, n_trs), float32
+        np.ndarray of shape (dim, n_trs), (N*dim, n_trs), or (n_tokens, dim, n_trs)
     """
     if data_format == "tr_tokens_dim":
         if keep_tokens:
@@ -79,6 +86,13 @@ def convert_clip(data: np.ndarray, data_format: str, aggregation: str,
         # layers_dim_tr: (n_layers, dim, n_trs)
         if aggregation == "last":
             return data[-1].astype(np.float32)   # (dim, n_trs)
+        elif aggregation == "cat":
+            # Concatenate last N layers: (N, dim, T) → (N*dim, T)
+            n = min(n_layers, data.shape[0])
+            selected = data[-n:]  # last N layers: (N, dim, T)
+            # Reshape: (N, dim, T) → (N*dim, T)
+            N, D, T = selected.shape
+            return selected.reshape(N * D, T).astype(np.float32)
         else:  # mean
             return data.mean(axis=0).astype(np.float32)  # (dim, n_trs)
 
@@ -88,6 +102,7 @@ def convert_modality(
     out_root: Path,
     modality: str,
     aggregation: str = "mean",
+    n_layers: int = 4,
     keep_omni_tokens: bool = False,
     dry_run: bool = False,
     overwrite: bool = False,
@@ -142,6 +157,7 @@ def convert_modality(
                 converted = convert_clip(
                     raw, cfg["data_format"], aggregation,
                     keep_tokens=(keep_omni_tokens and modality == "omni"),
+                    n_layers=n_layers,
                 )
                 # Replace NaN/Inf with 0
                 converted = np.nan_to_num(converted, nan=0.0, posinf=0.0, neginf=0.0)
@@ -185,8 +201,9 @@ def main():
         help="Which modalities to convert"
     )
     parser.add_argument(
-        "--aggregation", default="mean", choices=["mean", "last"],
-        help="Layer aggregation: 'mean' pools all layers, 'last' uses last layer only"
+        "--aggregation", default="mean", choices=["mean", "last", "cat"],
+        help="Layer aggregation: 'mean' pools all layers, 'last' uses last layer, "
+             "'cat' concatenates last N layers (see --n_layers)"
     )
     parser.add_argument(
         "--dry_run", action="store_true",
@@ -200,6 +217,10 @@ def main():
         "--keep_omni_tokens", action="store_true",
         help="Keep individual omni tokens instead of mean-pooling. "
              "Output shape: (n_tokens, dim, n_trs) instead of (dim, n_trs)"
+    )
+    parser.add_argument(
+        "--n_layers", type=int, default=4,
+        help="Number of last layers to concatenate (only used with --aggregation cat)"
     )
     args = parser.parse_args()
 
@@ -224,6 +245,7 @@ def main():
         stats = convert_modality(
             feat_root, out_root, modality,
             aggregation=args.aggregation,
+            n_layers=args.n_layers,
             keep_omni_tokens=args.keep_omni_tokens,
             dry_run=args.dry_run,
             overwrite=args.overwrite,

@@ -15,10 +15,10 @@ fmri:
 
 features:
   dir: features                    # H5 features (fallback)
-  npy_dir: features_npy            # NPY features (primary, faster)
+  npy_dir: features_npy_cat        # NPY features with last-4-layer concatenation
   npy_only: true                   # NPY-only mode: skip H5 entirely
   sample_freq: 2.0                 # extraction rate for unimodal features
-  layer_aggregation: mean          # NPY already mean-pooled, this only applies to H5
+  layer_aggregation: cat           # last-4-layer concat (matching NPY conversion)
 
   modalities:
     video:
@@ -26,19 +26,19 @@ features:
       file_pattern: "{movie_type}_{stimulus_type}_features_vjepa2.h5"
       npy_pattern: "{movie_type}_{stimulus_type}_features_vjepa2"
       h5_key: video
-      dim: 1408
+      dim: 5632                        # 4 layers × 1408
     audio:
       subdir: audio
       file_pattern: "{movie_type}_{stimulus_type}_features_w2vbert.h5"
       npy_pattern: "{movie_type}_{stimulus_type}_features_w2vbert"
       h5_key: audio
-      dim: 1024
+      dim: 4096                        # 4 layers × 1024
     text:
       subdir: text
       file_pattern: "{movie_type}_{stimulus_type}_features_llama3.h5"
       npy_pattern: "{movie_type}_{stimulus_type}_features_llama3"
       h5_key: text
-      dim: 3072
+      dim: 12288                       # 4 layers × 3072
     omni:
       subdir: omni
       file_pattern: "{movie_type}_{stimulus_type}_features_qwen_omni.h5"
@@ -77,8 +77,8 @@ preprocessing:
 
 # --- DataLoader ---
 dataloader:
-  batch_size: 256
-  val_batch_size: 256
+  batch_size: 512
+  val_batch_size: 512
   num_workers: 0
   max_cache_gb: 12.0
   pin_memory: true
@@ -90,18 +90,18 @@ dataloader:
 model:
   # Feature Encoder
   modality_dims:
-    video: 1408
-    audio: 1024
-    text: 3072
-    omni: 3584
-  encoder_hidden_dim: 1024
-  n_transformer_layers: 4
+    video: 5632                        # 4 layers × 1408
+    audio: 4096                        # 4 layers × 1024
+    text: 12288                        # 4 layers × 3072
+    omni: 3584                         # tokens mean-pooled (no layer concat)
+  encoder_hidden_dim: 2048
+  n_transformer_layers: 6
   n_heads: 8
   modality_dropout: 0.3
 
   # Velocity Network
   n_voxels: 1000
-  velocity_hidden_dim: 2048
+  velocity_hidden_dim: 1024
   n_velocity_blocks: 8
   time_embed_dim: 256
   n_subjects: 4
@@ -112,13 +112,13 @@ model:
 # =====================================================================
 training:
   n_epochs: 300
-  lr: 1.0e-4
+  lr: 3.0e-4
   weight_decay: 0.01
-  warmup_ratio: 0.1
+  warmup_ratio: 0.03
   grad_clip: 1.0
   ema_decay: 0.999
-  cfm_sigma: 0.0           # OT-CFM noise level (0 = deterministic interpolant)
-  cfm_method: otcfm         # otcfm | icfm | fm | si
+  cfm_sigma: 0.01          # i-CFM noise level (reduced for cleaner targets)
+  cfm_method: icfm          # icfm: standard independent CFM (safe for conditional gen)
 
   # Mixed precision
   use_amp: true

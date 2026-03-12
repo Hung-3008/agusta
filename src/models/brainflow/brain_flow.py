@@ -4,6 +4,11 @@ Replaces TRIBE's direct prediction with a generative flow matching approach:
   Features → Encoder → Conditioning → Velocity Network → ODE → fMRI
 
 Uses torchcfm for CFM training logic and torchdyn for ODE integration.
+
+Changes from v1:
+  - FeatureEncoder returns both global vector (B, H) and sequence (B, T, H)
+  - VelocityDiTBlock uses cross-attention to encoder features + adaLN FFN
+  - adaLN gate initialized to small non-zero value (not zero)
 """
 
 import math
@@ -36,22 +41,48 @@ class SinusoidalTimeEmbedding(nn.Module):
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # (B, dim)
 
 
-class AdaLNZeroBlock(nn.Module):
-    """FFN block with adaLN-Zero modulation.
+class VelocityDiTBlock(nn.Module):
+    """DiT block with cross-attention to encoder features + adaLN-modulated FFN.
 
-    Applies: x = x + gate * FFN(modulate(LayerNorm(x), shift, scale))
-    where (shift, scale, gate) are predicted from conditioning c.
+    Each block:
+      1. Cross-attention: h attends to encoder feature sequence (B, T, ctx_dim)
+      2. FFN with adaptive LayerNorm modulation from conditioning vector
+
+    Key difference from old AdaLNZeroBlock:
+      - Cross-attention provides rich conditioning even at initialization
+      - FFN gate initialized to small non-zero value (0.1) instead of 0,
+        so FFN contributes from the start
     """
 
-    def __init__(self, dim: int, cond_dim: int, ff_mult: int = 4, dropout: float = 0.0):
+    def __init__(
+        self,
+        dim: int,
+        cond_dim: int,
+        context_dim: int,
+        n_heads: int = 8,
+        ff_mult: int = 4,
+        dropout: float = 0.0,
+    ):
         super().__init__()
-        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
-        # adaLN-Zero: predict shift, scale, gate from condition
+
+        # Cross-attention to encoder features
+        self.norm_x = nn.LayerNorm(dim)
+        self.norm_ctx = nn.LayerNorm(context_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=n_heads,
+            kdim=context_dim,
+            vdim=context_dim,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        # FFN with adaLN modulation
+        self.norm_ffn = nn.LayerNorm(dim, elementwise_affine=False)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(cond_dim, 3 * dim),
         )
-        # FFN
         ff_dim = dim * ff_mult
         self.ffn = nn.Sequential(
             nn.Linear(dim, ff_dim),
@@ -60,14 +91,29 @@ class AdaLNZeroBlock(nn.Module):
             nn.Linear(ff_dim, dim),
             nn.Dropout(dropout),
         )
-        # Zero-init output projection for stable training start
+
+        # Initialize adaLN: shift=0, scale=0, gate=0.1 (NOT zero!)
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        # Set gate bias to 0.1 so FFN has effect from the start
+        with torch.no_grad():
+            self.adaLN_modulation[-1].bias[2 * dim:].fill_(0.1)
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        # c: (B, cond_dim)
-        shift, scale, gate = self.adaLN_modulation(c).chunk(3, dim=-1)  # each (B, dim)
-        h = self.norm(x) * (1 + scale) + shift
+    def forward(
+        self,
+        x: torch.Tensor,       # (B, dim)
+        c: torch.Tensor,       # (B, cond_dim) modulation vector
+        context: torch.Tensor,  # (B, T, context_dim) encoder features
+    ) -> torch.Tensor:
+        # Cross-attention: h queries encoder feature sequence
+        x_q = self.norm_x(x).unsqueeze(1)   # (B, 1, dim)
+        ctx = self.norm_ctx(context)          # (B, T, context_dim)
+        attn_out, _ = self.cross_attn(x_q, ctx, ctx)  # (B, 1, dim)
+        x = x + attn_out.squeeze(1)          # (B, dim)
+
+        # FFN with adaLN modulation
+        shift, scale, gate = self.adaLN_modulation(c).chunk(3, dim=-1)
+        h = self.norm_ffn(x) * (1 + scale) + shift
         h = self.ffn(h)
         return x + gate * h
 
@@ -77,20 +123,19 @@ class AdaLNZeroBlock(nn.Module):
 # =============================================================================
 
 class FeatureEncoder(nn.Module):
-    """Encode multimodal features into a conditioning vector.
+    """Encode multimodal features into conditioning vectors.
 
     Adapted from TRIBE's FmriEncoder: per-modality MLP projectors → concat
-    → Transformer encoder → mean-pool → conditioning vector.
+    → Transformer encoder → mean-pool + full sequence.
 
-    Input from SlidingWindowDataset.__getitem__:
-        features[mod]: (context_trs, mod_dim) per modality
-    After batching:
-        features[mod]: (B, context_trs, mod_dim) per modality
+    Returns:
+        c_global : (B, H) — mean-pooled conditioning for time embedding
+        c_seq    : (B, T, H) — full sequence for cross-attention in velocity net
     """
 
     def __init__(
         self,
-        modality_dims: dict[str, int],    # e.g. {"video": 1280, "audio": 1024, "text": 3072, "omni": 3584}
+        modality_dims: dict[str, int],
         hidden_dim: int = 1024,
         n_transformer_layers: int = 4,
         n_heads: int = 8,
@@ -137,8 +182,8 @@ class FeatureEncoder(nn.Module):
         )
         self.output_norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, features: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Encode multimodal features → conditioning vector.
+    def forward(self, features: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode multimodal features → global vector + sequence.
 
         Parameters
         ----------
@@ -147,8 +192,10 @@ class FeatureEncoder(nn.Module):
 
         Returns
         -------
-        c : Tensor (B, hidden_dim)
+        c_global : Tensor (B, hidden_dim)
             Global conditioning vector (mean-pooled).
+        c_seq : Tensor (B, T, hidden_dim)
+            Full temporal sequence for cross-attention.
         """
         B = next(iter(features.values())).shape[0]
         T = next(iter(features.values())).shape[1]
@@ -194,9 +241,77 @@ class FeatureEncoder(nn.Module):
         x = self.transformer(x)  # (B, T, hidden_dim)
         x = self.output_norm(x)
 
-        # Mean-pool over time → global conditioning
-        c = x.mean(dim=1)  # (B, hidden_dim)
-        return c
+        # Return both global (mean-pooled) and sequence
+        c_global = x.mean(dim=1)  # (B, hidden_dim)
+        c_seq = x                  # (B, T, hidden_dim)
+        return c_global, c_seq
+
+
+# =============================================================================
+# Subject Layers (per-subject linear decoder, identical to TRIBE)
+# =============================================================================
+
+class SubjectLayers(nn.Module):
+    """Per-subject linear projection layer.
+
+    Each subject has its own weight matrix to map from shared hidden
+    representation to subject-specific fMRI space. This captures anatomical
+    differences between subjects that a single shared layer cannot.
+
+    Identical to TRIBE's SubjectLayers (Meta AI, 2024).
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        n_subjects: int,
+        bias: bool = True,
+        init_id: bool = False,
+    ):
+        super().__init__()
+        self.weights = nn.Parameter(torch.empty(n_subjects, in_channels, out_channels))
+        self.bias = nn.Parameter(torch.empty(n_subjects, out_channels)) if bias else None
+
+        if init_id:
+            if in_channels != out_channels:
+                raise ValueError("in_channels must equal out_channels for identity init.")
+            self.weights.data[:] = torch.eye(in_channels)[None]
+            if self.bias is not None:
+                self.bias.data.zero_()
+        else:
+            self.weights.data.normal_()
+            if self.bias is not None:
+                self.bias.data.normal_()
+        # Scale init by 1/sqrt(in_channels) for stable activations
+        self.weights.data *= 1.0 / in_channels ** 0.5
+        if self.bias is not None:
+            self.bias.data *= 1.0 / in_channels ** 0.5
+
+    def forward(self, x: torch.Tensor, subjects: torch.Tensor) -> torch.Tensor:
+        """Apply per-subject linear projection.
+
+        Parameters
+        ----------
+        x : (B, in_channels)
+        subjects : (B,) integer subject indices
+
+        Returns
+        -------
+        out : (B, out_channels)
+        """
+        # x: (B, C), weights: (N, C, D)
+        # Gather per-sample weight matrix
+        weights = self.weights.index_select(0, subjects)  # (B, C, D)
+        out = torch.einsum("bc,bcd->bd", x, weights)       # (B, D)
+        if self.bias is not None:
+            bias = self.bias.index_select(0, subjects)     # (B, D)
+            out = out + bias
+        return out
+
+    def __repr__(self):
+        S, C, D = self.weights.shape
+        return f"SubjectLayers({C} → {D}, n_subjects={S})"
 
 
 # =============================================================================
@@ -207,6 +322,7 @@ class VelocityNetwork(nn.Module):
     """Velocity field v_θ(x_t, t, c) for flow matching.
 
     Predicts the velocity that transports Gaussian noise → fMRI.
+    Uses cross-attention to encoder feature sequence for rich conditioning.
 
     Parameters
     ----------
@@ -217,11 +333,13 @@ class VelocityNetwork(nn.Module):
     hidden_dim : int
         Hidden dimension for DiT blocks.
     n_blocks : int
-        Number of adaLN-Zero blocks.
+        Number of DiT blocks.
     time_embed_dim : int
         Dimension of sinusoidal time embedding.
     n_subjects : int
         Number of subjects for per-subject embedding.
+    n_heads : int
+        Number of attention heads for cross-attention.
     """
 
     def __init__(
@@ -232,6 +350,7 @@ class VelocityNetwork(nn.Module):
         n_blocks: int = 8,
         time_embed_dim: int = 256,
         n_subjects: int = 4,
+        n_heads: int = 8,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -258,25 +377,34 @@ class VelocityNetwork(nn.Module):
         # Input projection: x_t (n_voxels) → hidden_dim
         self.input_proj = nn.Linear(n_voxels, hidden_dim)
 
-        # Stack of adaLN-Zero blocks
+        # Stack of DiT blocks with cross-attention
         self.blocks = nn.ModuleList([
-            AdaLNZeroBlock(hidden_dim, hidden_dim, ff_mult=4, dropout=dropout)
+            VelocityDiTBlock(
+                dim=hidden_dim,
+                cond_dim=hidden_dim,
+                context_dim=cond_dim,  # encoder hidden dim
+                n_heads=n_heads,
+                ff_mult=4,
+                dropout=dropout,
+            )
             for _ in range(n_blocks)
         ])
 
-        # Output projection: hidden_dim → n_voxels (velocity)
+        # Output projection: per-subject SubjectLayers (like TRIBE)
         self.output_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
-        self.output_proj = nn.Linear(hidden_dim, n_voxels)
-
-        # Zero-init output for stable start
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        self.output_proj = SubjectLayers(
+            in_channels=hidden_dim,
+            out_channels=n_voxels,
+            n_subjects=n_subjects,
+            bias=True,
+        )
 
     def forward(
         self,
         x_t: torch.Tensor,       # (B, V) noisy fMRI
         t: torch.Tensor,          # (B,) flow time
-        c: torch.Tensor,          # (B, cond_dim) conditioning
+        c_global: torch.Tensor,   # (B, cond_dim) global conditioning
+        c_seq: torch.Tensor,      # (B, T, cond_dim) encoder feature sequence
         subject_id: Optional[torch.Tensor] = None,  # (B,) subject indices
     ) -> torch.Tensor:
         """Predict velocity v(x_t, t, c).
@@ -290,21 +418,27 @@ class VelocityNetwork(nn.Module):
 
         # Subject embedding
         if subject_id is not None:
-            c = c + self.subject_embed(subject_id)
+            c_global = c_global + self.subject_embed(subject_id)
 
-        # Merge condition + time
-        mod = self.cond_mlp(torch.cat([c, t_emb], dim=-1))  # (B, hidden_dim)
+        # Merge condition + time → modulation vector
+        mod = self.cond_mlp(torch.cat([c_global, t_emb], dim=-1))  # (B, hidden_dim)
 
         # Input projection
         h = self.input_proj(x_t)  # (B, hidden_dim)
 
-        # adaLN-Zero blocks
+        # DiT blocks with cross-attention to encoder features
         for block in self.blocks:
-            h = block(h, mod)
+            h = block(h, mod, c_seq)
 
-        # Output
+        # Output: per-subject projection
         h = self.output_norm(h)
-        v = self.output_proj(h)  # (B, V)
+        if subject_id is None:
+            weights_mean = self.output_proj.weights.mean(0)
+            v = h @ weights_mean
+            if self.output_proj.bias is not None:
+                v = v + self.output_proj.bias.mean(0)
+        else:
+            v = self.output_proj(h, subject_id)
         return v
 
 
@@ -353,6 +487,7 @@ class BrainFlowCFM(nn.Module):
             n_blocks=n_velocity_blocks,
             time_embed_dim=time_embed_dim,
             n_subjects=n_subjects,
+            n_heads=n_heads,
             dropout=dropout,
         )
 
@@ -372,8 +507,8 @@ class BrainFlowCFM(nn.Module):
             v_t = model(features, t, x_t, subject_id)
             loss = MSE(v_t, u_t)
         """
-        c = self.encoder(features)  # (B, H)
-        v = self.velocity_net(x_t, t, c, subject_id)  # (B, V)
+        c_global, c_seq = self.encoder(features)  # (B, H), (B, T, H)
+        v = self.velocity_net(x_t, t, c_global, c_seq, subject_id)  # (B, V)
         return v
 
     @torch.no_grad()
@@ -404,7 +539,7 @@ class BrainFlowCFM(nn.Module):
         device = next(iter(features.values())).device
 
         # Encode features once
-        c = self.encoder(features)  # (B, H)
+        c_global, c_seq = self.encoder(features)  # (B, H), (B, T, H)
 
         # Start from Gaussian noise
         x = torch.randn(B, self.n_voxels, device=device)
@@ -416,14 +551,14 @@ class BrainFlowCFM(nn.Module):
         for t_val in ts:
             t = torch.full((B,), t_val, device=device)
             if method == "euler":
-                v = self.velocity_net(x, t, c, subject_id)
+                v = self.velocity_net(x, t, c_global, c_seq, subject_id)
                 x = x + v * dt
             elif method == "midpoint":
                 # Midpoint method (2nd order)
-                v1 = self.velocity_net(x, t, c, subject_id)
+                v1 = self.velocity_net(x, t, c_global, c_seq, subject_id)
                 x_mid = x + v1 * (dt / 2)
                 t_mid = torch.full((B,), t_val + dt / 2, device=device)
-                v2 = self.velocity_net(x_mid, t_mid, c, subject_id)
+                v2 = self.velocity_net(x_mid, t_mid, c_global, c_seq, subject_id)
                 x = x + v2 * dt
             else:
                 raise ValueError(f"Unknown method: {method}")
