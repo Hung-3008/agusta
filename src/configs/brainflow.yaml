@@ -67,8 +67,8 @@ preprocessing:
 
 # ── DataLoader ────────────────────────────────────────────────────────
 dataloader:
-  batch_size: 512
-  val_batch_size: 512
+  batch_size: 128
+  val_batch_size: 128
   num_workers: 0       # H5py is not fork-safe — use 0 or preload_to_ram
   max_cache_gb: 10.0
   pin_memory: false    # must be false when num_workers=0
@@ -117,7 +117,7 @@ training:
   use_amp: true
 
   # RAM preloading (eliminates HDD I/O)
-  preload_to_ram: false
+  preload_to_ram: true
 
   # Logging & evaluation
   log_every_n_steps: 50
