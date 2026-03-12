@@ -1,0 +1,8 @@
+numpy
+torch
+scipy
+h5py
+pyyaml
+tqdm
+torchdiffeq
+pot

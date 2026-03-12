@@ -173,7 +173,7 @@ class FeaturePriorEncoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_encoder_layers)
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_encoder_layers, enable_nested_tensor=False)
         self.out_norm = nn.LayerNorm(hidden_dim)
 
         # Output: mean-pool → linear → n_voxels
