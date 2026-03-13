@@ -12,41 +12,31 @@ fmri:
   dir: algonauts_2025.competitors/fmri
   tr: 1.49
   n_voxels: 1000
+  excluded_samples_start: 5      # Match baseline: skip first 5 TRs (HRF not stable)
+  excluded_samples_end: 5        # Match baseline: skip last 5 TRs (movie may end early)
 
 features:
-  dir: features                    # H5 features (fallback)
-  npy_dir: features_npy_cat        # NPY features with last-4-layer concatenation
-  npy_only: true                   # NPY-only mode: skip H5 entirely
-  sample_freq: 2.0                 # extraction rate for unimodal features
-  layer_aggregation: cat           # last-4-layer concat (matching NPY conversion)
+  dir: algonauts_2025.features   # Per-clip H5 features from HuggingFace
+  sample_freq: 2.0               # extraction rate for unimodal features
+  layer_aggregation: last         # last | mean | cat
 
   modalities:
     video:
-      subdir: video
-      file_pattern: "{movie_type}_{stimulus_type}_features_vjepa2.h5"
-      npy_pattern: "{movie_type}_{stimulus_type}_features_vjepa2"
-      h5_key: video
-      dim: 5632                        # 4 layers × 1408
+      subdir: vjepa2_avg_feat
+      file_format: per_clip       # 1 H5 per clip at {subdir}/{task}/{stim_type}/{clip}.h5
+      dim: 1408                   # single layer dim (vjepa2 encoder hidden)
     audio:
-      subdir: audio
-      file_pattern: "{movie_type}_{stimulus_type}_features_w2vbert.h5"
-      npy_pattern: "{movie_type}_{stimulus_type}_features_w2vbert"
-      h5_key: audio
-      dim: 4096                        # 4 layers × 1024
+      subdir: whisper
+      file_format: per_clip
+      dim: 1280                   # whisper encoder hidden
     text:
-      subdir: text
-      file_pattern: "{movie_type}_{stimulus_type}_features_llama3.h5"
-      npy_pattern: "{movie_type}_{stimulus_type}_features_llama3"
-      h5_key: text
-      dim: 12288                       # 4 layers × 3072
+      subdir: Llama-3.2-3B
+      file_format: per_clip
+      dim: 3072                   # llama hidden dim
     omni:
-      subdir: omni
-      file_pattern: "{movie_type}_{stimulus_type}_features_qwen_omni.h5"
-      npy_pattern: "{movie_type}_{stimulus_type}_features_qwen_omni"
-      h5_key: omni
-      data_format: tr_tokens_dim
-      dim: 3584
-      keep_tokens: false   # mean-pool tokens → (1, 3584, n_trs)
+      subdir: qwen-2-5-omni-7b
+      file_format: per_clip
+      dim: 3584                   # qwen-omni hidden dim
 
 # --- Subjects ---
 subjects:
@@ -57,11 +47,14 @@ subjects:
 
 subject_mode: single     # 'single' or 'avg'
 
-# --- Splits ---
+# --- Splits (matching baseline: Friends s1-s6 + Movie10 for train) ---
 splits:
   friends:
     train: [s1, s2, s3, s4, s5, s6]
     test: [s7]
+  movie10:
+    train: [bourne, figures, life, wolf]
+    test: []
 
 val_ratio: 0.1
 
@@ -73,7 +66,7 @@ sliding_window:
 # --- Preprocessing ---
 preprocessing:
   fmri:
-    standardize: zscore_sample
+    standardize: none      # Match baseline: use raw fMRI (no z-score)
 
 # --- DataLoader ---
 dataloader:
@@ -90,10 +83,10 @@ dataloader:
 model:
   # Feature Encoder
   modality_dims:
-    video: 5632                        # 4 layers × 1408
-    audio: 4096                        # 4 layers × 1024
-    text: 12288                        # 4 layers × 3072
-    omni: 3584                         # tokens mean-pooled (no layer concat)
+    video: 1408
+    audio: 1280
+    text: 3072
+    omni: 3584
   encoder_hidden_dim: 2048
   n_transformer_layers: 6
   n_heads: 8
@@ -117,8 +110,8 @@ training:
   warmup_ratio: 0.03
   grad_clip: 1.0
   ema_decay: 0.999
-  cfm_sigma: 0.01          # i-CFM noise level (reduced for cleaner targets)
-  cfm_method: icfm          # icfm: standard independent CFM (safe for conditional gen)
+  cfm_sigma: 0.01          # i-CFM noise level
+  cfm_method: icfm          # icfm: standard independent CFM
 
   # Mixed precision
   use_amp: true

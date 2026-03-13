@@ -94,7 +94,7 @@ vae:
   subject_embed_dim: 64
 
   # TCN v5 hyperparams
-  hidden_dim: 128
+  hidden_dim: 64
   num_res_blocks: 4
   dropout: 0.25
 
@@ -104,7 +104,7 @@ vae:
 
   # KL regularization — smooth latent space for Flow Matching
   free_bits: 1.0
-  beta_max: 0.01
+  beta_max: 0.2
 
   # Augmentation for overfitting prevention
   mask_ratio: 0.25

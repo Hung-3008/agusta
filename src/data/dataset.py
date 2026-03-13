@@ -109,6 +109,11 @@ def resolve_paths(cfg: dict, project_root: str | Path) -> dict:
     return cfg
 
 
+def _task_to_feature_task(task: str) -> str:
+    """Map config task name to feature directory task name."""
+    return task  # friends → friends, movie10 → movie10
+
+
 # =============================================================================
 # fMRI data loading
 # =============================================================================
@@ -127,8 +132,6 @@ def _get_fmri_filepath(fmri_dir: str, subject: str, task: str) -> Path:
         return subj_dir / f"{stem}_desc-s123456_bold.h5"
     else:
         return subj_dir / f"{stem}_bold.h5"
-
-
 def load_fmri_clip(
     fmri_dir: str,
     subject: str,
@@ -136,6 +139,8 @@ def load_fmri_clip(
     clip_key: str,
     standardize: bool = True,
     run: int | None = None,
+    excluded_samples_start: int = 0,
+    excluded_samples_end: int = 0,
 ) -> np.ndarray:
     """Load and preprocess fMRI data for a single clip.
 
@@ -154,11 +159,15 @@ def load_fmri_clip(
     run : int or None
         For movie10 life/figures clips with multiple runs, specify 1 or 2.
         None means no run disambiguation (friends or single-run movie10).
+    excluded_samples_start : int
+        Number of TRs to trim from the start (baseline default: 5).
+    excluded_samples_end : int
+        Number of TRs to trim from the end (baseline default: 5).
 
     Returns
     -------
     np.ndarray
-        Shape (n_voxels, n_trs), float32, z-scored.
+        Shape (n_voxels, n_trs_trimmed), float32.
     """
     fmri_path = _get_fmri_filepath(fmri_dir, subject, task)
     if not fmri_path.exists():
@@ -173,10 +182,16 @@ def load_fmri_clip(
             matched = [k for k in matched if run_str in k]
         if len(matched) != 1:
             raise ValueError(
-                f"Expected 1 match for '{clip_key}' (run={run}) in {fmri_path}, "
+                f"Expected 1 match for '{clip_key}' in {fmri_path}, "
                 f"got {len(matched)}: {matched}"
             )
         data = f[matched[0]][:].astype(np.float32)
+
+    # Trim excluded samples (matching baseline convention)
+    if excluded_samples_end > 0:
+        data = data[excluded_samples_start:-excluded_samples_end]
+    elif excluded_samples_start > 0:
+        data = data[excluded_samples_start:]
 
     # Data from h5 is always (n_trs, n_voxels) — transpose to (n_voxels, n_trs)
     data = data.T
@@ -210,7 +225,7 @@ def load_feature_clip(
     layer_aggregation: str = "last",
     keep_tokens: bool = False,
 ) -> np.ndarray:
-    """Load pre-extracted features for a single clip.
+    """Load pre-extracted features for a single clip (consolidated H5 format).
 
     Parameters
     ----------
@@ -284,6 +299,95 @@ def load_feature_clip(
         # else: keep all layers as-is
 
     return np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)  # (1, dim, n_timepoints)
+
+
+def load_feature_clip_perfile(
+    features_dir: str,
+    modality: str,
+    modality_cfg: dict,
+    movie_type: str,
+    stimulus_type: str,
+    clip_name: str,
+    layer_aggregation: str = "last",
+) -> np.ndarray:
+    """Load features from per-clip H5 files (algonauts_2025.features format).
+
+    File layout:
+        {features_dir}/{subdir}/{task}/{stim_type}/{clip_name}.h5
+    Each H5 contains layer keys like 'encoder.layer.15.mlp.fc2_avg' etc.
+    Each layer dataset has shape (T, [tokens,] dim).
+
+    Parameters
+    ----------
+    features_dir : str
+        Root features directory (e.g. Data/algonauts_2025.features).
+    modality : str
+        Modality name: 'video', 'audio', 'text', 'omni'.
+    modality_cfg : dict
+        Modality config with 'subdir' and 'dim'.
+    movie_type : str
+        Task type: 'friends' or 'movie10'.
+    stimulus_type : str
+        Season/movie: 's1', 'bourne', etc.
+    clip_name : str
+        Clip filename stem: 'friends_s01e01a', 'bourne01', etc.
+    layer_aggregation : str
+        'last', 'mean', or 'cat'.
+
+    Returns
+    -------
+    np.ndarray
+        Shape (1, dim, T), float32.
+    """
+    subdir = modality_cfg["subdir"]
+
+    # Build path: {features_dir}/{subdir}/{task}/{stim_type}/{clip_name}.h5
+    base_dir = Path(features_dir) / subdir / movie_type / stimulus_type
+    h5_path = base_dir / f"{clip_name}.h5"
+
+    # Fallback: some extractors prefix clip names (e.g. Llama uses 'movie10_bourne01.h5')
+    if not h5_path.exists():
+        h5_path = base_dir / f"{movie_type}_{clip_name}.h5"
+    if not h5_path.exists():
+        raise FileNotFoundError(
+            f"Per-clip feature file not found at {base_dir}/{clip_name}.h5 "
+            f"or {movie_type}_{clip_name}.h5"
+        )
+
+    with h5py.File(h5_path, "r") as f:
+        layer_keys = sorted(f.keys())
+        if not layer_keys:
+            raise ValueError(f"No layers found in {h5_path}")
+
+        layers_data = []
+        for lk in layer_keys:
+            arr = f[lk][:].astype(np.float32)  # (T, [tokens,] dim)
+            # Squeeze any singleton dimensions: (T, 1, dim) → (T, dim)
+            if arr.ndim == 3 and arr.shape[1] == 1:
+                arr = arr.squeeze(1)
+            layers_data.append(arr)
+
+    # All layers should have same T dimension
+    T = layers_data[0].shape[0]
+    dim = layers_data[0].shape[-1]
+
+    if layer_aggregation == "last":
+        data = layers_data[-1]  # (T, dim)
+    elif layer_aggregation == "mean":
+        data = np.mean(layers_data, axis=0)  # (T, dim)
+    elif layer_aggregation == "cat":
+        data = np.concatenate(layers_data, axis=-1)  # (T, dim*n_layers)
+    else:
+        data = layers_data[-1]
+
+    # data: (T, dim) → (1, dim, T)
+    if data.ndim == 2:
+        data = data.T[np.newaxis]  # (1, dim, T)
+    else:
+        # Shouldn't happen, but handle gracefully
+        data = data.reshape(T, -1).T[np.newaxis]
+
+    return np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def load_feature_clip_npy(
@@ -484,9 +588,21 @@ def build_clip_index(
                 mod_cfg = modalities[first_mod]
 
                 clip_names = None
+                file_format = mod_cfg.get("file_format", "consolidated")
+
+                # Per-clip H5 mode: discover clips from directory listing
+                if file_format == "per_clip":
+                    clip_dir = Path(features_dir) / mod_cfg["subdir"] / task / stim_type
+                    if clip_dir.exists():
+                        clip_names = sorted(
+                            p.stem for p in clip_dir.glob("*.h5")
+                        )
+                    else:
+                        logger.warning("Per-clip feature dir missing, skipping: %s", clip_dir)
+                        continue
 
                 # NPY-only: enumerate .npy files in the NPY directory
-                if npy_only and features_npy_dir:
+                elif npy_only and features_npy_dir:
                     npy_pattern = mod_cfg.get("npy_pattern")
                     if npy_pattern:
                         npy_dirname = npy_pattern.format(
@@ -507,8 +623,8 @@ def build_clip_index(
                         logger.warning("NPY dir missing, skipping: %s", npy_dir_path)
                         continue
 
-                # H5 fallback
-                if clip_names is None:
+                # Consolidated H5 fallback
+                if clip_names is None and file_format != "per_clip":
                     filename = mod_cfg["file_pattern"].format(
                         movie_type=task, stimulus_type=stim_type
                     )
@@ -633,6 +749,10 @@ class SlidingWindowDataset(Dataset):
         self.n_voxels = cfg["fmri"]["n_voxels"]
         self.feature_freq = cfg["features"]["sample_freq"]
         self.layer_aggregation = cfg["features"].get("layer_aggregation", "last")
+
+        # Excluded samples (matching baseline: trim first/last N TRs)
+        self.excl_start = cfg["fmri"].get("excluded_samples_start", 0)
+        self.excl_end = cfg["fmri"].get("excluded_samples_end", 0)
 
         sw = cfg["sliding_window"]
         self.context_duration = sw["context_duration"]
@@ -790,12 +910,14 @@ class SlidingWindowDataset(Dataset):
                 if len(matched) < 1:
                     return None
                 # For avg mode, just use first match
-                shape = f[matched[0]].shape
-                # shape is always (n_trs, n_voxels) from h5
-                return shape[0]
+                n_trs_raw = f[matched[0]].shape[0]
+                # Apply excluded_samples trimming
+                n_trs = n_trs_raw - self.excl_start - self.excl_end
+                return n_trs if n_trs > 0 else None
         except Exception as e:
             logger.warning("Could not read fMRI for %s: %s", clip_info, e)
             return None
+
 
     def _load_fmri(self, clip_idx: int) -> np.ndarray:
         """Load fMRI for clip (RAM store or LRU cached)."""
@@ -813,6 +935,8 @@ class SlidingWindowDataset(Dataset):
                     self.fmri_dir, info["subject"], info["task"],
                     info["fmri_key"], standardize=self.standardize,
                     run=info.get("run"),
+                    excluded_samples_start=self.excl_start,
+                    excluded_samples_end=self.excl_end,
                 )
             self._cache.put(key, cached)
         return cached
@@ -859,6 +983,35 @@ class SlidingWindowDataset(Dataset):
         info = self.clip_index[clip_idx]
         mod_cfg = self.cfg["features"]["modalities"][modality]
         keep_tokens = self._keep_tokens.get(modality, False)
+        file_format = mod_cfg.get("file_format", "consolidated")
+
+        fmri = self._load_fmri(clip_idx)
+        n_trs = fmri.shape[1]  # already trimmed by excluded_samples
+
+        # ── Per-clip H5 path (algonauts_2025.features format) ──
+        if file_format == "per_clip":
+            raw = load_feature_clip_perfile(
+                self.features_dir, modality, mod_cfg,
+                info["movie_type"], info["stimulus_type"], info["clip_name"],
+                layer_aggregation=self.layer_aggregation,
+            )  # (1, dim, T_feat)
+
+            # Trim excluded_samples from features to align with fMRI
+            T_feat = raw.shape[2]
+            if self.excl_start > 0 or self.excl_end > 0:
+                end = T_feat - self.excl_end if self.excl_end > 0 else T_feat
+                raw = raw[:, :, self.excl_start:end]
+                T_feat = raw.shape[2]
+
+            # Pad/trim to match fMRI n_trs
+            if T_feat > n_trs:
+                raw = raw[:, :, :n_trs]
+            elif T_feat < n_trs:
+                pad = np.zeros((raw.shape[0], raw.shape[1], n_trs - T_feat), dtype=raw.dtype)
+                raw = np.concatenate([raw, pad], axis=2)
+
+            self._cache.put(key, raw)
+            return raw
 
         # ── NPY fast path (pre-converted, already mean-pooled, on TR grid) ──
         if self.features_npy_dir:
@@ -869,8 +1022,6 @@ class SlidingWindowDataset(Dataset):
             )  # (1, dim, n_trs) or (n_tokens, dim, n_trs) or None
             if raw is not None:
                 # NPY is already on TR grid; just trim/pad to match fMRI n_trs
-                fmri = self._load_fmri(clip_idx)
-                n_trs = fmri.shape[1]
                 T_feat = raw.shape[2]
                 if T_feat > n_trs:
                     raw = raw[:, :, :n_trs]
@@ -880,16 +1031,13 @@ class SlidingWindowDataset(Dataset):
                 self._cache.put(key, raw)
                 return raw
 
-        # ── H5 fallback (with layer aggregation + TR resampling) ──
+        # ── Consolidated H5 fallback (with layer aggregation + TR resampling) ──
         raw = load_feature_clip(
             self.features_dir, modality, mod_cfg,
             info["movie_type"], info["stimulus_type"], info["clip_name"],
             layer_aggregation=self.layer_aggregation,
             keep_tokens=keep_tokens,
         )  # shape: (1, dim, T) or (n_tokens, dim, T) for omni keep_tokens
-
-        fmri = self._load_fmri(clip_idx)
-        n_trs = fmri.shape[1]
 
         data_format = mod_cfg.get("data_format", "layers_dim_tr")
         if data_format == "tr_tokens_dim":
