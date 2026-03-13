@@ -1,4 +1,4 @@
-"""Precompute PCA-reduced stimulus features for BrainFlow v4.
+"""Precompute PCA-reduced stimulus features for BrainFlow.
 
 Follows the challenge baseline pipeline:
   1. Load raw per-clip features (video/audio/text) from algonauts_2025.features/
@@ -10,8 +10,8 @@ Follows the challenge baseline pipeline:
   7. Save as NPY per clip + scaler/PCA params for test-time transform
 
 Usage:
-    python src/data/precompute_pca_features.py --config src/configs/brainflow_v4.yaml
-    python src/data/precompute_pca_features.py --config src/configs/brainflow_v4.yaml --verify
+    python src/data/precompute_pca_features.py --config src/configs/brain_flow.yaml
+    python src/data/precompute_pca_features.py --config src/configs/brain_flow.yaml --verify
 """
 
 import argparse
@@ -202,7 +202,7 @@ def apply_hrf_and_window(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Precompute PCA features for BrainFlow v4")
+    parser = argparse.ArgumentParser(description="Precompute PCA features for BrainFlow")
     parser.add_argument("--config", type=str, required=True, help="Path to brainflow config YAML")
     parser.add_argument("--verify", action="store_true", help="Verify output dimensions only")
     args = parser.parse_args()

@@ -1,5 +1,5 @@
 # =====================================================================
-# BrainFlow v4: Latent-Space Conditional Flow Matching
+# BrainFlow: Latent-Space Conditional Flow Matching
 # =====================================================================
 # Stage 2 of the fMRI generation pipeline:
 #   PCA features + online VAE latent → velocity transformer → ODE → latent
@@ -75,14 +75,14 @@ dataloader:
   num_workers: 0
   pin_memory: true
 
-# --- BrainFlow v4 specific ---
+# --- BrainFlow specific ---
 brainflow:
   seq_len: 10          # Number of TRs per sample (~15s)
   train_stride: 1      # Dense overlap for training
   num_trial: 1         # VAE encoding trials (1=deterministic mu, >1=avg samples)
 
 # =====================================================================
-# Model config (BrainFlowCFM_v4 constructor args)
+# Model config (BrainFlowCFM constructor args)
 # =====================================================================
 model:
   latent_dim: 256        # VAE latent dimension
@@ -121,4 +121,4 @@ training:
   sample_method: euler
 
 # --- Output ---
-output_dir: outputs/brainflow_v4
+output_dir: outputs/brain_flow

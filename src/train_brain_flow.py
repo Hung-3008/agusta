@@ -1,4 +1,4 @@
-"""BrainFlow v4 training script.
+"""BrainFlow training script.
 
 Latent-space Conditional Flow Matching:
   - Load precomputed PCA features
@@ -7,8 +7,8 @@ Latent-space Conditional Flow Matching:
   - Validate with frozen VAE decoder (latent → fMRI → Pearson)
 
 Usage:
-    python src/train_brainflow_v4.py --config src/configs/brainflow_v4.yaml
-    python src/train_brainflow_v4.py --config src/configs/brainflow_v4.yaml --fast_dev_run
+    python src/train_brain_flow.py --config src/configs/brain_flow.yaml
+    python src/train_brain_flow.py --config src/configs/brain_flow.yaml --fast_dev_run
 """
 
 import argparse
@@ -35,7 +35,7 @@ sys.path.insert(0, str(TORCHCFM_PATH))
 
 from src.data.dataset import load_config, resolve_paths
 from src.data.brainflow_dataset import BrainFlowDataset, build_brainflow_dataloaders
-from src.models.brainflow.brain_flow_v4 import BrainFlowCFM_v4
+from src.models.brainflow.brain_flow import BrainFlowCFM
 from src.models.brainflow.fmri_vae import build_vae
 from torchcfm.conditional_flow_matching import (
     ConditionalFlowMatcher,
@@ -49,7 +49,7 @@ logging.basicConfig(
     format="[%(asctime)s %(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("brainflow_v4")
+logger = logging.getLogger("brain_flow")
 
 
 # =============================================================================
@@ -114,7 +114,7 @@ def load_vae_decoder(cfg: dict, device: torch.device):
 # =============================================================================
 
 def train_one_epoch(
-    model: BrainFlowCFM_v4,
+    model: BrainFlowCFM,
     dataloader,
     optimizer,
     scheduler,
@@ -197,7 +197,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def validate(
-    model: BrainFlowCFM_v4,
+    model: BrainFlowCFM,
     dataloader,
     fm,
     device,
@@ -293,7 +293,7 @@ def validate(
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="BrainFlow v4 training")
+    parser = argparse.ArgumentParser(description="BrainFlow training")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--fast_dev_run", action="store_true")
     parser.add_argument("--resume", type=str, default=None)
@@ -337,8 +337,8 @@ def main():
                 len(val_loader.dataset) if val_loader else 0)
 
     # ── Build model ──
-    logger.info("Building BrainFlow v4 model...")
-    model = BrainFlowCFM_v4(**model_cfg).to(device)
+    logger.info("Building BrainFlow model...")
+    model = BrainFlowCFM(**model_cfg).to(device)
     ema_model = copy.deepcopy(model)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -403,7 +403,7 @@ def main():
 
     # ── Training loop ──
     logger.info("=" * 60)
-    logger.info("Starting BrainFlow v4 training: %d epochs", n_epochs)
+    logger.info("Starting BrainFlow training: %d epochs", n_epochs)
     logger.info("=" * 60)
 
     best_val_pearson = -1.0
