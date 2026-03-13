@@ -489,11 +489,12 @@ def main():
             }
             torch.save(ckpt, output_dir / "last.pt")
 
-            # Track best by latent Pearson (faster + more reliable early indicator)
-            if val_latent_pearson > best_val_pearson:
-                best_val_pearson = val_latent_pearson
+            # Track best by voxel Pearson (directly measures fMRI prediction quality)
+            if did_val and val_voxel_pearson > best_val_pearson:
+                best_val_pearson = val_voxel_pearson
                 torch.save(ckpt, output_dir / "best.pt")
-                logger.info("  → New best latent Pearson: %.4f", val_latent_pearson)
+                logger.info("  → New best voxel Pearson: %.4f", val_voxel_pearson)
+
 
     logger.info("=" * 60)
     logger.info("Training complete! Best Latent Pearson: %.4f", best_val_pearson)

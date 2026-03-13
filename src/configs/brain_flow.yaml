@@ -49,11 +49,8 @@ pca_features:
 # --- Subjects ---
 subjects:
   - sub-01
-  - sub-02
-  - sub-03
-  - sub-05
 
-subject_mode: multi
+subject_mode: single
 
 # --- Splits ---
 splits:
@@ -96,7 +93,7 @@ model:
   hidden_dim: 512        # Transformer d_model
   n_heads: 8             # Attention heads (512/8 = 64 dim/head)
   n_layers: 6            # Transformer layers
-  n_subjects: 4          # Number of subjects (sub-01, sub-02, sub-03, sub-05)
+  n_subjects: 1          # Single subject
   dropout: 0.1
   time_embed_dim: 256
   cond_proj_dim: 256       # Projected conditioning dim for concat with z_t
@@ -128,4 +125,4 @@ training:
   sample_method: euler
 
 # --- Output ---
-output_dir: outputs/brain_flow
+output_dir: outputs/brain_flow_sub01
