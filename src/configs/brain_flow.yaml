@@ -73,15 +73,18 @@ preprocessing:
 
 # --- DataLoader ---
 dataloader:
-  batch_size: 512
-  val_batch_size: 512
-  num_workers: 0         # Must be 0: dataset does GPU VAE encoding in __getitem__
+  batch_size: 64
+  val_batch_size: 64
+  num_workers: 4           # >0 when precomputed latents exist (auto-detected)
   pin_memory: true
+
+# --- Precomputed latents (from precompute_latents.py) ---
+latent_dir: Data/latents
 
 # --- BrainFlow specific ---
 brainflow:
   seq_len: 100         # Number of TRs per sample (~149s), matches VAE training
-  train_stride: 1      # Dense overlap for training
+  train_stride: 80      # Dense overlap for training
   num_trial: 1         # VAE encoding trials (1=deterministic mu, >1=avg samples)
 
 # =====================================================================

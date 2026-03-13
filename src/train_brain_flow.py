@@ -424,8 +424,10 @@ def main():
         ema_update(model, ema_model, train_cfg["ema_decay"])
 
         # Validate
+        did_val = False
         val_loss, val_latent_pearson, val_voxel_pearson = 0.0, 0.0, 0.0
         if val_loader and (epoch + 1) % train_cfg["val_every_n_epochs"] == 0:
+            did_val = True
             if args.fast_dev_run:
                 mini_val = _limit_batches(val_loader, 2)
                 val_loss, val_latent_pearson, val_voxel_pearson = validate(
@@ -445,25 +447,32 @@ def main():
         elapsed = time.time() - t_epoch
         lr = optimizer.param_groups[0]["lr"]
 
-        logger.info(
-            "Epoch %d/%d | Train Loss: %.6f | Val Loss: %.6f | "
-            "Latent Pearson: %.4f | Voxel Pearson: %.4f | LR: %.2e | Time: %.1fs",
-            epoch + 1, n_epochs, train_loss, val_loss,
-            val_latent_pearson, val_voxel_pearson, lr, elapsed,
-        )
+        if did_val:
+            logger.info(
+                "Epoch %d/%d | Train Loss: %.6f | Val Loss: %.6f | "
+                "Latent Pearson: %.4f | Voxel Pearson: %.4f | LR: %.2e | Time: %.1fs",
+                epoch + 1, n_epochs, train_loss, val_loss,
+                val_latent_pearson, val_voxel_pearson, lr, elapsed,
+            )
+        else:
+            logger.info(
+                "Epoch %d/%d | Train Loss: %.6f | LR: %.2e | Time: %.1fs",
+                epoch + 1, n_epochs, train_loss, lr, elapsed,
+            )
 
-        # History
-        with open(history_path, "a", newline="") as f:
-            writer = csv.DictWriter(f, history_fields)
-            writer.writerow({
-                "epoch": epoch + 1,
-                "train_loss": f"{train_loss:.6f}",
-                "val_loss": f"{val_loss:.6f}",
-                "val_latent_pearson": f"{val_latent_pearson:.6f}",
-                "val_voxel_pearson": f"{val_voxel_pearson:.6f}",
-                "lr": f"{lr:.2e}",
-                "time_s": f"{elapsed:.1f}",
-            })
+        # History — only log when validation is performed
+        if did_val:
+            with open(history_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, history_fields)
+                writer.writerow({
+                    "epoch": epoch + 1,
+                    "train_loss": f"{train_loss:.6f}",
+                    "val_loss": f"{val_loss:.6f}",
+                    "val_latent_pearson": f"{val_latent_pearson:.6f}",
+                    "val_voxel_pearson": f"{val_voxel_pearson:.6f}",
+                    "lr": f"{lr:.2e}",
+                    "time_s": f"{elapsed:.1f}",
+                })
 
         # Checkpoint
         if not args.fast_dev_run:
