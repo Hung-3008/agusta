@@ -49,8 +49,11 @@ pca_features:
 # --- Subjects ---
 subjects:
   - sub-01
+  - sub-02
+  - sub-03
+  - sub-05
 
-subject_mode: single
+subject_mode: multi
 
 # --- Splits ---
 splits:
@@ -70,14 +73,14 @@ preprocessing:
 
 # --- DataLoader ---
 dataloader:
-  batch_size: 64
-  val_batch_size: 64
-  num_workers: 0
+  batch_size: 32
+  val_batch_size: 32
+  num_workers: 0         # Must be 0: dataset does GPU VAE encoding in __getitem__
   pin_memory: true
 
 # --- BrainFlow specific ---
 brainflow:
-  seq_len: 10          # Number of TRs per sample (~15s)
+  seq_len: 100         # Number of TRs per sample (~149s), matches VAE training
   train_stride: 1      # Dense overlap for training
   num_trial: 1         # VAE encoding trials (1=deterministic mu, >1=avg samples)
 
@@ -90,14 +93,15 @@ model:
   hidden_dim: 512        # Transformer d_model
   n_heads: 8             # Attention heads (512/8 = 64 dim/head)
   n_layers: 6            # Transformer layers
-  n_subjects: 1          # Number of subjects (single subject mode)
+  n_subjects: 4          # Number of subjects (sub-01, sub-02, sub-03, sub-05)
   dropout: 0.1
   time_embed_dim: 256
+  cond_proj_dim: 256       # Projected conditioning dim for concat with z_t
 
 # =====================================================================
 # VAE checkpoint (Stage 1, frozen decoder for validation)
 # =====================================================================
-vae_checkpoint: outputs/fmri_vae_128/best.pt
+vae_checkpoint: outputs/fmri_vae_256/best.pt
 
 # =====================================================================
 # Training config
