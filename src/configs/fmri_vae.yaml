@@ -86,7 +86,7 @@ dataloader:
 # =====================================================================
 vae:
   version: 5
-  latent_dim: 256
+  latent_dim: 64
   seq_len: 100
 
   # No subject conditioning — treat as pure autoencoder
@@ -94,7 +94,7 @@ vae:
   subject_embed_dim: 64
 
   # TCN v5 hyperparams
-  hidden_dim: 64
+  hidden_dim: 256
   num_res_blocks: 4
   dropout: 0.25
 
@@ -103,12 +103,12 @@ vae:
   pcc_warmstart_epochs: 10
 
   # KL regularization — smooth latent space for Flow Matching
-  free_bits: 1.0
+  free_bits: 0.5
   beta_max: 0.2
 
   # Augmentation for overfitting prevention
-  mask_ratio: 0.25
-  beta_warmup_epochs: 30
+  mask_ratio: 0.2
+  beta_warmup_epochs: 50
   window_stride: 50          # 50% overlap → 2× data
 
 # =====================================================================
@@ -126,4 +126,4 @@ training:
   val_every_n_epochs: 5
 
 # --- Output ---
-vae_output_dir: outputs/fmri_vae
+vae_output_dir: outputs/fmri_vae_64
