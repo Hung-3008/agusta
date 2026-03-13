@@ -45,7 +45,10 @@ def load_vae(cfg: dict, device: torch.device):
     """Load pretrained VAE in eval mode."""
     vae_ckpt_path = cfg.get("vae_checkpoint")
     if not vae_ckpt_path:
-        raise ValueError("vae_checkpoint not specified in config")
+        if "vae_output_dir" in cfg:
+            vae_ckpt_path = Path(cfg["vae_output_dir"]) / "best.pt"
+        else:
+            raise ValueError("Neither vae_checkpoint nor vae_output_dir is specified in config")
 
     vae_ckpt_path = Path(PROJECT_ROOT) / vae_ckpt_path
     ckpt = torch.load(vae_ckpt_path, map_location=device)
@@ -148,8 +151,11 @@ def main():
 
     # Subject → ID mapping (for VAE)
     # Note: VAE was trained with use_subject=False, so subject_id=0 works for all
+    vae_ckpt_path = cfg.get("vae_checkpoint")
+    if not vae_ckpt_path:
+        vae_ckpt_path = Path(cfg["vae_output_dir"]) / "best.pt"
     vae_cfg = torch.load(
-        Path(PROJECT_ROOT) / cfg["vae_checkpoint"], map_location="cpu"
+        Path(PROJECT_ROOT) / vae_ckpt_path, map_location="cpu"
     ).get("config", {})
     vae_use_subject = vae_cfg.get("vae", {}).get("use_subject", False)
 

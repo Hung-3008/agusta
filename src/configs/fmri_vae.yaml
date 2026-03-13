@@ -126,4 +126,4 @@ training:
   val_every_n_epochs: 5
 
 # --- Output ---
-vae_output_dir: outputs/fmri_vae
+vae_output_dir: outputs/fmri_vae_64
