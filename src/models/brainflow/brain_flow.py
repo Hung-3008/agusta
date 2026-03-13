@@ -3,20 +3,19 @@
 Generates fMRI VAE latent vectors (B, T, Z) from noise, conditioned on
 PCA-reduced stimulus features and subject embeddings.
 
-Key design choices:
+Key design choices (Matcha-TTS + TRIBE inspired):
   - Operates in VAE latent space (Z=256) instead of voxel space (V=1000)
-  - No multimodal FeatureEncoder — uses precomputed PCA features
-  - VelocityTransformer with temporal self-attention across TRs
-  - Simple additive conditioning (no DiT adaLN or cross-attention)
+  - Channel concatenation: [z_t; cond] instead of additive conditioning
+  - DiT-style adaLN: time+subject injected into EVERY transformer layer
+  - TRIBE SubjectLayers: per-subject linear transforms for conditioning & output
   - Zero-initialized output for identity flow at init
 
 Architecture:
-    PCA cond (B,T,D) → ConditioningMLP → (B,T,H)
-    + subject_embed + time_embed
-    z_t (B,T,Z) → input_proj → (B,T,H)
-    → add conditioning
-    → TransformerEncoder (self-attention across T)
-    → output_proj → v_θ (B,T,Z)
+    PCA cond (B,T,D) → ConditioningMLP → SubjectLayer → cond (B,T,P)
+    [z_t (B,T,Z); cond (B,T,P)] → input_proj → (B,T,H)
+    t (B,) + subject → MLP → per-layer (shift, scale, gate)
+    → N × AdaLNTransformerBlock (self-attn + FFN + adaLN)
+    → final_norm (adaLN) → SubjectLayer output → v_θ (B,T,Z)
 """
 
 import math
@@ -24,6 +23,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # =============================================================================
@@ -52,47 +52,216 @@ class SinusoidalTimeEmbedding(nn.Module):
 # =============================================================================
 
 class ConditioningMLP(nn.Module):
-    """Project PCA features → hidden dim.
+    """Project PCA features → conditioning dim for channel concatenation.
 
-    Simple 2-layer MLP with LayerNorm + GELU.
+    2-layer MLP with LayerNorm + GELU.
     Processes each TR independently (applied to (B, T, D_cond)).
     """
 
-    def __init__(self, cond_dim: int, hidden_dim: int, dropout: float = 0.0):
+    def __init__(self, cond_dim: int, out_dim: int, dropout: float = 0.0):
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(cond_dim),
-            nn.Linear(cond_dim, hidden_dim),
+            nn.Linear(cond_dim, out_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(out_dim, out_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """(B, T, D_cond) → (B, T, H)"""
+        """(B, T, D_cond) → (B, T, P)."""
         return self.net(x)
 
 
 # =============================================================================
-# Velocity Transformer
+# TRIBE-style Subject Layers (per-subject linear transform)
+# =============================================================================
+
+class SubjectLayers(nn.Module):
+    """Per-subject linear transform (TRIBE-style).
+
+    Each subject gets its own weight matrix W_s: (in_dim, out_dim).
+    For a given subject s, computes: y = x @ W_s + b_s.
+
+    This is much more expressive than a shared embedding + adaLN because
+    it allows full channel mixing per subject (a 2D matrix vs a 1D vector).
+
+    Adapted from TRIBE (Meta) to work with BrainFlow's (B, T, C) tensors
+    instead of the original (B, C, T) format.
+
+    Parameters
+    ----------
+    in_dim : int
+    out_dim : int
+    n_subjects : int
+    bias : bool
+    init_id : bool
+        If True, initialize weights as identity (requires in_dim == out_dim).
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        n_subjects: int,
+        bias: bool = True,
+        init_id: bool = True,
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.n_subjects = n_subjects
+
+        # (N, in_dim, out_dim) — one linear transform per subject
+        self.weights = nn.Parameter(torch.empty(n_subjects, in_dim, out_dim))
+        self.bias = nn.Parameter(torch.zeros(n_subjects, out_dim)) if bias else None
+
+        if init_id:
+            assert in_dim == out_dim, "init_id requires in_dim == out_dim"
+            # Identity init: each subject starts as pass-through
+            self.weights.data[:] = torch.eye(in_dim)[None]
+        else:
+            nn.init.xavier_uniform_(self.weights.data.view(-1, in_dim, out_dim))
+
+    def forward(
+        self,
+        x: torch.Tensor,           # (B, T, C_in)
+        subject_id: torch.Tensor,   # (B,)
+    ) -> torch.Tensor:
+        """Apply per-subject linear transform.
+
+        Returns (B, T, C_out)
+        """
+        # Select weights for each sample in batch
+        W = self.weights[subject_id]        # (B, C_in, C_out)
+        # Batched matmul: (B, T, C_in) @ (B, C_in, C_out) → (B, T, C_out)
+        out = torch.bmm(x, W)
+        if self.bias is not None:
+            out = out + self.bias[subject_id].unsqueeze(1)  # (B, 1, C_out)
+        return out
+
+    def __repr__(self) -> str:
+        return (f"SubjectLayers({self.in_dim}, {self.out_dim}, "
+                f"n_subjects={self.n_subjects})")
+
+
+# =============================================================================
+# DiT-style Adaptive LayerNorm Transformer Block
+# =============================================================================
+
+class AdaLNTransformerBlock(nn.Module):
+    """Transformer block with Adaptive Layer Norm (DiT-style).
+
+    Instead of standard Pre-LN, uses adaLN where the normalization
+    shift/scale/gate are conditioned on flow time + subject.
+    This injects time information at EVERY layer (like Matcha-TTS
+    injects time into every ResNet block).
+
+    Flow:
+        adaLN_1(h, γ₁, β₁) → Self-Attention → h + gate₁ · attn_out
+        adaLN_2(h, γ₂, β₂) → FFN            → h + gate₂ · ffn_out
+
+    Parameters
+    ----------
+    hidden_dim : int
+    n_heads : int
+    dropout : float
+    ffn_mult : int
+        FFN expansion factor.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 512,
+        n_heads: int = 8,
+        dropout: float = 0.1,
+        ffn_mult: int = 4,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+        # adaLN norms (no learnable affine — shift/scale come from conditioning)
+        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+
+        # Self-attention
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        # FFN
+        ffn_dim = hidden_dim * ffn_mult
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+        # adaLN modulation: 6 values per token (shift1, scale1, gate1, shift2, scale2, gate2)
+        # These are projected from the global conditioning embedding
+        # Initialized so that shift=0, scale=1, gate=1 at init (identity)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 6 * hidden_dim),
+        )
+        # Zero-init the linear layer so outputs start at 0
+        nn.init.zeros_(self.adaLN_modulation[1].weight)
+        nn.init.zeros_(self.adaLN_modulation[1].bias)
+
+    def forward(
+        self,
+        h: torch.Tensor,       # (B, T, H)
+        c: torch.Tensor,       # (B, H) — global conditioning (time + subject)
+    ) -> torch.Tensor:
+        # Compute modulation parameters from conditioning
+        mod = self.adaLN_modulation(c)  # (B, 6*H)
+        shift1, scale1, gate1, shift2, scale2, gate2 = mod.chunk(6, dim=-1)  # each (B, H)
+
+        # --- Self-Attention block ---
+        # adaLN: norm then apply learned shift/scale
+        h_norm = self.norm1(h)
+        h_norm = h_norm * (1 + scale1.unsqueeze(1)) + shift1.unsqueeze(1)  # (B, T, H)
+        attn_out, _ = self.attn(h_norm, h_norm, h_norm)
+        h = h + gate1.unsqueeze(1) * attn_out  # gated residual
+
+        # --- FFN block ---
+        h_norm = self.norm2(h)
+        h_norm = h_norm * (1 + scale2.unsqueeze(1)) + shift2.unsqueeze(1)
+        ffn_out = self.ffn(h_norm)
+        h = h + gate2.unsqueeze(1) * ffn_out  # gated residual
+
+        return h
+
+
+# =============================================================================
+# Velocity Transformer (DiT-style)
 # =============================================================================
 
 class VelocityTransformer(nn.Module):
-    """Velocity field v_θ(z_t, t, cond) with temporal self-attention.
+    """Velocity field v_θ(z_t, t, cond) with DiT-style temporal transformer.
 
-    Processes the full sequence of TRs jointly, allowing the model to learn
-    temporal dynamics in the latent space (HRF, temporal smoothness, etc.).
+    Key improvements over previous version:
+    1. Channel concatenation: [z_t; cond] instead of z_t + cond
+    2. DiT-style adaLN: time+subject modulates every layer
+    3. Gated residuals for stable training
 
     Parameters
     ----------
     latent_dim : int
         VAE latent dimension (Z).
+    cond_proj_dim : int
+        Projected conditioning dimension for concatenation.
     hidden_dim : int
         Transformer d_model.
     n_heads : int
         Number of attention heads.
     n_layers : int
-        Number of transformer encoder layers.
+        Number of transformer layers.
     dropout : float
     time_embed_dim : int
         Dimension of sinusoidal time embedding.
@@ -103,6 +272,7 @@ class VelocityTransformer(nn.Module):
     def __init__(
         self,
         latent_dim: int = 256,
+        cond_proj_dim: int = 256,
         hidden_dim: int = 512,
         n_heads: int = 8,
         n_layers: int = 6,
@@ -114,7 +284,7 @@ class VelocityTransformer(nn.Module):
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
 
-        # Time embedding: sinusoidal → MLP
+        # Time embedding: sinusoidal → MLP → hidden_dim
         self.time_embed = nn.Sequential(
             SinusoidalTimeEmbedding(time_embed_dim),
             nn.Linear(time_embed_dim, hidden_dim),
@@ -122,9 +292,10 @@ class VelocityTransformer(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Input projection: z_t (Z) → hidden_dim
+        # Input projection: concat [z_t; cond] → hidden_dim
+        # (Matcha-TTS style: concat noise and condition along channel dim)
         self.input_proj = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
+            nn.Linear(latent_dim + cond_proj_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
         )
 
@@ -132,24 +303,26 @@ class VelocityTransformer(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, hidden_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
-        # Transformer encoder: self-attention across T positions
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=n_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,  # Pre-LN for training stability
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=n_layers,
-            enable_nested_tensor=False,
-        )
+        # DiT-style transformer blocks (adaLN in every layer)
+        self.blocks = nn.ModuleList([
+            AdaLNTransformerBlock(
+                hidden_dim=hidden_dim,
+                n_heads=n_heads,
+                dropout=dropout,
+            )
+            for _ in range(n_layers)
+        ])
 
-        # Output projection: hidden_dim → Z
-        self.output_norm = nn.LayerNorm(hidden_dim)
+        # Final adaLN + output projection
+        self.final_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.final_adaLN = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2 * hidden_dim),  # shift + scale
+        )
+        nn.init.zeros_(self.final_adaLN[1].weight)
+        nn.init.zeros_(self.final_adaLN[1].bias)
+
+        # Shared output projection (before subject-specific layer)
         self.output_proj = nn.Linear(hidden_dim, latent_dim)
 
         # Zero-init output layer: velocity ≈ 0 at initialization (identity flow)
@@ -160,7 +333,8 @@ class VelocityTransformer(nn.Module):
         self,
         z_t: torch.Tensor,      # (B, T, Z) noisy latent sequence
         t: torch.Tensor,         # (B,) flow time
-        cond: torch.Tensor,      # (B, T, H) conditioning from CondMLP
+        cond: torch.Tensor,      # (B, T, P) projected conditioning
+        c_global: torch.Tensor,  # (B, H) global conditioning (time + subject)
     ) -> torch.Tensor:
         """Predict velocity v(z_t, t, cond).
 
@@ -170,24 +344,22 @@ class VelocityTransformer(nn.Module):
         """
         B, T, Z = z_t.shape
 
-        # Project z_t to hidden dim
-        h = self.input_proj(z_t)  # (B, T, H)
-
-        # Add conditioning (additive — simple and effective)
-        h = h + cond  # (B, T, H)
-
-        # Add time embedding (broadcast across T)
-        t_emb = self.time_embed(t)  # (B, H)
-        h = h + t_emb.unsqueeze(1)  # (B, T, H)
+        # Channel concatenation: [z_t; cond] (Matcha-TTS style)
+        h = torch.cat([z_t, cond], dim=-1)  # (B, T, Z+P)
+        h = self.input_proj(h)  # (B, T, H)
 
         # Add positional embedding
         h = h + self.pos_embed[:, :T, :]  # (B, T, H)
 
-        # Transformer: self-attention across T (temporal modeling)
-        h = self.transformer(h)  # (B, T, H)
+        # DiT blocks: each layer receives time+subject conditioning
+        for block in self.blocks:
+            h = block(h, c_global)  # (B, T, H)
 
-        # Output projection
-        h = self.output_norm(h)
+        # Final adaLN + shared output projection
+        final_mod = self.final_adaLN(c_global)  # (B, 2*H)
+        shift, scale = final_mod.chunk(2, dim=-1)
+        h = self.final_norm(h)
+        h = h * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
         v = self.output_proj(h)  # (B, T, Z)
 
         return v
@@ -201,7 +373,12 @@ class BrainFlowCFM(nn.Module):
     """BrainFlow: Latent-Space Conditional Flow Matching.
 
     Generates fMRI VAE latent sequences conditioned on PCA stimulus features.
-    Uses temporal self-attention to capture inter-TR dynamics.
+    Uses DiT-style temporal transformer with adaLN conditioning.
+
+    Key improvements (Matcha-TTS inspired):
+    1. Channel concat [z_t; cond] instead of additive
+    2. adaLN: time+subject modulates every transformer layer
+    3. Gated residuals for training stability
 
     Parameters
     ----------
@@ -219,6 +396,8 @@ class BrainFlowCFM(nn.Module):
         Number of subjects for subject embedding.
     dropout : float
     time_embed_dim : int
+    cond_proj_dim : int
+        Projected conditioning dimension for concat with z_t.
     """
 
     def __init__(
@@ -231,26 +410,54 @@ class BrainFlowCFM(nn.Module):
         n_subjects: int = 4,
         dropout: float = 0.1,
         time_embed_dim: int = 256,
+        cond_proj_dim: int = 256,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.cond_dim = cond_dim
 
-        # Conditioning: PCA features → hidden dim
-        self.cond_mlp = ConditioningMLP(cond_dim, hidden_dim, dropout=dropout)
+        # Conditioning: PCA features → projected dim for concat
+        self.cond_mlp = ConditioningMLP(cond_dim, cond_proj_dim, dropout=dropout)
 
-        # Subject embedding
+        # TRIBE-style: per-subject transform on conditioning (identity-init)
+        self.cond_subject_layer = SubjectLayers(
+            in_dim=cond_proj_dim, out_dim=cond_proj_dim,
+            n_subjects=n_subjects, init_id=True,
+        )
+
+        # Subject embedding → added to time embedding for global conditioning
         self.subject_embed = nn.Embedding(n_subjects, hidden_dim)
 
-        # Velocity network
+        # TRIBE-style: per-subject output projection (identity-init)
+        self.output_subject_layer = SubjectLayers(
+            in_dim=latent_dim, out_dim=latent_dim,
+            n_subjects=n_subjects, init_id=True,
+        )
+
+        # Velocity network (DiT-style)
         self.velocity_net = VelocityTransformer(
             latent_dim=latent_dim,
+            cond_proj_dim=cond_proj_dim,
             hidden_dim=hidden_dim,
             n_heads=n_heads,
             n_layers=n_layers,
             dropout=dropout,
             time_embed_dim=time_embed_dim,
         )
+
+    def _build_global_cond(
+        self,
+        t: torch.Tensor,
+        subject_id: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Build global conditioning vector from time + subject.
+
+        Returns (B, H) vector used by adaLN in every transformer layer.
+        """
+        c = self.velocity_net.time_embed(t)  # (B, H)
+        if subject_id is not None:
+            c = c + self.subject_embed(subject_id)  # (B, H)
+        return c
 
     def forward(
         self,
@@ -266,15 +473,23 @@ class BrainFlowCFM(nn.Module):
             v_t = model(pca_features, t, z_t, subject_id)
             loss = MSE(v_t, u_t)
         """
-        # Conditioning
-        cond = self.cond_mlp(pca_features)  # (B, T, H)
+        # Project PCA features to concat dim
+        cond = self.cond_mlp(pca_features)  # (B, T, P)
 
-        # Add subject embedding
+        # TRIBE: subject-specific conditioning transform
         if subject_id is not None:
-            cond = cond + self.subject_embed(subject_id).unsqueeze(1)  # (B, T, H)
+            cond = self.cond_subject_layer(cond, subject_id)  # (B, T, P)
+
+        # Build global conditioning (time + subject) for adaLN
+        c_global = self._build_global_cond(t, subject_id)  # (B, H)
 
         # Predict velocity
-        v = self.velocity_net(z_t, t, cond)  # (B, T, Z)
+        v = self.velocity_net(z_t, t, cond, c_global)  # (B, T, Z)
+
+        # TRIBE: subject-specific output transform
+        if subject_id is not None:
+            v = self.output_subject_layer(v, subject_id)  # (B, T, Z)
+
         return v
 
     @torch.no_grad()
@@ -301,10 +516,12 @@ class BrainFlowCFM(nn.Module):
         B, T, _ = pca_features.shape
         device = pca_features.device
 
-        # Encode conditioning once
-        cond = self.cond_mlp(pca_features)  # (B, T, H)
+        # Encode conditioning once (reused across ODE steps)
+        cond = self.cond_mlp(pca_features)  # (B, T, P)
+
+        # TRIBE: subject-specific conditioning transform
         if subject_id is not None:
-            cond = cond + self.subject_embed(subject_id).unsqueeze(1)
+            cond = self.cond_subject_layer(cond, subject_id)  # (B, T, P)
 
         # Start from Gaussian noise
         z = torch.randn(B, T, self.latent_dim, device=device)
@@ -315,14 +532,24 @@ class BrainFlowCFM(nn.Module):
 
         for t_val in ts:
             t = torch.full((B,), t_val, device=device)
+            c_global = self._build_global_cond(t, subject_id)  # (B, H)
+
             if method == "euler":
-                v = self.velocity_net(z, t, cond)
+                v = self.velocity_net(z, t, cond, c_global)
+                # TRIBE: subject-specific output transform
+                if subject_id is not None:
+                    v = self.output_subject_layer(v, subject_id)
                 z = z + v * dt
             elif method == "midpoint":
-                v1 = self.velocity_net(z, t, cond)
+                v1 = self.velocity_net(z, t, cond, c_global)
+                if subject_id is not None:
+                    v1 = self.output_subject_layer(v1, subject_id)
                 z_mid = z + v1 * (dt / 2)
                 t_mid = torch.full((B,), t_val + dt / 2, device=device)
-                v2 = self.velocity_net(z_mid, t_mid, cond)
+                c_mid = self._build_global_cond(t_mid, subject_id)
+                v2 = self.velocity_net(z_mid, t_mid, cond, c_mid)
+                if subject_id is not None:
+                    v2 = self.output_subject_layer(v2, subject_id)
                 z = z + v2 * dt
             else:
                 raise ValueError(f"Unknown method: {method}")

@@ -49,8 +49,11 @@ pca_features:
 # --- Subjects ---
 subjects:
   - sub-01
+  - sub-02
+  - sub-03
+  - sub-05
 
-subject_mode: single
+subject_mode: multi
 
 # --- Splits ---
 splits:
@@ -72,13 +75,16 @@ preprocessing:
 dataloader:
   batch_size: 64
   val_batch_size: 64
-  num_workers: 0
+  num_workers: 4           # >0 when precomputed latents exist (auto-detected)
   pin_memory: true
+
+# --- Precomputed latents (from precompute_latents.py) ---
+latent_dir: Data/latents
 
 # --- BrainFlow specific ---
 brainflow:
-  seq_len: 10          # Number of TRs per sample (~15s)
-  train_stride: 1      # Dense overlap for training
+  seq_len: 100         # Number of TRs per sample (~149s), matches VAE training
+  train_stride: 80      # Dense overlap for training
   num_trial: 1         # VAE encoding trials (1=deterministic mu, >1=avg samples)
 
 # =====================================================================
@@ -90,25 +96,26 @@ model:
   hidden_dim: 512        # Transformer d_model
   n_heads: 8             # Attention heads (512/8 = 64 dim/head)
   n_layers: 6            # Transformer layers
-  n_subjects: 1          # Number of subjects (single subject mode)
+  n_subjects: 4          # Number of subjects (sub-01, sub-02, sub-03, sub-05)
   dropout: 0.1
   time_embed_dim: 256
+  cond_proj_dim: 256       # Projected conditioning dim for concat with z_t
 
 # =====================================================================
 # VAE checkpoint (Stage 1, frozen decoder for validation)
 # =====================================================================
-vae_checkpoint: outputs/fmri_vae_128/best.pt
+vae_checkpoint: outputs/fmri_vae_256/best.pt
 
 # =====================================================================
 # Training config
 # =====================================================================
 training:
-  n_epochs: 200
+  n_epochs: 300
   lr: 3.0e-4
   weight_decay: 0.01
   warmup_ratio: 0.05
   grad_clip: 1.0
-  ema_decay: 0.999
+  ema_decay: 0.99
   cfm_sigma: 0.01
   cfm_method: icfm
 

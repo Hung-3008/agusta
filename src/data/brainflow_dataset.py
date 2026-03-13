@@ -1,16 +1,16 @@
-"""BrainFlow v4 Dataset: PCA features + online VAE latent extraction.
+"""BrainFlow Dataset: PCA features + precomputed or online VAE latent extraction.
 
-Loads precomputed PCA features (from precompute_pca_features.py) and
-extracts VAE latents on-the-fly from fMRI data.
+Loads precomputed PCA features and VAE latents. Two modes:
+  1. **Precomputed (fast)**: Loads latents from NPY files (from precompute_latents.py).
+     Allows num_workers > 0 for parallel prefetching. ~3-5 min/epoch.
+  2. **Online (slow, fallback)**: Encodes fMRI through VAE in __getitem__.
+     Requires num_workers=0 (GPU in dataloader). ~70 min/epoch.
 
 Each sample:
-    pca_features : (T_out, D_cond) float32 — PCA-reduced stimulus features
-    latent       : (T_out, Z) float32 — VAE latent targets (online encoded)
-    subject_id   : int — subject index
-
-The VAE latents are extracted online with configurable `num_trial`:
-  - num_trial=1: deterministic μ (no sampling noise)
-  - num_trial>1: sample `num_trial` times and average (reduces VAE noise)
+    pca_features : (T_out, D_cond) float32
+    latent       : (T_out, Z) float32
+    fmri         : (T_out, V) float32 (for validation decoding)
+    subject_id   : int
 """
 
 import hashlib
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class BrainFlowDataset(Dataset):
-    """Dataset for BrainFlow v4: PCA features + VAE latent targets.
+    """Dataset for BrainFlow: PCA features + VAE latent targets.
 
     Parameters
     ----------
@@ -38,9 +38,9 @@ class BrainFlowDataset(Dataset):
     split : str
         'train' or 'val'.
     vae_model : nn.Module or None
-        Pretrained VAE for online latent extraction. If None, loads raw fMRI.
+        Pretrained VAE for online latent extraction (fallback only).
     num_trial : int
-        Number of VAE encoding trials to average. 1 = deterministic μ.
+        Number of VAE encoding trials to average (online mode only).
     seq_len : int
         Number of TRs per sample.
     stride : int or None
@@ -69,9 +69,10 @@ class BrainFlowDataset(Dataset):
 
         # Paths
         self.fmri_dir = cfg["_fmri_dir"]
-        pca_cfg = cfg.get("pca_features", {})
         project_root = cfg["_project_root"]
+        pca_cfg = cfg.get("pca_features", {})
         self.pca_dir = Path(project_root) / pca_cfg.get("output_dir", "Data/pca_features")
+        self.latent_dir = Path(project_root) / cfg.get("latent_dir", "Data/latents")
 
         # Subjects
         self.subjects = cfg["subjects"]
@@ -80,21 +81,23 @@ class BrainFlowDataset(Dataset):
         # Val ratio
         self.val_ratio = cfg.get("val_ratio", 0.1)
 
-        # Build clip + sample indices
-        self._clips: list[dict] = []
-        self._samples: list[tuple[int, int]] = []
+        # Caches
         self._fmri_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._pca_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._latent_cache: OrderedDict[str, np.ndarray] = OrderedDict()
-        self._max_cache = 100
+        self._max_cache = 300
 
+        # Build clip + sample indices
+        self._clips: list[dict] = []
+        self._samples: list[tuple[int, int]] = []
+        self._has_precomputed = False
         self._enumerate_clips()
 
         logger.info(
             "BrainFlowDataset[%s]: %d samples (seq_len=%d, stride=%d) "
-            "from %d clips, num_trial=%d",
+            "from %d clips, precomputed_latents=%s",
             split, len(self._samples), seq_len, self.stride,
-            len(self._clips), num_trial,
+            len(self._clips), self._has_precomputed,
         )
 
     def _assign_split(self, uid: str) -> str:
@@ -115,27 +118,25 @@ class BrainFlowDataset(Dataset):
     def _enumerate_clips(self):
         """Discover clips from PCA features directory."""
         splits_cfg = self.cfg["splits"]
+        first_checked = False
 
         for task, task_splits in splits_cfg.items():
             for split_name, stim_types in task_splits.items():
                 for stim_type in stim_types:
                     pca_dir = self.pca_dir / task / stim_type
                     if not pca_dir.exists():
-                        logger.debug("PCA dir missing: %s", pca_dir)
                         continue
 
                     clip_files = sorted(pca_dir.glob("*.npy"))
                     for pca_path in clip_files:
                         clip_name = pca_path.stem
 
-                        # Determine fMRI key
                         fmri_key = clip_name
                         if task == "friends" and clip_name.startswith("friends_"):
                             fmri_key = clip_name[len("friends_"):]
                         elif task == "movie10" and clip_name.startswith("movie10_"):
                             fmri_key = clip_name[len("movie10_"):]
 
-                        # Check split
                         if split_name == "test":
                             clip_split = "test"
                         else:
@@ -144,16 +145,24 @@ class BrainFlowDataset(Dataset):
                         if clip_split != self.split:
                             continue
 
-                        # Per subject
                         for subject in self.subjects:
                             fp = self._fmri_path(subject, task)
                             if not fp.exists():
                                 continue
 
-                            # Verify clip exists in fMRI h5
+                            # Check precomputed latent
+                            latent_path = (self.latent_dir / subject / task
+                                           / stim_type / f"{clip_name}.npy")
+                            has_latent = latent_path.exists()
+                            if has_latent and not first_checked:
+                                self._has_precomputed = True
+                                first_checked = True
+
+                            # Verify fMRI exists
                             try:
                                 with h5py.File(fp, "r") as f:
-                                    matched = [k for k in f.keys() if fmri_key in k]
+                                    matched = [k for k in f.keys()
+                                               if fmri_key in k]
                                     if not matched:
                                         continue
                                     n_trs_raw = f[matched[0]].shape[0]
@@ -161,13 +170,15 @@ class BrainFlowDataset(Dataset):
                                 continue
 
                             n_trs = n_trs_raw - self.excl_start - self.excl_end
-                            if n_trs < self.seq_len:
-                                continue
 
-                            # Check PCA feature alignment
+                            # Usable TRs = min(fMRI, PCA, latent)
                             pca_data = np.load(pca_path)
-                            pca_trs = pca_data.shape[0]
-                            usable_trs = min(n_trs, pca_trs)
+                            usable_trs = min(n_trs, pca_data.shape[0])
+
+                            if has_latent:
+                                lat_data = np.load(latent_path)
+                                usable_trs = min(usable_trs, lat_data.shape[0])
+
                             if usable_trs < self.seq_len:
                                 continue
 
@@ -179,121 +190,138 @@ class BrainFlowDataset(Dataset):
                                 "fmri_key": fmri_key,
                                 "fmri_path": str(fp),
                                 "pca_path": str(pca_path),
+                                "latent_path": str(latent_path)
+                                    if has_latent else None,
                                 "n_trs": usable_trs,
                                 "fmri_h5_key": matched[0],
                             })
 
-                            # Build windows
-                            for start in range(0, usable_trs - self.seq_len + 1, self.stride):
+                            for start in range(
+                                0, usable_trs - self.seq_len + 1,
+                                self.stride,
+                            ):
                                 self._samples.append((clip_idx, start))
 
-    def _load_fmri(self, clip: dict) -> np.ndarray:
-        """Load fMRI clip → (n_trs, V) float32."""
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
+
+    def _load_cached(self, cache, key, load_fn):
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key]
+        data = load_fn()
+        cache[key] = data
+        if len(cache) > self._max_cache:
+            cache.popitem(last=False)
+        return data
+
+    def _load_fmri(self, clip):
         cache_key = f"{clip['subject']}_{clip['fmri_h5_key']}"
-        if cache_key in self._fmri_cache:
-            self._fmri_cache.move_to_end(cache_key)
-            return self._fmri_cache[cache_key]
+        def _load():
+            with h5py.File(clip["fmri_path"], "r") as f:
+                raw = f[clip["fmri_h5_key"]]
+                end = len(raw) - self.excl_end if self.excl_end > 0 else len(raw)
+                data = raw[self.excl_start:end].astype(np.float32)
+            if self.standardize:
+                m = data.mean(axis=0, keepdims=True)
+                s = data.std(axis=0, keepdims=True)
+                s = np.where(s < 1e-8, 1.0, s)
+                data = (data - m) / s
+            return np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+        return self._load_cached(self._fmri_cache, cache_key, _load)
 
-        with h5py.File(clip["fmri_path"], "r") as f:
-            raw = f[clip["fmri_h5_key"]]
-            end = len(raw) - self.excl_end if self.excl_end > 0 else len(raw)
-            data = raw[self.excl_start:end].astype(np.float32)
-
-        if self.standardize:
-            mean = data.mean(axis=0, keepdims=True)
-            std = data.std(axis=0, keepdims=True)
-            std = np.where(std < 1e-8, 1.0, std)
-            data = (data - mean) / std
-
-        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-        self._fmri_cache[cache_key] = data
-        if len(self._fmri_cache) > self._max_cache:
-            self._fmri_cache.popitem(last=False)
-        return data
-
-    def _load_pca(self, clip: dict) -> np.ndarray:
-        """Load PCA features → (n_trs, D_cond) float32."""
+    def _load_pca(self, clip):
         path = clip["pca_path"]
-        if path in self._pca_cache:
-            self._pca_cache.move_to_end(path)
-            return self._pca_cache[path]
+        return self._load_cached(
+            self._pca_cache, path,
+            lambda: np.load(path).astype(np.float32),
+        )
 
-        data = np.load(path).astype(np.float32)
-        self._pca_cache[path] = data
-        if len(self._pca_cache) > self._max_cache:
-            self._pca_cache.popitem(last=False)
-        return data
+    def _load_latent(self, clip):
+        path = clip["latent_path"]
+        return self._load_cached(
+            self._latent_cache, path,
+            lambda: np.load(path).astype(np.float32),
+        )
 
-    def _encode_latent(self, fmri_window: np.ndarray, subject_id: int) -> np.ndarray:
-        """Encode fMRI window to VAE latent, with num_trial averaging.
-
-        Parameters
-        ----------
-        fmri_window : (T, V) float32
-        subject_id : int
-
-        Returns
-        -------
-        latent : (T, Z) float32
-        """
+    def _encode_latent_online(self, fmri_window, subject_id):
+        """Fallback: encode fMRI through VAE online (slow)."""
         if self.vae_model is None:
-            # No VAE — return raw fMRI as target
             return fmri_window
-
         device = next(self.vae_model.parameters()).device
-        fmri_t = torch.from_numpy(fmri_window).unsqueeze(0).to(device)  # (1, T, V)
-        sid_t = torch.tensor([subject_id], dtype=torch.long, device=device)  # (1,)
-
+        fmri_t = torch.from_numpy(fmri_window).unsqueeze(0).to(device)
+        sid_t = torch.tensor([subject_id], dtype=torch.long, device=device)
         with torch.no_grad():
             if self.num_trial <= 1:
-                # Deterministic: use μ only
-                latent = self.vae_model.get_latent(fmri_t, sid_t)  # (1, T, Z)
+                latent = self.vae_model.get_latent(fmri_t, sid_t)
             else:
-                # Multi-trial: sample num_trial times and average
-                latents = []
+                zs = []
                 for _ in range(self.num_trial):
-                    self.vae_model.train()  # Enable sampling
-                    z, _, _ = self.vae_model.encode(fmri_t, sid_t)  # (1, T, Z)
-                    latents.append(z)
+                    self.vae_model.train()
+                    z, _, _ = self.vae_model.encode(fmri_t, sid_t)
+                    zs.append(z)
                 self.vae_model.eval()
-                latent = torch.stack(latents).mean(dim=0)  # (1, T, Z)
+                latent = torch.stack(zs).mean(dim=0)
+        return latent.squeeze(0).cpu().numpy()
 
-        return latent.squeeze(0).cpu().numpy()  # (T, Z)
+    # ------------------------------------------------------------------
+    # Dataset interface
+    # ------------------------------------------------------------------
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self._samples)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx):
         clip_idx, start = self._samples[idx]
         clip = self._clips[clip_idx]
+        end = start + self.seq_len
 
-        # Load PCA features
         pca_full = self._load_pca(clip)
-        pca_window = pca_full[start:start + self.seq_len].copy()  # (T, D_cond)
+        pca_window = pca_full[start:end].copy()
 
-        # Load fMRI and encode to latent
         fmri_full = self._load_fmri(clip)
-        fmri_window = fmri_full[start:start + self.seq_len].copy()  # (T, V)
-        latent = self._encode_latent(fmri_window, clip["subject_id"])  # (T, Z)
+        fmri_window = fmri_full[start:end].copy()
+
+        if clip["latent_path"] is not None:
+            latent_full = self._load_latent(clip)
+            latent_window = latent_full[start:end].copy()
+        else:
+            latent_window = self._encode_latent_online(
+                fmri_window, clip["subject_id"],
+            )
 
         return {
             "pca_features": torch.from_numpy(pca_window),
-            "latent": torch.from_numpy(latent),
+            "latent": torch.from_numpy(latent_window),
             "fmri": torch.from_numpy(fmri_window),
             "subject_id": torch.tensor(clip["subject_id"], dtype=torch.long),
         }
 
+
+# =====================================================================
+# DataLoader builder
+# =====================================================================
 
 def build_brainflow_dataloaders(
     cfg: dict,
     vae_model=None,
     num_trial: int = 1,
 ) -> dict[str, DataLoader | None]:
-    """Build train/val dataloaders for BrainFlow v4."""
+    """Build train/val dataloaders for BrainFlow."""
     bf_cfg = cfg.get("brainflow", {})
     dl_cfg = cfg["dataloader"]
     seq_len = bf_cfg.get("seq_len", 10)
-    train_stride = bf_cfg.get("train_stride", 1)  # Dense overlap for training
+    train_stride = bf_cfg.get("train_stride", 1)
+
+    # Auto-enable workers when precomputed latents exist
+    project_root = cfg["_project_root"]
+    latent_dir = Path(project_root) / cfg.get("latent_dir", "Data/latents")
+    has_precomputed = latent_dir.exists() and any(latent_dir.rglob("*.npy"))
+    num_workers = dl_cfg.get("num_workers", 0)
+    if has_precomputed and num_workers == 0:
+        num_workers = min(4, dl_cfg.get("max_workers", 4))
+        logger.info("Precomputed latents found -> num_workers=%d", num_workers)
 
     loaders = {}
     for split in ("train", "val"):
@@ -309,13 +337,16 @@ def build_brainflow_dataloaders(
             logger.warning("Empty dataset for split '%s'", split)
             loaders[split] = None
             continue
-        bs = dl_cfg["batch_size"] if split == "train" else dl_cfg.get("val_batch_size", dl_cfg["batch_size"])
+        bs = (dl_cfg["batch_size"] if split == "train"
+              else dl_cfg.get("val_batch_size", dl_cfg["batch_size"]))
+        use_workers = num_workers if ds._has_precomputed else 0
         loaders[split] = DataLoader(
             ds,
             batch_size=bs,
             shuffle=(split == "train"),
-            num_workers=dl_cfg.get("num_workers", 0),
+            num_workers=use_workers,
             pin_memory=dl_cfg.get("pin_memory", True),
             drop_last=(split == "train"),
+            persistent_workers=(use_workers > 0),
         )
     return loaders

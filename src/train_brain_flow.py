@@ -118,7 +118,7 @@ def train_one_epoch(
     dataloader,
     optimizer,
     scheduler,
-    fm,
+    sigma: float,
     device,
     scaler,
     use_amp: bool,
@@ -138,26 +138,21 @@ def train_one_epoch(
 
         B, T, Z = latent.shape
 
-        # CFM operates per-sequence: flatten (B,T,Z) → (B*T, Z) for CFM sampling
-        # then reshape back. This treats each TR as an independent flow point
-        # but the velocity net sees the full temporal context.
-        x1_flat = latent.reshape(B * T, Z).float()
-        x0_flat = torch.randn_like(x1_flat)
-        t_flow, xt_flat, ut_flat = fm.sample_location_and_conditional_flow(x0_flat, x1_flat)
+        # Sample 1 flow time per sequence (consistent across all TRs)
+        t_flow = torch.rand(B, device=device)  # (B,)
+        t_expand = t_flow.view(B, 1, 1)  # (B, 1, 1) for broadcasting
 
-        # t_flow: (B*T,) → we need same t for all TRs in a sequence
-        # Reshape and take mean per batch element
-        t_flow_seq = t_flow.reshape(B, T).mean(dim=1)  # (B,)
-        # Reconstruct xt using the averaged t for consistency
-        # Actually, for simplicity, use the per-TR t as-is but reshape
-        xt_seq = xt_flat.reshape(B, T, Z)
-        ut_seq = ut_flat.reshape(B, T, Z)
+        # Compute interpolant directly (ICFM: xt = (1-(1-σ)t)·x0 + t·x1)
+        x0 = torch.randn_like(latent)  # (B, T, Z)
+        x1 = latent.float()
+        xt = (1 - (1 - sigma) * t_expand) * x0 + t_expand * x1  # (B, T, Z)
+        ut = x1 - (1 - sigma) * x0  # (B, T, Z) — target velocity
 
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=use_amp):
-            vt = model(pca_features, t_flow_seq, xt_seq, subject_id)  # (B, T, Z)
-            loss = nn.functional.mse_loss(vt, ut_seq)
+            vt = model(pca_features, t_flow, xt, subject_id)  # (B, T, Z)
+            loss = nn.functional.mse_loss(vt, ut)
 
         if use_amp:
             scaler.scale(loss).backward()
@@ -199,7 +194,7 @@ def train_one_epoch(
 def validate(
     model: BrainFlowCFM,
     dataloader,
-    fm,
+    sigma: float,
     device,
     use_amp: bool,
     vae_decoder=None,
@@ -224,17 +219,17 @@ def validate(
 
         B, T, Z = latent.shape
 
-        # CFM loss
-        x1_flat = latent.reshape(B * T, Z).float()
-        x0_flat = torch.randn_like(x1_flat)
-        t_flow, xt_flat, ut_flat = fm.sample_location_and_conditional_flow(x0_flat, x1_flat)
-        t_flow_seq = t_flow.reshape(B, T).mean(dim=1)
-        xt_seq = xt_flat.reshape(B, T, Z)
-        ut_seq = ut_flat.reshape(B, T, Z)
+        # CFM loss — consistent t per sequence
+        t_flow = torch.rand(B, device=device)
+        t_expand = t_flow.view(B, 1, 1)
+        x0 = torch.randn_like(latent)
+        x1 = latent.float()
+        xt = (1 - (1 - sigma) * t_expand) * x0 + t_expand * x1
+        ut = x1 - (1 - sigma) * x0
 
         with autocast(enabled=use_amp):
-            vt = model(pca_features, t_flow_seq, xt_seq, subject_id)
-            loss = nn.functional.mse_loss(vt, ut_seq)
+            vt = model(pca_features, t_flow, xt, subject_id)
+            loss = nn.functional.mse_loss(vt, ut)
 
         total_loss += loss.item()
         n_batches += 1
@@ -415,31 +410,35 @@ def main():
         if args.fast_dev_run:
             mini_loader = _limit_batches(train_loader, 2)
             train_loss = train_one_epoch(
-                model, mini_loader, optimizer, scheduler, fm, device, scaler,
+                model, mini_loader, optimizer, scheduler,
+                train_cfg["cfm_sigma"], device, scaler,
                 use_amp, train_cfg["grad_clip"], 1, epoch + 1,
             )
         else:
             train_loss = train_one_epoch(
-                model, train_loader, optimizer, scheduler, fm, device, scaler,
+                model, train_loader, optimizer, scheduler,
+                train_cfg["cfm_sigma"], device, scaler,
                 use_amp, train_cfg["grad_clip"], train_cfg["log_every_n_steps"], epoch + 1,
             )
 
         ema_update(model, ema_model, train_cfg["ema_decay"])
 
         # Validate
+        did_val = False
         val_loss, val_latent_pearson, val_voxel_pearson = 0.0, 0.0, 0.0
         if val_loader and (epoch + 1) % train_cfg["val_every_n_epochs"] == 0:
+            did_val = True
             if args.fast_dev_run:
                 mini_val = _limit_batches(val_loader, 2)
                 val_loss, val_latent_pearson, val_voxel_pearson = validate(
-                    ema_model, mini_val, fm, device, use_amp,
+                    ema_model, mini_val, train_cfg["cfm_sigma"], device, use_amp,
                     vae_decoder=vae,
                     n_sample_steps=train_cfg["n_sample_steps"],
                     sample_method=train_cfg["sample_method"],
                 )
             else:
                 val_loss, val_latent_pearson, val_voxel_pearson = validate(
-                    ema_model, val_loader, fm, device, use_amp,
+                    ema_model, val_loader, train_cfg["cfm_sigma"], device, use_amp,
                     vae_decoder=vae,
                     n_sample_steps=train_cfg["n_sample_steps"],
                     sample_method=train_cfg["sample_method"],
@@ -448,25 +447,32 @@ def main():
         elapsed = time.time() - t_epoch
         lr = optimizer.param_groups[0]["lr"]
 
-        logger.info(
-            "Epoch %d/%d | Train Loss: %.6f | Val Loss: %.6f | "
-            "Latent Pearson: %.4f | Voxel Pearson: %.4f | LR: %.2e | Time: %.1fs",
-            epoch + 1, n_epochs, train_loss, val_loss,
-            val_latent_pearson, val_voxel_pearson, lr, elapsed,
-        )
+        if did_val:
+            logger.info(
+                "Epoch %d/%d | Train Loss: %.6f | Val Loss: %.6f | "
+                "Latent Pearson: %.4f | Voxel Pearson: %.4f | LR: %.2e | Time: %.1fs",
+                epoch + 1, n_epochs, train_loss, val_loss,
+                val_latent_pearson, val_voxel_pearson, lr, elapsed,
+            )
+        else:
+            logger.info(
+                "Epoch %d/%d | Train Loss: %.6f | LR: %.2e | Time: %.1fs",
+                epoch + 1, n_epochs, train_loss, lr, elapsed,
+            )
 
-        # History
-        with open(history_path, "a", newline="") as f:
-            writer = csv.DictWriter(f, history_fields)
-            writer.writerow({
-                "epoch": epoch + 1,
-                "train_loss": f"{train_loss:.6f}",
-                "val_loss": f"{val_loss:.6f}",
-                "val_latent_pearson": f"{val_latent_pearson:.6f}",
-                "val_voxel_pearson": f"{val_voxel_pearson:.6f}",
-                "lr": f"{lr:.2e}",
-                "time_s": f"{elapsed:.1f}",
-            })
+        # History — only log when validation is performed
+        if did_val:
+            with open(history_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, history_fields)
+                writer.writerow({
+                    "epoch": epoch + 1,
+                    "train_loss": f"{train_loss:.6f}",
+                    "val_loss": f"{val_loss:.6f}",
+                    "val_latent_pearson": f"{val_latent_pearson:.6f}",
+                    "val_voxel_pearson": f"{val_voxel_pearson:.6f}",
+                    "lr": f"{lr:.2e}",
+                    "time_s": f"{elapsed:.1f}",
+                })
 
         # Checkpoint
         if not args.fast_dev_run:
