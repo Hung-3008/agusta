@@ -360,19 +360,38 @@ def load_feature_clip_perfile(
             raise ValueError(f"No layers found in {h5_path}")
 
         layers_data = []
+        valid_layer_keys = []
         for lk in layer_keys:
             arr = f[lk][:].astype(np.float32)  # (T, [tokens,] dim)
             # Squeeze any singleton dimensions: (T, 1, dim) → (T, dim)
             if arr.ndim == 3 and arr.shape[1] == 1:
                 arr = arr.squeeze(1)
+            # CRITICAL: Skip layers with overflow values (std=Inf due to FP16 overflow).
+            # These show up as unreachable large values in float32 (not NaN, not Inf,
+            # but numpy std overflows when computing). Detect by checking if std overflows.
+            try:
+                std_val = float(np.std(arr))
+                if not np.isfinite(std_val) or std_val == 0:
+                    continue  # skip this overflow/degenerate layer
+            except (OverflowError, FloatingPointError):
+                continue
             layers_data.append(arr)
+            valid_layer_keys.append(lk)
+
+        if not layers_data:
+            # Fallback: use first layer even if overflow (nan_to_num will zero it)
+            arr = f[layer_keys[0]][:].astype(np.float32)
+            if arr.ndim == 3 and arr.shape[1] == 1:
+                arr = arr.squeeze(1)
+            layers_data = [arr]
+            valid_layer_keys = [layer_keys[0]]
 
     # All layers should have same T dimension
     T = layers_data[0].shape[0]
     dim = layers_data[0].shape[-1]
 
     if layer_aggregation == "last":
-        data = layers_data[-1]  # (T, dim)
+        data = layers_data[-1]  # last VALID layer (not alphabetically-last)
     elif layer_aggregation == "mean":
         data = np.mean(layers_data, axis=0)  # (T, dim)
     elif layer_aggregation == "cat":

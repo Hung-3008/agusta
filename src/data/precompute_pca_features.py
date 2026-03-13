@@ -57,14 +57,36 @@ def _get_clip_n_trs(fmri_dir: str, subject: str, task: str, clip_key: str,
     return n_raw - excl_start - excl_end
 
 
+def _normalize_clip_name(clip_name: str, task: str) -> str:
+    """Strip task prefix from clip name to get a consistent normalized name.
+
+    Some modalities prefix the clip name with the task name (e.g. text uses
+    ``movie10_bourne01.h5`` while video/audio use ``bourne01.h5``). This
+    normalisation ensures all modalities share the same UID key-space so that
+    cross-modality intersection works correctly.
+    """
+    prefix = f"{task}_"
+    if clip_name.startswith(prefix):
+        return clip_name[len(prefix):]
+    return clip_name
+
+
 def _discover_clips(features_dir: str, modality_cfg: dict, task: str,
-                     stim_type: str) -> list[str]:
-    """Discover clip names from per-clip feature directory."""
+                     stim_type: str) -> list[tuple[str, str]]:
+    """Discover clip names from per-clip feature directory.
+
+    Returns list of (raw_stem, normalized_name) tuples.
+    ``raw_stem`` is the actual filename stem used for loading;
+    ``normalized_name`` is the task-prefix-stripped name used as UID.
+    """
     subdir = modality_cfg["subdir"]
     clip_dir = Path(features_dir) / subdir / task / stim_type
     if not clip_dir.exists():
         return []
-    return sorted(p.stem for p in clip_dir.glob("*.h5"))
+    return sorted(
+        (p.stem, _normalize_clip_name(p.stem, task))
+        for p in clip_dir.glob("*.h5")
+    )
 
 
 def load_all_features_for_modality(
@@ -95,27 +117,25 @@ def load_all_features_for_modality(
         stim_types = task_splits.get(split_filter, [])
         for stim_type in stim_types:
             clips = _discover_clips(features_dir, mod_cfg, task, stim_type)
-            for clip_name in clips:
-                # Get n_trs from fMRI
-                fmri_key = clip_name
-                if task == "friends" and clip_name.startswith("friends_"):
-                    fmri_key = clip_name[len("friends_"):]
-                elif task == "movie10" and clip_name.startswith("movie10_"):
-                    fmri_key = clip_name[len("movie10_"):]
+            for raw_clip_name, norm_clip_name in clips:
+                # norm_clip_name has task prefix stripped (e.g. "bourne01" not "movie10_bourne01")
+                # fmri_key is used to look up data in the H5 file via substring match
+                fmri_key = norm_clip_name
 
                 n_trs = _get_clip_n_trs(fmri_dir, ref_subject, task, fmri_key,
                                          excl_start, excl_end)
                 if n_trs is None or n_trs < 1:
-                    logger.warning("No fMRI for %s/%s, skipping", task, clip_name)
+                    logger.warning("No fMRI for %s/%s, skipping", task, raw_clip_name)
                     continue
 
                 try:
+                    # Load using the raw filename (as it exists on disk)
                     feat = load_feature_clip_perfile(
                         features_dir, modality, mod_cfg,
-                        task, stim_type, clip_name, layer_agg,
+                        task, stim_type, raw_clip_name, layer_agg,
                     )
                 except (FileNotFoundError, KeyError, ValueError) as e:
-                    logger.warning("Skip %s/%s: %s", modality, clip_name, e)
+                    logger.warning("Skip %s/%s: %s", modality, raw_clip_name, e)
                     continue
 
                 # feat: (1, dim, T_feat) → resample to (1, dim, n_trs)
@@ -124,7 +144,8 @@ def load_all_features_for_modality(
                 feat = feat[0].T  # (n_trs, dim)
                 feat = np.nan_to_num(feat, nan=0.0)
 
-                uid = f"{task}/{stim_type}/{clip_name}"
+                # Use normalized name as UID so all modalities share the same key
+                uid = f"{task}/{stim_type}/{norm_clip_name}"
                 result[uid] = feat
 
     return result

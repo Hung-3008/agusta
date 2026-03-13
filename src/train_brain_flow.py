@@ -1,520 +1,343 @@
-"""BrainFlow training script.
-
-Latent-space Conditional Flow Matching:
-  - Load precomputed PCA features
-  - Extract VAE latents online (with num_trial averaging)
-  - Train velocity transformer to map noise → latents
-  - Validate with frozen VAE decoder (latent → fMRI → Pearson)
-
-Usage:
-    python src/train_brain_flow.py --config src/configs/brain_flow.yaml
-    python src/train_brain_flow.py --config src/configs/brain_flow.yaml --fast_dev_run
-"""
-
 import argparse
-import copy
-import csv
 import logging
+import random
 import sys
 import time
 from pathlib import Path
 
+import h5py
 import numpy as np
 import torch
-import torch.nn as nn
-from scipy.stats import pearsonr
-from torch.cuda.amp import GradScaler, autocast
+import torch.nn.functional as F
 
-# Project root
+from matplotlib import pyplot as plt
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
+from scipy.stats import pearsonr
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# torchcfm
-TORCHCFM_PATH = PROJECT_ROOT / "Data" / "conditional-flow-matching"
-sys.path.insert(0, str(TORCHCFM_PATH))
-
 from src.data.dataset import load_config, resolve_paths
-from src.data.brainflow_dataset import BrainFlowDataset, build_brainflow_dataloaders
 from src.models.brainflow.brain_flow import BrainFlowCFM
-from src.models.brainflow.fmri_vae import build_vae
-from torchcfm.conditional_flow_matching import (
-    ConditionalFlowMatcher,
-    ExactOptimalTransportConditionalFlowMatcher,
-    TargetConditionalFlowMatcher,
-    VariancePreservingConditionalFlowMatcher,
-)
+from src.data.precompute_latents import load_vae
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s %(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("brain_flow")
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+logger = logging.getLogger("train_cfm")
 
 
-# =============================================================================
-# Helpers
-# =============================================================================
+class BrainFlowDataset(Dataset):
+    """
+    Loads pre-computed PCA features and VAE latents.
+    Yields sliding windows of (features, latents).
+    """
+    def __init__(self, cfg, split="train"):
+        self.cfg = cfg
+        self.split = split
+        self.subjects = cfg["subjects"]
+        self.splits_cfg = cfg.get("splits", {})
+        
+        self.latent_dir = Path(PROJECT_ROOT) / cfg["latent_dir"]
+        self.pca_dir = Path(PROJECT_ROOT) / cfg["pca_features"]["output_dir"]
+        
+        # Sliding window params
+        self.tr = cfg["fmri"]["tr"]
+        self.context_dur = cfg["sliding_window"]["context_duration"]
+        self.stride_dur = cfg["sliding_window"]["stride"]
+        self.seq_len = max(1, int(round(self.context_dur / self.tr)))
+        self.stride = max(1, int(round(self.stride_dur / self.tr)))
+        
+        self.val_ratio = cfg.get("val_ratio", 0.1)
+        self.samples = self._build_index()
 
-@torch.no_grad()
-def ema_update(model: nn.Module, ema_model: nn.Module, decay: float = 0.999):
-    for p, ep in zip(model.parameters(), ema_model.parameters()):
-        ep.data.mul_(decay).add_(p.data, alpha=1 - decay)
+    def _build_index(self):
+        samples = []
+        logger.info("Building %s split index...", self.split)
+        
+        for task, splits in self.splits_cfg.items():
+            for split_name, stim_types in splits.items():
+                for stim_type in stim_types:
+                    pca_stim_dir = self.pca_dir / task / stim_type
+                    if not pca_stim_dir.exists():
+                        continue
+                        
+                    clip_names = sorted([p.stem for p in pca_stim_dir.glob("*.npy")])
+                    
+                    # Deterministic val split based on clip names
+                    rng = random.Random(42)
+                    shuffled_clips = clip_names.copy()
+                    rng.shuffle(shuffled_clips)
+                    
+                    n_val = int(len(shuffled_clips) * self.val_ratio)
+                    val_clips = set(shuffled_clips[:n_val])
+                    
+                    for clip_name in clip_names:
+                        is_val = clip_name in val_clips
+                        if (self.split == "train" and is_val) or (self.split == "val" and not is_val):
+                            continue
+                            
+                        # Load shapes to determine sliding windows
+                        try:
+                            # Use subject 0's latent shape as reference
+                            subj = self.subjects[0]
+                            lat_path = self.latent_dir / subj / task / stim_type / f"{clip_name}.npy"
+                            feat_path = pca_stim_dir / f"{clip_name}.npy"
+                            
+                            if not lat_path.exists() or not feat_path.exists():
+                                continue
+                                
+                            # We just need the temporal length. We assume feat and latent have same length.
+                            # In precompute scripts, features and latents should be aligned to the same TRs.
+                            # We lazy-load using np.load(mmap_mode="r") to check shape quickly.
+                            lat_shape = np.load(lat_path, mmap_mode="r").shape
+                            n_trs = lat_shape[0]
+                            
+                            if n_trs < self.seq_len:
+                                continue
+                                
+                            for start_idx in range(0, n_trs - self.seq_len + 1, self.stride):
+                                samples.append({
+                                    "task": task,
+                                    "stim_type": stim_type,
+                                    "clip_name": clip_name,
+                                    "start_idx": start_idx,
+                                })
+                        except Exception as e:
+                            logger.warning(f"Error reading shape for {clip_name}: {e}")
+                            
+        logger.info("Found %d windows for %s split.", len(samples), self.split)
+        return samples
 
+    def __len__(self):
+        return len(self.samples)
 
-def build_cfm(method: str, sigma: float):
-    if method == "otcfm":
-        return ExactOptimalTransportConditionalFlowMatcher(sigma=sigma)
-    elif method == "icfm":
-        return ConditionalFlowMatcher(sigma=sigma)
-    elif method == "fm":
-        return TargetConditionalFlowMatcher(sigma=sigma)
-    elif method == "si":
-        return VariancePreservingConditionalFlowMatcher(sigma=sigma)
-    else:
-        raise ValueError(f"Unknown CFM method: {method}")
-
-
-def load_vae_decoder(cfg: dict, device: torch.device):
-    """Load pretrained VAE and return it in eval mode (frozen)."""
-    vae_ckpt_path = cfg.get("vae_checkpoint")
-    if not vae_ckpt_path:
-        logger.warning("No vae_checkpoint specified, VAE decoder not loaded")
-        return None
-
-    vae_ckpt_path = Path(PROJECT_ROOT) / vae_ckpt_path
-    if not vae_ckpt_path.exists():
-        raise FileNotFoundError(f"VAE checkpoint not found: {vae_ckpt_path}")
-
-    # Load VAE config from checkpoint
-    ckpt = torch.load(vae_ckpt_path, map_location=device)
-    vae_cfg = ckpt.get("config", cfg)
-
-    # Build VAE model
-    vae = build_vae(vae_cfg).to(device)
-
-    # Load weights (prefer ema_model if available)
-    if "ema_model" in ckpt:
-        vae.load_state_dict(ckpt["ema_model"])
-        logger.info("Loaded VAE EMA weights from %s", vae_ckpt_path)
-    elif "model" in ckpt:
-        vae.load_state_dict(ckpt["model"])
-        logger.info("Loaded VAE model weights from %s", vae_ckpt_path)
-
-    # Freeze
-    vae.eval()
-    for p in vae.parameters():
-        p.requires_grad = False
-
-    return vae
-
-
-# =============================================================================
-# Training step
-# =============================================================================
-
-def train_one_epoch(
-    model: BrainFlowCFM,
-    dataloader,
-    optimizer,
-    scheduler,
-    sigma: float,
-    device,
-    scaler,
-    use_amp: bool,
-    grad_clip: float,
-    log_every: int,
-    epoch: int,
-):
-    model.train()
-    total_loss = 0.0
-    n_batches = 0
-    t_start = time.time()
-
-    for batch_idx, batch in enumerate(dataloader):
-        pca_features = batch["pca_features"].to(device, non_blocking=True)  # (B, T, D)
-        latent = batch["latent"].to(device, non_blocking=True)  # (B, T, Z)
-        subject_id = batch["subject_id"].to(device, non_blocking=True)  # (B,)
-
-        B, T, Z = latent.shape
-
-        # Sample 1 flow time per sequence (consistent across all TRs)
-        t_flow = torch.rand(B, device=device)  # (B,)
-        t_expand = t_flow.view(B, 1, 1)  # (B, 1, 1) for broadcasting
-
-        # Compute interpolant directly (ICFM: xt = (1-(1-σ)t)·x0 + t·x1)
-        x0 = torch.randn_like(latent)  # (B, T, Z)
-        x1 = latent.float()
-        xt = (1 - (1 - sigma) * t_expand) * x0 + t_expand * x1  # (B, T, Z)
-        ut = x1 - (1 - sigma) * x0  # (B, T, Z) — target velocity
-
-        optimizer.zero_grad(set_to_none=True)
-
-        with autocast(enabled=use_amp):
-            vt = model(pca_features, t_flow, xt, subject_id)  # (B, T, Z)
-            loss = nn.functional.mse_loss(vt, ut)
-
-        if use_amp:
-            scaler.scale(loss).backward()
-            if grad_clip > 0:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            if grad_clip > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-
-        if scheduler is not None:
-            scheduler.step()
-
-        total_loss += loss.item()
-        n_batches += 1
-
-        if log_every > 0 and (batch_idx + 1) % log_every == 0:
-            avg = total_loss / n_batches
-            lr = optimizer.param_groups[0]["lr"]
-            elapsed = time.time() - t_start
-            speed = n_batches / elapsed
-            logger.info(
-                "  Epoch %d | Batch %d/%d | Loss %.6f | LR %.2e | %.1f batch/s",
-                epoch, batch_idx + 1, len(dataloader), avg, lr, speed,
-            )
-
-    return total_loss / max(n_batches, 1)
+    def __getitem__(self, idx):
+        sample_info = self.samples[idx]
+        task = sample_info["task"]
+        stim_type = sample_info["stim_type"]
+        clip_name = sample_info["clip_name"]
+        start = sample_info["start_idx"]
+        end = start + self.seq_len
+        
+        # Load features (shared across subjects)
+        feat_path = self.pca_dir / task / stim_type / f"{clip_name}.npy"
+        feat_data = np.load(feat_path, mmap_mode="r")[start:end].astype(np.float32)
+        
+        # Load latent (for now, single subject mode uses subjects[0])
+        # TODO: Add support for multi-subject batching
+        subj = self.subjects[0]
+        lat_path = self.latent_dir / subj / task / stim_type / f"{clip_name}.npy"
+        lat_data = np.load(lat_path, mmap_mode="r")[start:end].astype(np.float32)
+        
+        return {
+            "features": torch.from_numpy(feat_data.copy()),
+            "latent": torch.from_numpy(lat_data.copy()),
+        }
 
 
-# =============================================================================
-# Validation
-# =============================================================================
-
-@torch.no_grad()
-def validate(
-    model: BrainFlowCFM,
-    dataloader,
-    sigma: float,
-    device,
-    use_amp: bool,
-    vae_decoder=None,
-    n_sample_steps: int = 20,
-    sample_method: str = "euler",
-):
-    """Validate: CFM loss + Pearson in latent space + optionally in voxel space."""
-    model.eval()
-    total_loss = 0.0
-    n_batches = 0
-
-    all_pred_latents = []
-    all_true_latents = []
-    all_pred_fmri = []
-    all_true_fmri = []
-
-    for batch in dataloader:
-        pca_features = batch["pca_features"].to(device, non_blocking=True)
-        latent = batch["latent"].to(device, non_blocking=True)
-        fmri = batch["fmri"].to(device, non_blocking=True)
-        subject_id = batch["subject_id"].to(device, non_blocking=True)
-
-        B, T, Z = latent.shape
-
-        # CFM loss — consistent t per sequence
-        t_flow = torch.rand(B, device=device)
-        t_expand = t_flow.view(B, 1, 1)
-        x0 = torch.randn_like(latent)
-        x1 = latent.float()
-        xt = (1 - (1 - sigma) * t_expand) * x0 + t_expand * x1
-        ut = x1 - (1 - sigma) * x0
-
-        with autocast(enabled=use_amp):
-            vt = model(pca_features, t_flow, xt, subject_id)
-            loss = nn.functional.mse_loss(vt, ut)
-
-        total_loss += loss.item()
-        n_batches += 1
-
-        # Generate samples for Pearson (every 5th batch)
-        if n_batches % 5 == 1:
-            z_pred = model.sample(
-                pca_features, subject_id,
-                n_steps=n_sample_steps, method=sample_method,
-            )  # (B, T, Z)
-
-            all_pred_latents.append(z_pred.cpu().numpy().reshape(-1, Z))
-            all_true_latents.append(latent.cpu().numpy().reshape(-1, Z))
-
-            # Decode to fMRI if VAE decoder available
-            if vae_decoder is not None:
-                # VAE decoder expects (B, T, Z) and subject_id (B,)
-                # Handle case where VAE has no subject conditioning
-                fmri_pred = vae_decoder.decode(z_pred, subject_id)  # (B, T, V)
-                all_pred_fmri.append(fmri_pred.cpu().numpy().reshape(-1, fmri.shape[-1]))
-                all_true_fmri.append(fmri.cpu().numpy().reshape(-1, fmri.shape[-1]))
-
-    avg_loss = total_loss / max(n_batches, 1)
-
-    # Latent-space Pearson
-    latent_pearson = 0.0
-    if all_pred_latents:
-        preds = np.concatenate(all_pred_latents, axis=0)
-        trues = np.concatenate(all_true_latents, axis=0)
-        n_dims = trues.shape[1]
-        cors = []
-        for d in range(min(n_dims, 50)):  # Sample 50 dims for speed
-            r, _ = pearsonr(trues[:, d], preds[:, d])
-            if np.isfinite(r):
-                cors.append(r)
-        latent_pearson = np.mean(cors) if cors else 0.0
-
-    # Voxel-space Pearson
-    voxel_pearson = 0.0
-    if all_pred_fmri:
-        preds = np.concatenate(all_pred_fmri, axis=0)
-        trues = np.concatenate(all_true_fmri, axis=0)
-        n_voxels = trues.shape[1]
-        cors = []
-        for v in range(n_voxels):
-            r, _ = pearsonr(trues[:, v], preds[:, v])
-            if np.isfinite(r):
-                cors.append(r)
-        voxel_pearson = np.mean(cors) if cors else 0.0
-
-    return avg_loss, latent_pearson, voxel_pearson
+def get_dataloaders(cfg):
+    train_set = BrainFlowDataset(cfg, split="train")
+    val_set = BrainFlowDataset(cfg, split="val")
+    
+    dl_cfg = cfg["dataloader"]
+    
+    train_loader = DataLoader(
+        train_set,
+        batch_size=dl_cfg["batch_size"],
+        shuffle=True,
+        num_workers=dl_cfg["num_workers"],
+        pin_memory=dl_cfg["pin_memory"],
+        drop_last=True
+    )
+    
+    val_loader = DataLoader(
+        val_set,
+        batch_size=dl_cfg["val_batch_size"],
+        shuffle=False,
+        num_workers=dl_cfg["num_workers"],
+        pin_memory=dl_cfg["pin_memory"],
+        drop_last=False
+    )
+    
+    return train_loader, val_loader
 
 
-# =============================================================================
-# Main
-# =============================================================================
+def pearson_corr(pred, target):
+    """Compute Pearson correlation across time for each feature/voxel, then mean over features."""
+    # pred/target: (B, T, D) -> flatten batch and time (Total_T, D)
+    pred = pred.reshape(-1, pred.shape[-1])
+    target = target.reshape(-1, target.shape[-1])
+    
+    # Mean across time for each voxel
+    pred_mean = pred.mean(dim=0, keepdim=True)
+    target_mean = target.mean(dim=0, keepdim=True)
+    
+    pred_cnt = pred - pred_mean
+    target_cnt = target - target_mean
+    
+    # Covariance and Variance
+    cov = (pred_cnt * target_cnt).sum(dim=0)
+    std = torch.sqrt((pred_cnt**2).sum(dim=0) * (target_cnt**2).sum(dim=0))
+    
+    corr = cov / (std + 1e-8)
+    return corr.mean().item()
 
-def main():
-    parser = argparse.ArgumentParser(description="BrainFlow training")
-    parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--fast_dev_run", action="store_true")
-    parser.add_argument("--resume", type=str, default=None)
-    args = parser.parse_args()
 
+def train(args):
     cfg = load_config(args.config)
     cfg = resolve_paths(cfg, PROJECT_ROOT)
-    train_cfg = cfg["training"]
-    model_cfg = cfg["model"]
-
-    output_dir = Path(PROJECT_ROOT) / cfg["output_dir"]
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    import yaml
-    with open(output_dir / "config.yaml", "w") as f:
-        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
-
+    
+    torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Device: %s", device)
-
-    # ── Load VAE for latent extraction + decoding ──
-    logger.info("Loading pretrained VAE...")
-    vae = load_vae_decoder(cfg, device)
-
-    # ── Build dataloaders ──
-    logger.info("Building dataloaders...")
-    bf_cfg = cfg.get("brainflow", {})
-    num_trial = bf_cfg.get("num_trial", 1)
-
-    loaders = build_brainflow_dataloaders(
-        cfg, vae_model=vae, num_trial=num_trial,
-    )
-    train_loader = loaders.get("train")
-    val_loader = loaders.get("val")
-
-    if train_loader is None:
-        raise RuntimeError("No training data found!")
-
-    logger.info("Train: %d samples, Val: %d samples",
-                len(train_loader.dataset),
-                len(val_loader.dataset) if val_loader else 0)
-
-    # ── Build model ──
-    logger.info("Building BrainFlow model...")
-    model = BrainFlowCFM(**model_cfg).to(device)
-    ema_model = copy.deepcopy(model)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info("Model: %s", model)
-    logger.info("Total params: %.2fM | Trainable: %.2fM",
-                total_params / 1e6, trainable_params / 1e6)
-
-    # ── Build CFM ──
-    fm = build_cfm(train_cfg["cfm_method"], train_cfg["cfm_sigma"])
-    logger.info("CFM method: %s (sigma=%.4f)", train_cfg["cfm_method"], train_cfg["cfm_sigma"])
-
-    # ── Optimizer ──
+    
+    # 1. Init Data
+    train_loader, val_loader = get_dataloaders(cfg)
+    
+    if args.fast_dev_run:
+        logger.info("Fast dev run mode")
+        cfg["training"]["n_epochs"] = 1
+        cfg["training"]["val_every_n_epochs"] = 1
+    
+    # 2. Init Model
+    logger.info("Initializing BrainFlowCFM...")
+    bf_cfg = cfg["brainflow"]
+    model = BrainFlowCFM(
+        feat_dim=bf_cfg["feat_dim"],
+        latent_dim=bf_cfg["latent_dim"],
+        encoder_params=bf_cfg["encoder"],
+        decoder_params=bf_cfg["decoder"],
+        cfm_params=bf_cfg["cfm"],
+    ).to(device)
+    
+    # 3. Load frozen VAE for validation (optional but good for tracking fMRI Pearson)
+    vae = None
+    try:
+        vae = load_vae(cfg, device)
+        logger.info("Loaded VAE for computing fMRI-level Pearson correlation.")
+    except Exception as e:
+        logger.warning(f"Failed to load VAE: {e}. Will only compute Latent Pearson.")
+    
+    # 4. Optimizer & Scheduler
+    tr_cfg = cfg["training"]
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=train_cfg["lr"],
-        weight_decay=train_cfg["weight_decay"],
+        lr=tr_cfg["lr"],
+        weight_decay=tr_cfg["weight_decay"]
     )
-
-    n_epochs = train_cfg["n_epochs"]
-    steps_per_epoch = len(train_loader)
-    total_steps = n_epochs * steps_per_epoch
-
+    
+    total_steps = len(train_loader) * tr_cfg["n_epochs"]
+    if args.fast_dev_run:
+        total_steps = 2
+        
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=train_cfg["lr"],
+        max_lr=tr_cfg["lr"],
         total_steps=total_steps,
-        pct_start=train_cfg["warmup_ratio"],
-        anneal_strategy="cos",
+        pct_start=tr_cfg["warmup_ratio"],
     )
+    
+    scaler = torch.amp.GradScaler("cuda", enabled=tr_cfg["use_amp"])
+    
+    # 5. Output dir & WandB
+    out_dir = Path(PROJECT_ROOT) / cfg.get("output_dir", "outputs/brain_flow_cfm")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
 
-    use_amp = train_cfg.get("use_amp", True) and device.type == "cuda"
-    scaler = GradScaler(enabled=use_amp)
+        
+    # 6. Training Loop
+    best_val_corr = -1.0
+    global_step = 0
+    mean_corr = 0.0
+    mean_fmri_corr = 0.0
+    
+    history_file = out_dir / "history.csv"
+    with open(history_file, "w") as f:
+        f.write("epoch,train_loss,val_latent_pearson,val_fmri_pcc,lr\n")
+    
+    for epoch in range(1, tr_cfg["n_epochs"] + 1):
+        model.train()
+        train_losses = []
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{tr_cfg['n_epochs']}")
+        for batch_idx, batch in enumerate(pbar):
+            if args.fast_dev_run and batch_idx >= 2:
+                break
+                
+            features = batch["features"].to(device)
+            latents = batch["latent"].to(device)
+            
+            with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"]):
+                loss = model(features, latents)
+                
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), tr_cfg["grad_clip"])
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            
+            train_losses.append(loss.item())
+            global_step += 1
+            
+            if global_step % tr_cfg["log_every_n_steps"] == 0:
+                pbar.set_postfix({"loss": f"{np.mean(train_losses[-50:]):.4f}", "lr": f"{scheduler.get_last_lr()[0]:.2e}"})
+                pass
+        # Validation
+        if epoch % tr_cfg["val_every_n_epochs"] == 0 or args.fast_dev_run:
+            model.eval()
+            val_lat_corr = []
+            val_fmri_corr = []
+            
+            logger.info("Running validation...")
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(tqdm(val_loader, desc="Val")):
+                    if args.fast_dev_run and batch_idx >= 2:
+                        break
+                        
+                    features = batch["features"].to(device)
+                    latents = batch["latent"].to(device)
+                    
+                    # Generate latents using ODE solver
+                    # T=10 is standard for Euler ODE in Matcha-TTS
+                    gen_latents = model.synthesise(features, n_timesteps=10, temperature=1.0)
+                    
+                    batch_corr = pearson_corr(gen_latents, latents)
+                    val_lat_corr.append(batch_corr)
+                    
+                    if vae is not None:
+                        dummy_subj = torch.zeros(features.shape[0], dtype=torch.long, device=device)
+                        gen_fmri = vae.decode(gen_latents, dummy_subj)
+                        true_fmri = vae.decode(latents, dummy_subj)
+                        val_fmri_corr.append(pearson_corr(gen_fmri, true_fmri))
+                        
+            mean_corr = float(np.mean(val_lat_corr))
+            mean_fmri_corr = float(np.mean(val_fmri_corr)) if val_fmri_corr else 0.0
+            logger.info(f"Epoch {epoch} | Val Latent Pearson Corr: {mean_corr:.4f} | Val fMRI Pearson Corr: {mean_fmri_corr:.4f}")
+            
+            # Save best
+            if mean_corr > best_val_corr:
+                best_val_corr = mean_corr
+                torch.save(model.state_dict(), out_dir / "best.pt")
+                logger.info(f"Saved new best model to {out_dir / 'best.pt'}")
+                
+            # Save history
+            mean_train_loss = float(np.mean(train_losses))
+            current_lr = scheduler.get_last_lr()[0]
+            with open(history_file, "a") as f:
+                f.write(f"{epoch},{mean_train_loss:.6f},{mean_corr:.6f},{mean_fmri_corr:.6f},{current_lr:.2e}\n")
 
-    # ── Resume ──
-    start_epoch = 0
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        ema_model.load_state_dict(ckpt["ema_model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-        start_epoch = ckpt["epoch"] + 1
-        logger.info("Resumed from epoch %d", start_epoch)
-
-    # ── History ──
-    history_path = output_dir / "history.csv"
-    history_fields = [
-        "epoch", "train_loss", "val_loss",
-        "val_latent_pearson", "val_voxel_pearson",
-        "lr", "time_s",
-    ]
-    if not history_path.exists() or start_epoch == 0:
-        with open(history_path, "w", newline="") as f:
-            csv.DictWriter(f, history_fields).writeheader()
-
-    # ── Fast dev run ──
-    if args.fast_dev_run:
-        n_epochs = 1
-        train_cfg["log_every_n_steps"] = 1
-        logger.info("=== FAST DEV RUN (2 batches) ===")
-
-    # ── Training loop ──
-    logger.info("=" * 60)
-    logger.info("Starting BrainFlow training: %d epochs", n_epochs)
-    logger.info("=" * 60)
-
-    best_val_pearson = -1.0
-
-    for epoch in range(start_epoch, n_epochs):
-        t_epoch = time.time()
-
-        # Train
-        if args.fast_dev_run:
-            mini_loader = _limit_batches(train_loader, 2)
-            train_loss = train_one_epoch(
-                model, mini_loader, optimizer, scheduler,
-                train_cfg["cfm_sigma"], device, scaler,
-                use_amp, train_cfg["grad_clip"], 1, epoch + 1,
-            )
-        else:
-            train_loss = train_one_epoch(
-                model, train_loader, optimizer, scheduler,
-                train_cfg["cfm_sigma"], device, scaler,
-                use_amp, train_cfg["grad_clip"], train_cfg["log_every_n_steps"], epoch + 1,
-            )
-
-        ema_update(model, ema_model, train_cfg["ema_decay"])
-
-        # Validate
-        did_val = False
-        val_loss, val_latent_pearson, val_voxel_pearson = 0.0, 0.0, 0.0
-        if val_loader and (epoch + 1) % train_cfg["val_every_n_epochs"] == 0:
-            did_val = True
-            if args.fast_dev_run:
-                mini_val = _limit_batches(val_loader, 2)
-                val_loss, val_latent_pearson, val_voxel_pearson = validate(
-                    ema_model, mini_val, train_cfg["cfm_sigma"], device, use_amp,
-                    vae_decoder=vae,
-                    n_sample_steps=train_cfg["n_sample_steps"],
-                    sample_method=train_cfg["sample_method"],
-                )
-            else:
-                val_loss, val_latent_pearson, val_voxel_pearson = validate(
-                    ema_model, val_loader, train_cfg["cfm_sigma"], device, use_amp,
-                    vae_decoder=vae,
-                    n_sample_steps=train_cfg["n_sample_steps"],
-                    sample_method=train_cfg["sample_method"],
-                )
-
-        elapsed = time.time() - t_epoch
-        lr = optimizer.param_groups[0]["lr"]
-
-        if did_val:
-            logger.info(
-                "Epoch %d/%d | Train Loss: %.6f | Val Loss: %.6f | "
-                "Latent Pearson: %.4f | Voxel Pearson: %.4f | LR: %.2e | Time: %.1fs",
-                epoch + 1, n_epochs, train_loss, val_loss,
-                val_latent_pearson, val_voxel_pearson, lr, elapsed,
-            )
-        else:
-            logger.info(
-                "Epoch %d/%d | Train Loss: %.6f | LR: %.2e | Time: %.1fs",
-                epoch + 1, n_epochs, train_loss, lr, elapsed,
-            )
-
-        # History — only log when validation is performed
-        if did_val:
-            with open(history_path, "a", newline="") as f:
-                writer = csv.DictWriter(f, history_fields)
-                writer.writerow({
-                    "epoch": epoch + 1,
-                    "train_loss": f"{train_loss:.6f}",
-                    "val_loss": f"{val_loss:.6f}",
-                    "val_latent_pearson": f"{val_latent_pearson:.6f}",
-                    "val_voxel_pearson": f"{val_voxel_pearson:.6f}",
-                    "lr": f"{lr:.2e}",
-                    "time_s": f"{elapsed:.1f}",
-                })
-
-        # Checkpoint
-        if not args.fast_dev_run:
-            ckpt = {
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "ema_model": ema_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "val_latent_pearson": val_latent_pearson,
-                "val_voxel_pearson": val_voxel_pearson,
-            }
-            torch.save(ckpt, output_dir / "last.pt")
-
-            # Track best by voxel Pearson (directly measures fMRI prediction quality)
-            if did_val and val_voxel_pearson > best_val_pearson:
-                best_val_pearson = val_voxel_pearson
-                torch.save(ckpt, output_dir / "best.pt")
-                logger.info("  → New best voxel Pearson: %.4f", val_voxel_pearson)
-
-
-    logger.info("=" * 60)
-    logger.info("Training complete! Best Latent Pearson: %.4f", best_val_pearson)
-    logger.info("Outputs saved to: %s", output_dir)
-
-
-def _limit_batches(loader, n):
-    class _Limited:
-        def __init__(self, loader, n):
-            self.loader = loader
-            self.n = n
-        def __iter__(self):
-            for i, batch in enumerate(self.loader):
-                if i >= self.n:
-                    break
-                yield batch
-        def __len__(self):
-            return min(self.n, len(self.loader))
-    return _Limited(loader, n)
-
+        torch.save({
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+        }, out_dir / "last.pt")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True, help="Path to brain_flow.yaml")
+    parser.add_argument("--fast_dev_run", action="store_true", help="Run 2 batches to test pipeline")
+    args = parser.parse_args()
+    train(args)
