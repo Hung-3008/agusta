@@ -3,18 +3,19 @@
 Generates fMRI VAE latent vectors (B, T, Z) from noise, conditioned on
 PCA-reduced stimulus features and subject embeddings.
 
-Key design choices (Matcha-TTS inspired):
+Key design choices (Matcha-TTS + TRIBE inspired):
   - Operates in VAE latent space (Z=256) instead of voxel space (V=1000)
   - Channel concatenation: [z_t; cond] instead of additive conditioning
   - DiT-style adaLN: time+subject injected into EVERY transformer layer
+  - TRIBE SubjectLayers: per-subject linear transforms for conditioning & output
   - Zero-initialized output for identity flow at init
 
 Architecture:
-    PCA cond (B,T,D) → ConditioningMLP → cond (B,T,P)
+    PCA cond (B,T,D) → ConditioningMLP → SubjectLayer → cond (B,T,P)
     [z_t (B,T,Z); cond (B,T,P)] → input_proj → (B,T,H)
     t (B,) + subject → MLP → per-layer (shift, scale, gate)
     → N × AdaLNTransformerBlock (self-attn + FFN + adaLN)
-    → final_norm (adaLN) → output_proj (zero-init) → v_θ (B,T,Z)
+    → final_norm (adaLN) → SubjectLayer output → v_θ (B,T,Z)
 """
 
 import math
@@ -68,8 +69,80 @@ class ConditioningMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """(B, T, D_cond) → (B, T, P)"""
+        """(B, T, D_cond) → (B, T, P)."""
         return self.net(x)
+
+
+# =============================================================================
+# TRIBE-style Subject Layers (per-subject linear transform)
+# =============================================================================
+
+class SubjectLayers(nn.Module):
+    """Per-subject linear transform (TRIBE-style).
+
+    Each subject gets its own weight matrix W_s: (in_dim, out_dim).
+    For a given subject s, computes: y = x @ W_s + b_s.
+
+    This is much more expressive than a shared embedding + adaLN because
+    it allows full channel mixing per subject (a 2D matrix vs a 1D vector).
+
+    Adapted from TRIBE (Meta) to work with BrainFlow's (B, T, C) tensors
+    instead of the original (B, C, T) format.
+
+    Parameters
+    ----------
+    in_dim : int
+    out_dim : int
+    n_subjects : int
+    bias : bool
+    init_id : bool
+        If True, initialize weights as identity (requires in_dim == out_dim).
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        n_subjects: int,
+        bias: bool = True,
+        init_id: bool = True,
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.n_subjects = n_subjects
+
+        # (N, in_dim, out_dim) — one linear transform per subject
+        self.weights = nn.Parameter(torch.empty(n_subjects, in_dim, out_dim))
+        self.bias = nn.Parameter(torch.zeros(n_subjects, out_dim)) if bias else None
+
+        if init_id:
+            assert in_dim == out_dim, "init_id requires in_dim == out_dim"
+            # Identity init: each subject starts as pass-through
+            self.weights.data[:] = torch.eye(in_dim)[None]
+        else:
+            nn.init.xavier_uniform_(self.weights.data.view(-1, in_dim, out_dim))
+
+    def forward(
+        self,
+        x: torch.Tensor,           # (B, T, C_in)
+        subject_id: torch.Tensor,   # (B,)
+    ) -> torch.Tensor:
+        """Apply per-subject linear transform.
+
+        Returns (B, T, C_out)
+        """
+        # Select weights for each sample in batch
+        W = self.weights[subject_id]        # (B, C_in, C_out)
+        # Batched matmul: (B, T, C_in) @ (B, C_in, C_out) → (B, T, C_out)
+        out = torch.bmm(x, W)
+        if self.bias is not None:
+            out = out + self.bias[subject_id].unsqueeze(1)  # (B, 1, C_out)
+        return out
+
+    def __repr__(self) -> str:
+        return (f"SubjectLayers({self.in_dim}, {self.out_dim}, "
+                f"n_subjects={self.n_subjects})")
 
 
 # =============================================================================
@@ -249,6 +322,7 @@ class VelocityTransformer(nn.Module):
         nn.init.zeros_(self.final_adaLN[1].weight)
         nn.init.zeros_(self.final_adaLN[1].bias)
 
+        # Shared output projection (before subject-specific layer)
         self.output_proj = nn.Linear(hidden_dim, latent_dim)
 
         # Zero-init output layer: velocity ≈ 0 at initialization (identity flow)
@@ -281,7 +355,7 @@ class VelocityTransformer(nn.Module):
         for block in self.blocks:
             h = block(h, c_global)  # (B, T, H)
 
-        # Final adaLN + output projection
+        # Final adaLN + shared output projection
         final_mod = self.final_adaLN(c_global)  # (B, 2*H)
         shift, scale = final_mod.chunk(2, dim=-1)
         h = self.final_norm(h)
@@ -345,8 +419,20 @@ class BrainFlowCFM(nn.Module):
         # Conditioning: PCA features → projected dim for concat
         self.cond_mlp = ConditioningMLP(cond_dim, cond_proj_dim, dropout=dropout)
 
+        # TRIBE-style: per-subject transform on conditioning (identity-init)
+        self.cond_subject_layer = SubjectLayers(
+            in_dim=cond_proj_dim, out_dim=cond_proj_dim,
+            n_subjects=n_subjects, init_id=True,
+        )
+
         # Subject embedding → added to time embedding for global conditioning
         self.subject_embed = nn.Embedding(n_subjects, hidden_dim)
+
+        # TRIBE-style: per-subject output projection (identity-init)
+        self.output_subject_layer = SubjectLayers(
+            in_dim=latent_dim, out_dim=latent_dim,
+            n_subjects=n_subjects, init_id=True,
+        )
 
         # Velocity network (DiT-style)
         self.velocity_net = VelocityTransformer(
@@ -390,11 +476,20 @@ class BrainFlowCFM(nn.Module):
         # Project PCA features to concat dim
         cond = self.cond_mlp(pca_features)  # (B, T, P)
 
+        # TRIBE: subject-specific conditioning transform
+        if subject_id is not None:
+            cond = self.cond_subject_layer(cond, subject_id)  # (B, T, P)
+
         # Build global conditioning (time + subject) for adaLN
         c_global = self._build_global_cond(t, subject_id)  # (B, H)
 
         # Predict velocity
         v = self.velocity_net(z_t, t, cond, c_global)  # (B, T, Z)
+
+        # TRIBE: subject-specific output transform
+        if subject_id is not None:
+            v = self.output_subject_layer(v, subject_id)  # (B, T, Z)
+
         return v
 
     @torch.no_grad()
@@ -424,6 +519,10 @@ class BrainFlowCFM(nn.Module):
         # Encode conditioning once (reused across ODE steps)
         cond = self.cond_mlp(pca_features)  # (B, T, P)
 
+        # TRIBE: subject-specific conditioning transform
+        if subject_id is not None:
+            cond = self.cond_subject_layer(cond, subject_id)  # (B, T, P)
+
         # Start from Gaussian noise
         z = torch.randn(B, T, self.latent_dim, device=device)
 
@@ -437,13 +536,20 @@ class BrainFlowCFM(nn.Module):
 
             if method == "euler":
                 v = self.velocity_net(z, t, cond, c_global)
+                # TRIBE: subject-specific output transform
+                if subject_id is not None:
+                    v = self.output_subject_layer(v, subject_id)
                 z = z + v * dt
             elif method == "midpoint":
                 v1 = self.velocity_net(z, t, cond, c_global)
+                if subject_id is not None:
+                    v1 = self.output_subject_layer(v1, subject_id)
                 z_mid = z + v1 * (dt / 2)
                 t_mid = torch.full((B,), t_val + dt / 2, device=device)
                 c_mid = self._build_global_cond(t_mid, subject_id)
                 v2 = self.velocity_net(z_mid, t_mid, cond, c_mid)
+                if subject_id is not None:
+                    v2 = self.output_subject_layer(v2, subject_id)
                 z = z + v2 * dt
             else:
                 raise ValueError(f"Unknown method: {method}")

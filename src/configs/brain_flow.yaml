@@ -73,8 +73,8 @@ preprocessing:
 
 # --- DataLoader ---
 dataloader:
-  batch_size: 32
-  val_batch_size: 32
+  batch_size: 512
+  val_batch_size: 512
   num_workers: 0         # Must be 0: dataset does GPU VAE encoding in __getitem__
   pin_memory: true
 
@@ -107,12 +107,12 @@ vae_checkpoint: outputs/fmri_vae_256/best.pt
 # Training config
 # =====================================================================
 training:
-  n_epochs: 200
+  n_epochs: 300
   lr: 3.0e-4
   weight_decay: 0.01
   warmup_ratio: 0.05
   grad_clip: 1.0
-  ema_decay: 0.999
+  ema_decay: 0.99
   cfm_sigma: 0.01
   cfm_method: icfm
 
