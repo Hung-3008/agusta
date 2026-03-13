@@ -407,7 +407,7 @@ class BrainFlowCFM(nn.Module):
         hidden_dim: int = 512,
         n_heads: int = 8,
         n_layers: int = 6,
-        n_subjects: int = 4,
+        n_subjects: int = 1,   # kept for API compat, no longer used
         dropout: float = 0.1,
         time_embed_dim: int = 256,
         cond_proj_dim: int = 256,
@@ -418,21 +418,6 @@ class BrainFlowCFM(nn.Module):
 
         # Conditioning: PCA features → projected dim for concat
         self.cond_mlp = ConditioningMLP(cond_dim, cond_proj_dim, dropout=dropout)
-
-        # TRIBE-style: per-subject transform on conditioning (identity-init)
-        self.cond_subject_layer = SubjectLayers(
-            in_dim=cond_proj_dim, out_dim=cond_proj_dim,
-            n_subjects=n_subjects, init_id=True,
-        )
-
-        # Subject embedding → added to time embedding for global conditioning
-        self.subject_embed = nn.Embedding(n_subjects, hidden_dim)
-
-        # TRIBE-style: per-subject output projection (identity-init)
-        self.output_subject_layer = SubjectLayers(
-            in_dim=latent_dim, out_dim=latent_dim,
-            n_subjects=n_subjects, init_id=True,
-        )
 
         # Velocity network (DiT-style)
         self.velocity_net = VelocityTransformer(
@@ -445,115 +430,56 @@ class BrainFlowCFM(nn.Module):
             time_embed_dim=time_embed_dim,
         )
 
-    def _build_global_cond(
-        self,
-        t: torch.Tensor,
-        subject_id: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """Build global conditioning vector from time + subject.
+    def _build_global_cond(self, t: torch.Tensor) -> torch.Tensor:
+        """Build global conditioning vector from time embedding only.
 
         Returns (B, H) vector used by adaLN in every transformer layer.
         """
-        c = self.velocity_net.time_embed(t)  # (B, H)
-        if subject_id is not None:
-            c = c + self.subject_embed(subject_id)  # (B, H)
-        return c
+        return self.velocity_net.time_embed(t)  # (B, H)
 
     def forward(
         self,
         pca_features: torch.Tensor,  # (B, T, D_cond)
         t: torch.Tensor,             # (B,)
         z_t: torch.Tensor,           # (B, T, Z)
-        subject_id: Optional[torch.Tensor] = None,  # (B,)
+        subject_id: Optional[torch.Tensor] = None,  # kept for API compat, unused
     ) -> torch.Tensor:
-        """Predict velocity v_θ(z_t, t | pca_features).
-
-        Used during training with CFM:
-            t, z_t, u_t = FM.sample_location_and_conditional_flow(z0, z1)
-            v_t = model(pca_features, t, z_t, subject_id)
-            loss = MSE(v_t, u_t)
-        """
-        # Project PCA features to concat dim
-        cond = self.cond_mlp(pca_features)  # (B, T, P)
-
-        # TRIBE: subject-specific conditioning transform
-        if subject_id is not None:
-            cond = self.cond_subject_layer(cond, subject_id)  # (B, T, P)
-
-        # Build global conditioning (time + subject) for adaLN
-        c_global = self._build_global_cond(t, subject_id)  # (B, H)
-
-        # Predict velocity
-        v = self.velocity_net(z_t, t, cond, c_global)  # (B, T, Z)
-
-        # TRIBE: subject-specific output transform
-        if subject_id is not None:
-            v = self.output_subject_layer(v, subject_id)  # (B, T, Z)
-
-        return v
+        """Predict velocity v_θ(z_t, t | pca_features)."""
+        cond = self.cond_mlp(pca_features)      # (B, T, P)
+        c_global = self._build_global_cond(t)  # (B, H)
+        return self.velocity_net(z_t, t, cond, c_global)  # (B, T, Z)
 
     @torch.no_grad()
     def sample(
         self,
         pca_features: torch.Tensor,  # (B, T, D_cond)
-        subject_id: Optional[torch.Tensor] = None,
+        subject_id: Optional[torch.Tensor] = None,  # unused, kept for API compat
         n_steps: int = 50,
         method: str = "euler",
     ) -> torch.Tensor:
-        """Generate latent sequence from noise via ODE integration.
-
-        Parameters
-        ----------
-        pca_features : (B, T, D_cond)
-        subject_id : (B,)
-        n_steps : int
-        method : 'euler' or 'midpoint'
-
-        Returns
-        -------
-        z1 : (B, T, Z) — generated latent sequence
-        """
+        """Generate latent sequence from noise via ODE integration."""
         B, T, _ = pca_features.shape
         device = pca_features.device
 
-        # Encode conditioning once (reused across ODE steps)
-        cond = self.cond_mlp(pca_features)  # (B, T, P)
-
-        # TRIBE: subject-specific conditioning transform
-        if subject_id is not None:
-            cond = self.cond_subject_layer(cond, subject_id)  # (B, T, P)
-
-        # Start from Gaussian noise
+        cond = self.cond_mlp(pca_features)  # (B, T, P) — encode once
         z = torch.randn(B, T, self.latent_dim, device=device)
 
-        # ODE integration t=0 → t=1
         dt = 1.0 / n_steps
         ts = torch.linspace(0, 1 - dt, n_steps, device=device)
 
         for t_val in ts:
             t = torch.full((B,), t_val, device=device)
-            c_global = self._build_global_cond(t, subject_id)  # (B, H)
-
+            c_global = self._build_global_cond(t)
             if method == "euler":
-                v = self.velocity_net(z, t, cond, c_global)
-                # TRIBE: subject-specific output transform
-                if subject_id is not None:
-                    v = self.output_subject_layer(v, subject_id)
-                z = z + v * dt
+                z = z + self.velocity_net(z, t, cond, c_global) * dt
             elif method == "midpoint":
                 v1 = self.velocity_net(z, t, cond, c_global)
-                if subject_id is not None:
-                    v1 = self.output_subject_layer(v1, subject_id)
                 z_mid = z + v1 * (dt / 2)
                 t_mid = torch.full((B,), t_val + dt / 2, device=device)
-                c_mid = self._build_global_cond(t_mid, subject_id)
-                v2 = self.velocity_net(z_mid, t_mid, cond, c_mid)
-                if subject_id is not None:
-                    v2 = self.output_subject_layer(v2, subject_id)
-                z = z + v2 * dt
+                c_mid = self._build_global_cond(t_mid)
+                z = z + self.velocity_net(z_mid, t_mid, cond, c_mid) * dt
             else:
                 raise ValueError(f"Unknown method: {method}")
-
         return z
 
     def __repr__(self) -> str:
