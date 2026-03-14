@@ -4,6 +4,7 @@ import random
 import sys
 import time
 from pathlib import Path
+from functools import lru_cache
 
 import h5py
 import numpy as np
@@ -27,10 +28,22 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", date
 logger = logging.getLogger("train_cfm")
 
 
+def _get_fmri_filepath(fmri_dir: str, subject: str, task: str) -> Path:
+    """Resolve fMRI H5 file path (same logic as precompute_latents)."""
+    subj_dir = Path(fmri_dir) / subject / "func"
+    atlas = "space-MNI152NLin2009cAsym_atlas-Schaefer18_parcel-1000Par7Net"
+    stem = f"{subject}_task-{task}_{atlas}"
+    if task == "friends":
+        return subj_dir / f"{stem}_desc-s123456_bold.h5"
+    else:
+        return subj_dir / f"{stem}_bold.h5"
+
+
 class BrainFlowDataset(Dataset):
     """
     Loads pre-computed PCA features and VAE latents.
     Yields sliding windows of (features, latents).
+    For val split, also loads ground truth fMRI for metric computation.
     """
     def __init__(self, cfg, split="train"):
         self.cfg = cfg
@@ -41,6 +54,11 @@ class BrainFlowDataset(Dataset):
         self.latent_dir = Path(PROJECT_ROOT) / cfg["latent_dir"]
         self.pca_dir = Path(PROJECT_ROOT) / cfg["pca_features"]["output_dir"]
         
+        # fMRI ground truth access (for val)
+        self.fmri_dir = Path(cfg["_fmri_dir"])
+        self.excl_start = cfg["fmri"].get("excluded_samples_start", 0)
+        self.excl_end = cfg["fmri"].get("excluded_samples_end", 0)
+        
         # Sliding window params
         self.tr = cfg["fmri"]["tr"]
         self.context_dur = cfg["sliding_window"]["context_duration"]
@@ -50,6 +68,9 @@ class BrainFlowDataset(Dataset):
         
         self.val_ratio = cfg.get("val_ratio", 0.1)
         self.samples = self._build_index()
+        
+        # Cache for opened H5 files (val only)
+        self._fmri_cache = {}
 
     def _build_index(self):
         samples = []
@@ -93,15 +114,22 @@ class BrainFlowDataset(Dataset):
                             lat_shape = np.load(lat_path, mmap_mode="r").shape
                             n_trs = lat_shape[0]
                             
-                            if n_trs < self.seq_len:
+                            if n_trs < 10:  # need at least 10 TRs to be meaningful
                                 continue
                                 
-                            for start_idx in range(0, n_trs - self.seq_len + 1, self.stride):
+                            # TRIBE-style: one window per clip (or multiple non-overlapping)
+                            # If clip is shorter than seq_len, we record the actual length
+                            # and pad in __getitem__
+                            for start_idx in range(0, n_trs, self.stride):
+                                actual_len = min(self.seq_len, n_trs - start_idx)
+                                if actual_len < 10:  # skip tiny tail fragments
+                                    break
                                 samples.append({
                                     "task": task,
                                     "stim_type": stim_type,
                                     "clip_name": clip_name,
                                     "start_idx": start_idx,
+                                    "actual_len": actual_len,
                                 })
                         except Exception as e:
                             logger.warning(f"Error reading shape for {clip_name}: {e}")
@@ -112,28 +140,73 @@ class BrainFlowDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def _load_fmri_clip(self, subject, task, clip_name):
+        """Load ground truth fMRI for a clip from H5 file (cached)."""
+        cache_key = (subject, task, clip_name)
+        if cache_key in self._fmri_cache:
+            return self._fmri_cache[cache_key]
+        
+        fmri_path = _get_fmri_filepath(str(self.fmri_dir), subject, task)
+        # Determine fMRI key inside H5
+        fmri_key = clip_name
+        if task == "friends" and clip_name.startswith("friends_"):
+            fmri_key = clip_name[len("friends_"):]
+        elif task == "movie10" and clip_name.startswith("movie10_"):
+            fmri_key = clip_name[len("movie10_"):]
+        
+        with h5py.File(fmri_path, "r") as f:
+            matched = [k for k in f.keys() if fmri_key in k]
+            if not matched:
+                return None
+            raw = f[matched[0]]
+            end = len(raw) - self.excl_end if self.excl_end > 0 else len(raw)
+            data = raw[self.excl_start:end].astype(np.float32)
+        
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+        self._fmri_cache[cache_key] = data
+        return data
+
     def __getitem__(self, idx):
         sample_info = self.samples[idx]
         task = sample_info["task"]
         stim_type = sample_info["stim_type"]
         clip_name = sample_info["clip_name"]
         start = sample_info["start_idx"]
-        end = start + self.seq_len
+        actual_len = sample_info.get("actual_len", self.seq_len)
+        end = start + actual_len
         
         # Load features (shared across subjects)
         feat_path = self.pca_dir / task / stim_type / f"{clip_name}.npy"
         feat_data = np.load(feat_path, mmap_mode="r")[start:end].astype(np.float32)
         
         # Load latent (for now, single subject mode uses subjects[0])
-        # TODO: Add support for multi-subject batching
         subj = self.subjects[0]
         lat_path = self.latent_dir / subj / task / stim_type / f"{clip_name}.npy"
         lat_data = np.load(lat_path, mmap_mode="r")[start:end].astype(np.float32)
         
-        return {
+        # Zero-pad to seq_len if this is a short tail fragment
+        if actual_len < self.seq_len:
+            pad = self.seq_len - actual_len
+            feat_data = np.pad(feat_data, ((0, pad), (0, 0)), mode="constant")
+            lat_data  = np.pad(lat_data,  ((0, pad), (0, 0)), mode="constant")
+        
+        result = {
             "features": torch.from_numpy(feat_data.copy()),
             "latent": torch.from_numpy(lat_data.copy()),
+            "valid_len": actual_len,  # for CFM mask in training and PCC mask in eval
         }
+        
+        # For val split, also load ground truth fMRI
+        if self.split == "val":
+            fmri_data = self._load_fmri_clip(subj, task, clip_name)
+            if fmri_data is not None:
+                fmri_window = fmri_data[start:end].astype(np.float32)
+                if actual_len < self.seq_len:
+                    pad = self.seq_len - actual_len
+                    fmri_window = np.pad(fmri_window, ((0, pad), (0, 0)), mode="constant")
+                result["fmri"] = torch.from_numpy(fmri_window.copy())
+        
+        return result
 
 
 def get_dataloaders(cfg):
@@ -163,17 +236,32 @@ def get_dataloaders(cfg):
     return train_loader, val_loader
 
 
-def pearson_corr(pred, target):
-    """Compute Pearson correlation across time for each feature/voxel, then mean over features."""
-    # pred/target: (B, T, D) -> flatten batch and time (Total_T, D)
-    pred = pred.reshape(-1, pred.shape[-1])
-    target = target.reshape(-1, target.shape[-1])
+def pearson_corr(pred, target, valid_lens=None):
+    """Compute Pearson correlation across time for each feature/voxel, then mean over features.
+    
+    Args:
+        pred, target: (B, T, D)
+        valid_lens: optional LongTensor (B,) — number of valid (non-padded) TRs per sample.
+                    If provided, padded TRs are excluded from the computation.
+    """
+    if valid_lens is not None:
+        # Collect only valid TRs for each sample in the batch
+        rows_p, rows_t = [], []
+        for b in range(pred.shape[0]):
+            vl = int(valid_lens[b].item())
+            rows_p.append(pred[b, :vl, :])
+            rows_t.append(target[b, :vl, :])
+        pred   = torch.cat(rows_p, dim=0)   # (total_valid_T, D)
+        target = torch.cat(rows_t, dim=0)
+    else:
+        pred   = pred.reshape(-1, pred.shape[-1])
+        target = target.reshape(-1, target.shape[-1])
     
     # Mean across time for each voxel
-    pred_mean = pred.mean(dim=0, keepdim=True)
+    pred_mean   = pred.mean(dim=0, keepdim=True)
     target_mean = target.mean(dim=0, keepdim=True)
     
-    pred_cnt = pred - pred_mean
+    pred_cnt   = pred   - pred_mean
     target_cnt = target - target_mean
     
     # Covariance and Variance
@@ -208,6 +296,7 @@ def train(args):
         encoder_params=bf_cfg["encoder"],
         decoder_params=bf_cfg["decoder"],
         cfm_params=bf_cfg["cfm"],
+        cfg_drop_prob=bf_cfg.get("cfg_drop_prob", 0.1),
     ).to(device)
     
     # 3. Load frozen VAE for validation (optional but good for tracking fMRI Pearson)
@@ -267,8 +356,15 @@ def train(args):
             features = batch["features"].to(device)
             latents = batch["latent"].to(device)
             
+            # Build CFM mask: 0 for zero-padded TRs, 1 for valid TRs
+            B, T, _ = latents.shape
+            mask = torch.ones(B, 1, T, device=device)
+            if "valid_len" in batch:
+                for b, vl in enumerate(batch["valid_len"]):
+                    mask[b, 0, int(vl):] = 0.0
+            
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"]):
-                loss = model(features, latents)
+                loss = model(features, latents, mask=mask)
                 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -298,19 +394,26 @@ def train(args):
                         
                     features = batch["features"].to(device)
                     latents = batch["latent"].to(device)
+                    valid_lens = batch.get("valid_len", None)  # (B,) or None for full-length
+                    if valid_lens is not None:
+                        valid_lens = valid_lens.to(device)
                     
-                    # Generate latents using ODE solver
-                    # T=10 is standard for Euler ODE in Matcha-TTS
-                    gen_latents = model.synthesise(features, n_timesteps=10, temperature=1.0)
+                    # Generate latents using ODE solver with CFG
+                    gen_latents = model.synthesise(
+                        features,
+                        n_timesteps=20,
+                        temperature=1.0,
+                        guidance_scale=bf_cfg.get("cfg_guidance_scale", 2.0),
+                    )
                     
-                    batch_corr = pearson_corr(gen_latents, latents)
+                    batch_corr = pearson_corr(gen_latents, latents, valid_lens=valid_lens)
                     val_lat_corr.append(batch_corr)
                     
-                    if vae is not None:
+                    if vae is not None and "fmri" in batch:
+                        true_fmri = batch["fmri"].to(device)  # ground truth from scanner
                         dummy_subj = torch.zeros(features.shape[0], dtype=torch.long, device=device)
                         gen_fmri = vae.decode(gen_latents, dummy_subj)
-                        true_fmri = vae.decode(latents, dummy_subj)
-                        val_fmri_corr.append(pearson_corr(gen_fmri, true_fmri))
+                        val_fmri_corr.append(pearson_corr(gen_fmri, true_fmri, valid_lens=valid_lens))
                         
             mean_corr = float(np.mean(val_lat_corr))
             mean_fmri_corr = float(np.mean(val_fmri_corr)) if val_fmri_corr else 0.0

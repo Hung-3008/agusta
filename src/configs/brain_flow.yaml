@@ -72,8 +72,8 @@ splits:
 val_ratio: 0.1
 
 sliding_window:
-  context_duration: 14.9
-  stride: 1.49
+  context_duration: 149.0  # 100 TRs — no-overlap like TRIBE
+  stride: 149.0             # stride == duration → zero overlap
 
 # --- Preprocessing ---
 preprocessing:
@@ -82,8 +82,8 @@ preprocessing:
 
 # --- DataLoader ---
 dataloader:
-  batch_size: 128
-  val_batch_size: 128
+  batch_size: 8
+  val_batch_size: 8
   num_workers: 0
   pin_memory: true
   max_cache_size: 50
@@ -94,6 +94,7 @@ dataloader:
 brainflow:
   latent_dim: 64           # MUST MATCH VAE
   feat_dim: 2750           # MUST MATCH PCA n_components
+  cfg_drop_prob: 0.1       # CFG: prob of zeroing out conditioning during training
   
   # ConditionEncoder params
   encoder:
@@ -130,4 +131,4 @@ training:
   val_every_n_epochs: 5
 
 # --- Output ---
-output_dir: outputs/brain_flow_cfm
+output_dir: outputs/brain_flow_cfm_exp4
