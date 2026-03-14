@@ -249,6 +249,9 @@ class BrainFlowV2Dataset(Dataset):
         result = {
             "latent": torch.from_numpy(lat_data.copy()),
             "valid_len": actual_len,
+            "clip_key": f"{task}/{stim_type}/{norm_name}",
+            "start_idx": start,
+            "n_trs": n_trs,
         }
         result.update(mod_features)  # mod_name → (T, D_mod)
 
@@ -469,13 +472,14 @@ def train(args):
         mean_fmri_corr = 0.0
         if epoch % tr_cfg["val_every_n_epochs"] == 0 or args.fast_dev_run:
             model.eval()
-            val_lat_corr = []
-            val_fmri_corr = []
 
             logger.info("Running validation...")
-            # Collect ALL predictions/targets across val set for proper PCC
-            all_gen_lat, all_tgt_lat = [], []
-            all_gen_fmri, all_tgt_fmri = [], []
+
+            # Per-clip accumulators: {clip_key: {"sum": (n_trs, D), "count": (n_trs,)}}
+            lat_pred_acc = {}   # predicted latents
+            lat_tgt_acc = {}    # target latents
+            fmri_pred_acc = {}  # predicted fMRI (via VAE decode)
+            fmri_tgt_acc = {}   # target fMRI
 
             with torch.no_grad():
                 for batch_idx, batch in enumerate(tqdm(val_loader, desc="Val")):
@@ -490,40 +494,93 @@ def train(args):
 
                     gen_latents = model.synthesise(
                         mod_features,
-                        n_timesteps=20,
-                        temperature=1.0,
-                        guidance_scale=tr_cfg.get("guidance_scale", 2.0),
+                        n_timesteps=50,
+                        temperature=0.8,
+                        guidance_scale=tr_cfg.get("guidance_scale", 1.5),
                     )
 
-                    # Collect valid TRs only (strip padding)
-                    for b in range(gen_latents.shape[0]):
-                        vl = int(valid_lens[b].item()) if valid_lens is not None else gen_latents.shape[1]
-                        all_gen_lat.append(gen_latents[b, :vl].cpu())
-                        all_tgt_lat.append(latents[b, :vl].cpu())
-
+                    # Decode to fMRI if VAE available
+                    gen_fmri = None
                     if vae is not None and "fmri" in batch:
                         true_fmri = batch["fmri"].to(device)
                         dummy_subj = torch.zeros(latents.shape[0], dtype=torch.long, device=device)
                         gen_fmri = vae.decode(gen_latents, dummy_subj)
-                        for b in range(gen_fmri.shape[0]):
-                            vl = int(valid_lens[b].item()) if valid_lens is not None else gen_fmri.shape[1]
-                            all_gen_fmri.append(gen_fmri[b, :vl].cpu())
-                            all_tgt_fmri.append(true_fmri[b, :vl].cpu())
 
-            # Compute PCC over full val set (per-dim/per-voxel, then mean)
-            all_gen_lat = torch.cat(all_gen_lat, dim=0)   # (total_TRs, 64)
-            all_tgt_lat = torch.cat(all_tgt_lat, dim=0)
-            lat_pcc_per_dim = pearson_corr_per_dim(
-                all_gen_lat.unsqueeze(0), all_tgt_lat.unsqueeze(0)
-            )  # (64,)
-            mean_corr = float(lat_pcc_per_dim.mean().item())
+                    # Accumulate per-clip, per-TR (de-duplicate overlapping windows)
+                    clip_keys = batch["clip_key"]       # list of strings
+                    start_idxs = batch["start_idx"]     # (B,)
+                    n_trs_batch = batch["n_trs"]         # (B,)
+
+                    for b in range(gen_latents.shape[0]):
+                        vl = int(valid_lens[b].item()) if valid_lens is not None else gen_latents.shape[1]
+                        ck = clip_keys[b]
+                        si = int(start_idxs[b].item())
+                        n_t = int(n_trs_batch[b].item())
+                        lat_dim = gen_latents.shape[-1]
+
+                        # Initialize clip accumulator if needed
+                        if ck not in lat_pred_acc:
+                            lat_pred_acc[ck] = {"sum": torch.zeros(n_t, lat_dim), "count": torch.zeros(n_t)}
+                            lat_tgt_acc[ck] = {"sum": torch.zeros(n_t, lat_dim), "count": torch.zeros(n_t)}
+
+                        # Accumulate predicted and target latents (vectorized slice)
+                        lat_pred_acc[ck]["sum"][si:si+vl] += gen_latents[b, :vl].cpu()
+                        lat_pred_acc[ck]["count"][si:si+vl] += 1
+                        lat_tgt_acc[ck]["sum"][si:si+vl] += latents[b, :vl].cpu()
+                        lat_tgt_acc[ck]["count"][si:si+vl] += 1
+
+                        # fMRI accumulation (vectorized slice)
+                        if gen_fmri is not None:
+                            fmri_dim = gen_fmri.shape[-1]
+                            if ck not in fmri_pred_acc:
+                                fmri_pred_acc[ck] = {"sum": torch.zeros(n_t, fmri_dim), "count": torch.zeros(n_t)}
+                                fmri_tgt_acc[ck] = {"sum": torch.zeros(n_t, fmri_dim), "count": torch.zeros(n_t)}
+                            fmri_pred_acc[ck]["sum"][si:si+vl] += gen_fmri[b, :vl].cpu()
+                            fmri_pred_acc[ck]["count"][si:si+vl] += 1
+                            fmri_tgt_acc[ck]["sum"][si:si+vl] += true_fmri[b, :vl].cpu()
+                            fmri_tgt_acc[ck]["count"][si:si+vl] += 1
+
+            # Average overlapping predictions and concatenate per-clip
+            all_gen_lat, all_tgt_lat = [], []
+            all_gen_fmri, all_tgt_fmri = [], []
+
+            for ck in sorted(lat_pred_acc.keys()):
+                count = lat_pred_acc[ck]["count"]
+                valid_mask = count > 0
+                if valid_mask.sum() < 2:
+                    continue
+                avg_pred = lat_pred_acc[ck]["sum"][valid_mask] / count[valid_mask].unsqueeze(-1)
+                avg_tgt = lat_tgt_acc[ck]["sum"][valid_mask] / lat_tgt_acc[ck]["count"][valid_mask].unsqueeze(-1)
+                all_gen_lat.append(avg_pred)
+                all_tgt_lat.append(avg_tgt)
+
+            for ck in sorted(fmri_pred_acc.keys()):
+                count = fmri_pred_acc[ck]["count"]
+                valid_mask = count > 0
+                if valid_mask.sum() < 2:
+                    continue
+                avg_pred = fmri_pred_acc[ck]["sum"][valid_mask] / count[valid_mask].unsqueeze(-1)
+                avg_tgt = fmri_tgt_acc[ck]["sum"][valid_mask] / fmri_tgt_acc[ck]["count"][valid_mask].unsqueeze(-1)
+                all_gen_fmri.append(avg_pred)
+                all_tgt_fmri.append(avg_tgt)
+
+            # Compute PCC on de-duplicated, per-clip concatenated timeseries
+            if all_gen_lat:
+                all_gen_lat = torch.cat(all_gen_lat, dim=0)   # (unique_TRs, 64)
+                all_tgt_lat = torch.cat(all_tgt_lat, dim=0)
+                lat_pcc_per_dim = pearson_corr_per_dim(
+                    all_gen_lat.unsqueeze(0), all_tgt_lat.unsqueeze(0)
+                )
+                mean_corr = float(lat_pcc_per_dim.mean().item())
+            else:
+                mean_corr = 0.0
 
             if all_gen_fmri:
-                all_gen_fmri = torch.cat(all_gen_fmri, dim=0)  # (total_TRs, 1000)
+                all_gen_fmri = torch.cat(all_gen_fmri, dim=0)
                 all_tgt_fmri = torch.cat(all_tgt_fmri, dim=0)
                 fmri_pcc_per_voxel = pearson_corr_per_dim(
                     all_gen_fmri.unsqueeze(0), all_tgt_fmri.unsqueeze(0)
-                )  # (1000,)
+                )
                 mean_fmri_corr = float(fmri_pcc_per_voxel.mean().item())
             else:
                 mean_fmri_corr = 0.0

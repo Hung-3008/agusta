@@ -126,16 +126,16 @@ class MultiModalConditionEncoder(nn.Module):
         self.n_modalities = len(modality_dims)
 
         # Per-modality MLP projectors
-        # Each modality projects to hidden_dim // N so cat gives hidden_dim
+        # Each modality projects raw_dim → hidden_dim (bottleneck) → per_mod_dim
         per_mod_dim = hidden_dim // self.n_modalities
         self.projectors = nn.ModuleDict()
         for mod_name, raw_dim in modality_dims.items():
             self.projectors[mod_name] = nn.Sequential(
-                nn.Linear(raw_dim, per_mod_dim),
-                nn.LayerNorm(per_mod_dim),
+                nn.Linear(raw_dim, hidden_dim),       # raw → full hidden (large bottleneck)
+                nn.LayerNorm(hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
-                nn.Linear(per_mod_dim, per_mod_dim),
+                nn.Linear(hidden_dim, per_mod_dim),    # hidden → per_mod_dim
                 nn.LayerNorm(per_mod_dim),
             )
 
@@ -240,18 +240,20 @@ class AdaLNZero(nn.Module):
             nn.SiLU(),
             nn.Linear(cond_dim, 6 * hidden_dim, bias=True),
         )
-        # Zero-init so block starts as identity
-        nn.init.zeros_(self.mlp[-1].weight)
+        # Small-init for faster convergence (not zero-init which blocks learning)
+        nn.init.normal_(self.mlp[-1].weight, std=0.02)
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, c: torch.Tensor) -> tuple:
         """
         Args:
-            c: (B, cond_dim) — conditioning vector.
+            c: (B, cond_dim) or (B, T, cond_dim) — conditioning vector.
         Returns:
-            (γ₁, β₁, α₁, γ₂, β₂, α₂), each (B, 1, hidden_dim)
+            (γ₁, β₁, α₁, γ₂, β₂, α₂), each (B, 1, hidden_dim) or (B, T, hidden_dim)
         """
-        params = self.mlp(c).unsqueeze(1)  # (B, 1, 6*H)
+        params = self.mlp(c)  # (B, 6*H) or (B, T, 6*H)
+        if params.ndim == 2:
+            params = params.unsqueeze(1)  # (B, 1, 6*H) for broadcast
         return params.chunk(6, dim=-1)
 
 
@@ -473,13 +475,12 @@ class DiTVelocityNet(nn.Module):
         # Get RoPE frequencies
         cos, sin = self.rope(x, seq_dim=1)
 
-        # Conditioning: timestep + global condition
+        # Conditioning: timestep + per-timestep condition
         t_emb = self.time_embed(t)     # (B, H)
         if cond_seq is not None:
-            # Global condition = mean pool of conditioning sequence
-            c_global = cond_seq.mean(dim=1)  # (B, cond_dim)
-            c_global = self.cond_proj(c_global)  # (B, H)
-            c = t_emb + c_global       # (B, H)
+            # Per-timestep conditioning (preserves temporal info)
+            c_per_t = self.cond_proj(cond_seq)   # (B, T_cond, H)
+            c = t_emb.unsqueeze(1) + c_per_t     # (B, T_cond, H)
         else:
             c = t_emb
 
@@ -575,7 +576,7 @@ class DiTCFM(nn.Module):
         mask: torch.Tensor,       # (B, 1, T)
         mu: torch.Tensor,         # (B, latent_dim, T) — unused but kept for API
         cond_seq: torch.Tensor = None,
-        noise_scale: float = 0.05, # Brownian Bridge variance scaling
+        noise_scale: float = 0.0,  # Pure OT-CFM (no Brownian Bridge stochasticity)
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute OT-CFM loss with Brownian Bridge stochasticity."""
         b, _, T = x1.shape
@@ -718,13 +719,17 @@ class BrainFlowCFMv2(nn.Module):
         cond_seq = self._encode_condition(modality_features)  # (B, T, H_cond)
 
         # CFG dropout: zero out entire conditioning vector for random samples
+        cfg_keep = None
         if self.training and self.cfg_drop_prob > 0.0:
             # shape (B, 1, 1) broadcasts over T and cond_dim
-            keep = (torch.rand(B, 1, 1, device=cond_seq.device) > self.cfg_drop_prob).float()
-            cond_seq = cond_seq * keep
+            cfg_keep = (torch.rand(B, 1, 1, device=cond_seq.device) > self.cfg_drop_prob).float()
+            cond_seq = cond_seq * cfg_keep
 
         # 2. Project conditioning → latent space
         mu_cond = self.cond_to_mu(cond_seq)  # (B, T, Z)
+        # Also zero mu_cond for dropped samples (bypass projection bias)
+        if cfg_keep is not None:
+            mu_cond = mu_cond * cfg_keep
         mu_cond = mu_cond.transpose(1, 2)    # (B, Z, T)
 
         # 3. CFM loss

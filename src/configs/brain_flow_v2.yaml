@@ -56,14 +56,14 @@ splits:
     val: []
 
 sliding_window:
-  context_duration: 149.0   # 100 TRs
-  stride: 149.0             # no overlap
+  context_duration: 14.9    # 10 TRs — covers HRF response window
+  stride: 1.49              # 1 TR stride — max overlap → ~100x more samples
 
 # --- DataLoader ---
 dataloader:
-  batch_size: 8
-  val_batch_size: 8
-  num_workers: 0             # start with 0 for H5 reads
+  batch_size: 256
+  val_batch_size: 256
+  num_workers: 4
   pin_memory: true
 
 # =====================================================================
@@ -74,42 +74,42 @@ brainflow:
 
   # Encoder: TRIBE-style (per-modality MLP + Transformer)
   encoder:
-    hidden_dim: 768          # Transformer d_model
-    n_layers: 4              # Transformer layers
+    hidden_dim: 1024         # Transformer d_model (768→1024)
+    n_layers: 6              # Transformer layers (4→6)
     n_heads: 8
-    dropout: 0.2
-    modality_dropout: 0.3    # TRIBE uses 0.3
+    dropout: 0.1             # Reduced from 0.2
+    modality_dropout: 0.15   # Reduced from 0.3
 
   # Decoder: DiT or unet
   decoder_type: dit          # "dit" or "unet"
 
   # DiT decoder params
   decoder:
-    hidden_dim: 256          # DiT block hidden dim
-    n_blocks: 6              # DiT blocks
+    hidden_dim: 768          # DiT block hidden dim (256→768)
+    n_blocks: 12             # DiT blocks (6→12)
     n_heads: 8
-    dropout: 0.2
+    dropout: 0.1             # Reduced from 0.2
     use_cross_attention: true
 
   cfm:
     solver: euler
     sigma_min: 0.0001
     
-  cfg_drop_prob: 0.2
+  cfg_drop_prob: 0.1         # Reduced from 0.2
 
 # =====================================================================
 # Training config
 # =====================================================================
 training:
-  n_epochs: 500
-  lr: 1.0e-4
-  weight_decay: 0.05
+  n_epochs: 300
+  lr: 3.0e-4                 # Increased (1e-4→3e-4) for larger model
+  weight_decay: 0.01          # Reduced (0.05→0.01)
   warmup_ratio: 0.05
   grad_clip: 1.0
   use_amp: true
   log_every_n_steps: 20
-  val_every_n_epochs: 5
-  guidance_scale: 2.0
+  val_every_n_epochs: 10
+  guidance_scale: 1.5         # Reduced (2.0→1.5)
 
 # --- Output ---
 output_dir: outputs/brain_flow_v2_dit
