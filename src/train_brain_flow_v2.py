@@ -375,6 +375,7 @@ def train(args):
         decoder_type=bf_cfg.get("decoder_type", "dit"),
         decoder_params=bf_cfg["decoder"],
         cfm_params=bf_cfg["cfm"],
+        cfg_drop_prob=bf_cfg.get("cfg_drop_prob", 0.1),
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -491,6 +492,7 @@ def train(args):
                         mod_features,
                         n_timesteps=20,
                         temperature=1.0,
+                        guidance_scale=tr_cfg.get("guidance_scale", 2.0),
                     )
 
                     # Collect valid TRs only (strip padding)

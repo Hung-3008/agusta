@@ -28,6 +28,65 @@ def _get_cfm_class():
     return CFM
 
 
+from src.models.brainflow.components.rope import RotaryEmbedding, apply_rotary_pos_emb
+
+# =============================================================================
+# Custom Transformer Encoder Layer for RoPE
+# =============================================================================
+
+class RoPETransformerEncoderLayer(nn.Module):
+    """Transformer Encoder Layer customized to inject RoPE."""
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = nn.GELU()
+        
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+
+    def forward(self, src, cos, sin):
+        # Pre-LN
+        x = self.norm1(src)
+        B, T, C = x.shape
+        
+        # Project Q, K, V
+        qkv = self.self_attn.in_proj_weight @ x.transpose(1, 2)
+        qkv = qkv.transpose(1, 2) + self.self_attn.in_proj_bias
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Reshape for RoPE
+        q = q.view(B, T, self.nhead, self.head_dim).transpose(1, 2) # (B, H, T, D)
+        k = k.view(B, T, self.nhead, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.nhead, self.head_dim).transpose(1, 2)
+        
+        # Apply RoPE
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        
+        # Flash Attention
+        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.self_attn.dropout if self.training else 0.0)
+        attn_out = attn_out.transpose(1, 2).reshape(B, T, C)
+        
+        # Output proj
+        attn_out = self.self_attn.out_proj(attn_out)
+        
+        # Residual
+        src = src + self.dropout1(attn_out)
+        
+        # FFN
+        src2 = self.norm2(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
+        src = src + self.dropout2(src2)
+        return src
+
+
 # =============================================================================
 # TRIBE-style Condition Encoder
 # =============================================================================
@@ -89,21 +148,16 @@ class MultiModalConditionEncoder(nn.Module):
         else:
             self.dim_fix = nn.Identity()
 
-        # Learnable positional embedding
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1024, hidden_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        # RoPE embedding (no more absolute pos_embed)
+        self.rope = RotaryEmbedding(dim=hidden_dim // n_heads)
 
         # Transformer encoder for temporal context
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=n_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,  # Pre-LN for stability
-        )
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.layers = nn.ModuleList([
+            RoPETransformerEncoderLayer(
+                d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4, dropout=dropout
+            )
+            for _ in range(n_layers)
+        ])
         self.final_norm = nn.LayerNorm(hidden_dim)
 
     def forward(
@@ -157,11 +211,12 @@ class MultiModalConditionEncoder(nn.Module):
         x = torch.cat(projections, dim=-1)  # (B, T, actual_hidden)
         x = self.dim_fix(x)                 # (B, T, hidden_dim)
 
-        # Add positional embedding
-        x = x + self.pos_embed[:, :T, :]
+        # Get RoPE frequencies
+        cos, sin = self.rope(x, seq_dim=1)
 
         # Transformer encoder
-        x = self.transformer(x)              # (B, T, hidden_dim)
+        for layer in self.layers:
+            x = layer(x, cos, sin)
         x = self.final_norm(x)
 
         return x  # (B, T, hidden_dim)
@@ -219,18 +274,17 @@ class DiTBlock(nn.Module):
         cross_attention_dim: Optional[int] = None,
     ):
         super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = hidden_dim // n_heads
 
         # AdaLN-Zero modulation
         self.adaln = AdaLNZero(hidden_dim, cond_dim)
 
-        # Self-attention
+        # Self-attention with RoPE
         self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
+        self.qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+        self.attn_drop = dropout
 
         # Cross-attention (optional)
         self.use_cross_attention = use_cross_attention
@@ -260,15 +314,30 @@ class DiTBlock(nn.Module):
         self,
         x: torch.Tensor,              # (B, T, H)
         c: torch.Tensor,              # (B, cond_dim) — timestep + global cond
+        cos: torch.Tensor = None,     # (1, 1, T, head_dim) — RoPE frequencies
+        sin: torch.Tensor = None,     # (1, 1, T, head_dim) — RoPE frequencies
         cond_seq: Optional[torch.Tensor] = None,  # (B, T_cond, H_cond) — for cross-attn
     ) -> torch.Tensor:
         # AdaLN-Zero params
         γ1, β1, α1, γ2, β2, α2 = self.adaln(c)  # each (B, 1, H)
 
-        # 1. Self-Attention with AdaLN modulation
+        # 1. Self-Attention with AdaLN modulation and RoPE
         h = self.norm1(x)
-        h = γ1 * h + β1
-        h, _ = self.self_attn(h, h, h)
+        h = (1 + γ1) * h + β1
+        
+        B, T, C = h.shape
+        qkv = self.qkv(h).view(B, T, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]   # (B, n_heads, T, head_dim)
+        
+        if cos is not None and sin is not None:
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            
+        attn = F.scaled_dot_product_attention(
+            q, k, v, 
+            dropout_p=self.attn_drop if self.training else 0.0
+        )
+        attn = attn.transpose(1, 2).reshape(B, T, C)
+        h = self.proj(attn)
         x = x + α1 * h
 
         # 2. Cross-Attention (condition sequence)
@@ -279,7 +348,7 @@ class DiTBlock(nn.Module):
 
         # 3. FFN with AdaLN modulation
         h = self.norm2(x)
-        h = γ2 * h + β2
+        h = (1 + γ2) * h + β2
         h = self.ffn(h)
         x = x + α2 * h
 
@@ -356,9 +425,8 @@ class DiTVelocityNet(nn.Module):
         # Total conditioning dim for AdaLN = timestep + global_cond
         adaln_cond_dim = hidden_dim  # combined via addition
 
-        # Positional embedding for latent sequence
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1024, hidden_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        # RoPE embedding (no more absolute pos_embed)
+        self.rope = RotaryEmbedding(dim=hidden_dim // n_heads)
 
         # DiT blocks
         self.blocks = nn.ModuleList([
@@ -402,8 +470,8 @@ class DiTVelocityNet(nn.Module):
         mu_T = mu.transpose(1, 2)      # (B, T, D)
         x = self.input_proj(x) + self.mu_proj(mu_T)  # (B, T, H) — add conditioning
 
-        # Positional embedding
-        x = x + self.pos_embed[:, :T, :]
+        # Get RoPE frequencies
+        cos, sin = self.rope(x, seq_dim=1)
 
         # Conditioning: timestep + global condition
         t_emb = self.time_embed(t)     # (B, H)
@@ -417,7 +485,7 @@ class DiTVelocityNet(nn.Module):
 
         # DiT blocks
         for block in self.blocks:
-            x = block(x, c, cond_seq=cond_seq)
+            x = block(x, c, cos=cos, sin=sin, cond_seq=cond_seq)
 
         # Output
         x = self.final_norm(x)
@@ -465,16 +533,35 @@ class DiTCFM(nn.Module):
         n_timesteps: int = 20,
         temperature: float = 1.0,
         cond_seq: torch.Tensor = None,
+        guidance_scale: float = 1.0,
     ) -> torch.Tensor:
-        """ODE sampling (Euler solver)."""
+        """ODE sampling (Euler solver) with optional Classifier-Free Guidance."""
         z = torch.randn_like(mu) * temperature
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
 
         t, dt = t_span[0], t_span[1] - t_span[0]
         x = z
+        
+        B = mu.shape[0]
 
         for step in range(1, len(t_span)):
-            dphi_dt = self.estimator(x, mask, mu, t, cond_seq=cond_seq)
+            if guidance_scale != 1.0:
+                # Batched CFG: [cond, uncond]
+                x_both = torch.cat([x, x], dim=0)
+                mask_both = torch.cat([mask, mask], dim=0)
+                mu_both = torch.cat([mu, torch.zeros_like(mu)], dim=0)
+                t_both = t.expand(B * 2)
+                if cond_seq is not None:
+                    cond_seq_both = torch.cat([cond_seq, torch.zeros_like(cond_seq)], dim=0)
+                else:
+                    cond_seq_both = None
+                
+                v_both = self.estimator(x_both, mask_both, mu_both, t_both, cond_seq=cond_seq_both)
+                v_cond, v_uncond = v_both[:B], v_both[B:]
+                dphi_dt = v_uncond + guidance_scale * (v_cond - v_uncond)
+            else:
+                dphi_dt = self.estimator(x, mask, mu, t.expand(B), cond_seq=cond_seq)
+                
             x = x + dt * dphi_dt
             t = t + dt
             if step < len(t_span) - 1:
@@ -488,8 +575,9 @@ class DiTCFM(nn.Module):
         mask: torch.Tensor,       # (B, 1, T)
         mu: torch.Tensor,         # (B, latent_dim, T) — unused but kept for API
         cond_seq: torch.Tensor = None,
+        noise_scale: float = 0.05, # Brownian Bridge variance scaling
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute OT-CFM loss."""
+        """Compute OT-CFM loss with Brownian Bridge stochasticity."""
         b, _, T = x1.shape
 
         # Random timestep
@@ -500,8 +588,24 @@ class DiTCFM(nn.Module):
 
         # Interpolate: y(t) = (1 - (1-σ_min)t)z + t·x1
         y = (1 - (1 - self.sigma_min) * t) * z + t * x1
-        # Target velocity: u = x1 - (1-σ_min)z
-        u = x1 - (1 - self.sigma_min) * z
+        
+        # Add Brownian noise scaled by t(1-t) to make the path stochastic
+        if noise_scale > 0:
+            bridge_std = torch.sqrt(t * (1 - t) + 1e-8)
+            epsilon = torch.randn_like(x1)
+            y = y + noise_scale * bridge_std * epsilon
+            
+            # Derivative of the noise term wrt t: c * (1 - 2t) / (2 * sqrt(t(1-t)))
+            # Clamp denominator to avoid division by zero near t=0 or t=1
+            denom = 2 * torch.clamp(bridge_std, min=1e-5)
+            noise_deriv = noise_scale * ((1 - 2 * t) / denom) * epsilon
+        else:
+            noise_deriv = 0.0
+            
+        # Target velocity: u = dy/dt
+        # Base linear derivative: x1 - (1-σ_min)z
+        u = x1 - (1 - self.sigma_min) * z + noise_deriv
+        u = u * mask
 
         # Predict velocity
         v_pred = self.estimator(y, mask, mu, t.squeeze(), cond_seq=cond_seq)
@@ -539,10 +643,12 @@ class BrainFlowCFMv2(nn.Module):
         decoder_type: str = "dit",
         decoder_params: dict = None,
         cfm_params: dict = None,
+        cfg_drop_prob: float = 0.1,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.decoder_type = decoder_type
+        self.cfg_drop_prob = cfg_drop_prob
 
         # Encoder
         self.encoder = MultiModalConditionEncoder(
@@ -611,6 +717,12 @@ class BrainFlowCFMv2(nn.Module):
         # 1. Encode conditioning
         cond_seq = self._encode_condition(modality_features)  # (B, T, H_cond)
 
+        # CFG dropout: zero out entire conditioning vector for random samples
+        if self.training and self.cfg_drop_prob > 0.0:
+            # shape (B, 1, 1) broadcasts over T and cond_dim
+            keep = (torch.rand(B, 1, 1, device=cond_seq.device) > self.cfg_drop_prob).float()
+            cond_seq = cond_seq * keep
+
         # 2. Project conditioning → latent space
         mu_cond = self.cond_to_mu(cond_seq)  # (B, T, Z)
         mu_cond = mu_cond.transpose(1, 2)    # (B, Z, T)
@@ -633,6 +745,7 @@ class BrainFlowCFMv2(nn.Module):
         modality_features: dict[str, torch.Tensor],
         n_timesteps: int = 20,
         temperature: float = 1.0,
+        guidance_scale: float = 1.0,
     ) -> torch.Tensor:
         """Generate fMRI latents from multimodal features.
 
@@ -640,6 +753,7 @@ class BrainFlowCFMv2(nn.Module):
             modality_features: dict {mod_name: (B, T, D_mod)}.
             n_timesteps: ODE solver steps.
             temperature: Initial noise variance.
+            guidance_scale: CFG scale (>1.0 pushes away from unconditional).
 
         Returns:
             latent: (B, T, Z) — generated latents.
@@ -656,7 +770,7 @@ class BrainFlowCFMv2(nn.Module):
             z_1 = self.decoder(
                 mu=mu_cond, mask=mask,
                 n_timesteps=n_timesteps, temperature=temperature,
-                cond_seq=cond_seq,
+                cond_seq=cond_seq, guidance_scale=guidance_scale,
             )
         else:
             mu_cond = self.cond_to_mu(cond_seq).transpose(1, 2)

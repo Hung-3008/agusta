@@ -77,8 +77,8 @@ brainflow:
     hidden_dim: 768          # Transformer d_model
     n_layers: 4              # Transformer layers
     n_heads: 8
-    dropout: 0.1
-    modality_dropout: 0.2    # TRIBE uses 0.3
+    dropout: 0.2
+    modality_dropout: 0.3    # TRIBE uses 0.3
 
   # Decoder: DiT or unet
   decoder_type: dit          # "dit" or "unet"
@@ -88,12 +88,14 @@ brainflow:
     hidden_dim: 256          # DiT block hidden dim
     n_blocks: 6              # DiT blocks
     n_heads: 8
-    dropout: 0.1
+    dropout: 0.2
     use_cross_attention: true
 
   cfm:
     solver: euler
     sigma_min: 0.0001
+    
+  cfg_drop_prob: 0.2
 
 # =====================================================================
 # Training config
@@ -101,12 +103,13 @@ brainflow:
 training:
   n_epochs: 500
   lr: 1.0e-4
-  weight_decay: 0.01
+  weight_decay: 0.05
   warmup_ratio: 0.05
   grad_clip: 1.0
   use_amp: true
   log_every_n_steps: 20
   val_every_n_epochs: 5
+  guidance_scale: 2.0
 
 # --- Output ---
 output_dir: outputs/brain_flow_v2_dit
