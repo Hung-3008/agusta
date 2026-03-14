@@ -56,9 +56,9 @@ def load_clip_features_as_2d(
       - resample_features_to_tr  → (1, D, n_trs)
       - Transpose to (n_trs, D)
     """
-    feature_freq = cfg["raw_features"]["sample_freq"]
     fmri_tr = cfg["fmri"]["tr"]
     layer_aggregation = cfg["raw_features"].get("layer_aggregation", "mean")
+    feature_freq = cfg["raw_features"].get("sample_freq", 2.0)
 
     mod_features = {}
     for mod, mod_cfg in cfg["raw_features"]["modalities"].items():
@@ -72,14 +72,12 @@ def load_clip_features_as_2d(
             if raw.ndim == 2:
                 raw = raw[np.newaxis, :, :]  # (1, D, T_feat)
 
-            T_feat = raw.shape[2]
-            estimated_trs = int(round((T_feat / feature_freq) / fmri_tr))
-
-            # Resample to TR grid: (1, D, estimated_trs)
-            resampled = resample_features_to_tr(raw, feature_freq, fmri_tr, estimated_trs)
+            # Resample to match n_trs_target directly
+            # Features are at ~1/TR rate (not 2Hz), so use n_trs_target
+            resampled = resample_features_to_tr(raw, feature_freq, fmri_tr, n_trs_target)
 
             # Convert to (T, D) — same as training NPY format
-            feat_2d = resampled[0].T.astype(np.float32)  # (estimated_trs, D)
+            feat_2d = resampled[0].T.astype(np.float32)  # (n_trs_target, D)
             mod_features[mod] = feat_2d
 
             del raw, resampled

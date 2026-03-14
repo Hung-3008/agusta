@@ -21,7 +21,7 @@ fmri:
 # --- Raw features (no PCA) ---
 raw_features:
   dir: Data/algonauts_2025.features
-  sample_freq: 2.0
+  sample_freq: 0.6711          # ~1/TR Hz (features are at ~1 sample per raw fMRI TR)
   layer_aggregation: mean      # mean of all valid layers (simple, robust)
   modalities:
     video:
