@@ -125,7 +125,14 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    cfg = resolve_paths(cfg, PROJECT_ROOT)
+    
+    # Handle both v1 and v2 config formats
+    if "features" in cfg:
+        cfg = resolve_paths(cfg, PROJECT_ROOT)
+    else:
+        cfg["_project_root"] = str(PROJECT_ROOT)
+        cfg["_data_root"] = str(PROJECT_ROOT / cfg["data_root"])
+        cfg["_fmri_dir"] = str(PROJECT_ROOT / cfg["data_root"] / cfg["fmri"]["dir"])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
@@ -139,7 +146,7 @@ def main():
     splits_cfg = cfg["splits"]
     excl_start = cfg["fmri"].get("excluded_samples_start", 0)
     excl_end = cfg["fmri"].get("excluded_samples_end", 0)
-    standardize = cfg["preprocessing"]["fmri"]["standardize"] == "zscore_sample"
+    standardize = cfg.get("preprocessing", {}).get("fmri", {}).get("standardize", "none") == "zscore_sample"
 
     bf_cfg = cfg.get("brainflow", {})
     num_trial = args.num_trial or bf_cfg.get("num_trial", 1)
@@ -162,74 +169,93 @@ def main():
     total_clips = 0
     total_trs = 0
 
-    # Discover clips from PCA features dir (same clips that training uses)
-    pca_dir = Path(PROJECT_ROOT) / cfg.get("pca_features", {}).get("output_dir", "Data/pca_features")
+    for subject in subjects:
+        subject_id = 0 if not vae_use_subject else subjects.index(subject)
 
-    for task, task_splits in splits_cfg.items():
-        for split_name, stim_types in task_splits.items():
-            for stim_type in stim_types:
-                # Check PCA features exist for this stim
-                pca_stim_dir = pca_dir / task / stim_type
-                if not pca_stim_dir.exists():
-                    logger.debug("No PCA dir: %s", pca_stim_dir)
-                    continue
+        for task in splits_cfg.keys():
+            # Load fMRI H5 file for this subject/task
+            fmri_path = _get_fmri_filepath(fmri_dir, subject, task)
+            if not fmri_path.exists():
+                logger.warning("fMRI file not found: %s", fmri_path)
+                continue
 
-                clip_names = sorted(p.stem for p in pca_stim_dir.glob("*.npy"))
+            # Get all stim_types from splits (train + test)
+            all_stim_types = []
+            for split_name, stim_types in splits_cfg[task].items():
+                all_stim_types.extend(stim_types)
 
-                for clip_name in tqdm(clip_names, desc=f"{task}/{stim_type}"):
-                    # Determine fMRI key
-                    fmri_key = clip_name
-                    if task == "friends" and clip_name.startswith("friends_"):
-                        fmri_key = clip_name[len("friends_"):]
-                    elif task == "movie10" and clip_name.startswith("movie10_"):
-                        fmri_key = clip_name[len("movie10_"):]
+            with h5py.File(fmri_path, "r") as f:
+                all_keys = sorted(f.keys())
+                logger.info("Task %s: %d clips in fMRI H5", task, len(all_keys))
 
-                    for subject in subjects:
-                        subject_id = 0 if not vae_use_subject else subjects.index(subject)
+                for clip_key in tqdm(all_keys, desc=f"{subject}/{task}"):
+                    # Determine stim_type for this clip
+                    stim_type = None
 
-                        # Output path
-                        out_path = latent_dir / subject / task / stim_type / f"{clip_name}.npy"
-                        if out_path.exists():
-                            total_clips += 1
-                            continue
+                    if task == "friends":
+                        # Keys like "ses-001_task-s01e02a"
+                        # Extract episode name after "task-": "s01e02a"
+                        # Season = "s" + first 2 digits = "s01" → map to "s1"
+                        import re
+                        m = re.search(r'task-s(\d+)e', clip_key)
+                        if m:
+                            season_num = int(m.group(1))
+                            season_key = f"s{season_num}"
+                            if season_key in all_stim_types:
+                                stim_type = season_key
+                    else:
+                        # movie10: keys like "bourne_01", stim_types like "bourne"
+                        for st in all_stim_types:
+                            if st in clip_key:
+                                stim_type = st
+                                break
 
-                        # Load fMRI
-                        fmri_path = _get_fmri_filepath(fmri_dir, subject, task)
-                        if not fmri_path.exists():
-                            continue
+                    if stim_type is None:
+                        continue
 
-                        try:
-                            with h5py.File(fmri_path, "r") as f:
-                                matched = [k for k in f.keys() if fmri_key in k]
-                                if not matched:
-                                    continue
-                                raw = f[matched[0]]
-                                end = len(raw) - excl_end if excl_end > 0 else len(raw)
-                                data = raw[excl_start:end].astype(np.float32)
-                        except Exception as e:
-                            logger.warning("Skip %s/%s: %s", subject, clip_name, e)
-                            continue
+                    # Normalize clip key to match feature NPY convention
+                    # "ses-003_task-s01e01a" → "s01e01a"
+                    # "ses-001_task-bourne01" → "bourne01"
+                    # "ses-001_task-figures01_run-1" → "figures01" (strip _run-X)
+                    import re
+                    clip_name = re.sub(r'^ses-\d+_task-', '', clip_key)
+                    clip_name = re.sub(r'_run-\d+$', '', clip_name)
 
-                        if standardize:
-                            mean = data.mean(axis=0, keepdims=True)
-                            std = data.std(axis=0, keepdims=True)
-                            std = np.where(std < 1e-8, 1.0, std)
-                            data = (data - mean) / std
-
-                        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-
-                        # Encode
-                        latent = encode_clip(
-                            vae, data, subject_id, device,
-                            num_trial=num_trial,
-                        )  # (n_trs, Z)
-
-                        # Save
-                        out_path.parent.mkdir(parents=True, exist_ok=True)
-                        np.save(out_path, latent)
-
+                    # Output path
+                    out_path = latent_dir / subject / task / stim_type / f"{clip_name}.npy"
+                    if out_path.exists():
                         total_clips += 1
-                        total_trs += latent.shape[0]
+                        continue
+
+                    # Load fMRI data
+                    try:
+                        raw = f[clip_key]
+                        end = len(raw) - excl_end if excl_end > 0 else len(raw)
+                        data = raw[excl_start:end].astype(np.float32)
+                    except Exception as e:
+                        logger.warning("Skip %s/%s: %s", subject, clip_key, e)
+                        continue
+
+                    if standardize:
+                        mean = data.mean(axis=0, keepdims=True)
+                        std = data.std(axis=0, keepdims=True)
+                        std = np.where(std < 1e-8, 1.0, std)
+                        data = (data - mean) / std
+
+                    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+
+                    # Encode through VAE
+                    latent = encode_clip(
+                        vae, data, subject_id, device,
+                        num_trial=num_trial,
+                    )  # (n_trs, Z)
+
+                    # Save
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    np.save(out_path, latent)
+
+                    total_clips += 1
+                    total_trs += latent.shape[0]
 
     logger.info("Done! %d clips, %d total TRs encoded to %s",
                 total_clips, total_trs, latent_dir)
