@@ -74,22 +74,22 @@ brainflow:
 
   # Encoder: TRIBE-style (per-modality MLP + Transformer)
   encoder:
-    hidden_dim: 1024         # Transformer d_model (768→1024)
-    n_layers: 6              # Transformer layers (4→6)
+    hidden_dim: 512          # Transformer d_model (reduced from 1024)
+    n_layers: 4              # Transformer layers (reduced from 6)
     n_heads: 8
-    dropout: 0.1             # Reduced from 0.2
-    modality_dropout: 0.15   # Reduced from 0.3
+    dropout: 0.2             # Increased back to 0.2 for heavy regularization
+    modality_dropout: 0.3    # Increased back to 0.3 to enforce modality robustness
 
   # Decoder: DiT or unet
   decoder_type: dit          # "dit" or "unet"
 
   # DiT decoder params
   decoder:
-    hidden_dim: 768          # DiT block hidden dim (256→768)
-    n_blocks: 12             # DiT blocks (6→12)
-    n_heads: 8
-    dropout: 0.1             # Reduced from 0.2
-    use_cross_attention: true
+    hidden_dim: 384          # DiT block hidden dim (reduced from 768)
+    n_blocks: 6              # Reduced from 8 to limit capacity
+    n_heads: 6
+    dropout: 0.2             # Increased back to 0.2 to prevent overfitting
+    use_cross_attention: false # Disabled! Cross-attention without pos-emb smears temporally aligned sequences. AdaLN handles it perfectly.
 
   cfm:
     solver: euler
@@ -102,8 +102,8 @@ brainflow:
 # =====================================================================
 training:
   n_epochs: 300
-  lr: 3.0e-4                 # Increased (1e-4→3e-4) for larger model
-  weight_decay: 0.01          # Reduced (0.05→0.01)
+  lr: 1.0e-4                 # Restored to 1e-4 for stable CFM training
+  weight_decay: 0.1          # Increased to 0.1 (fMRI needs heavy L2 reg to avoid noise memorization)
   warmup_ratio: 0.05
   grad_clip: 1.0
   use_amp: true

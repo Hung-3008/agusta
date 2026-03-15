@@ -240,8 +240,9 @@ class AdaLNZero(nn.Module):
             nn.SiLU(),
             nn.Linear(cond_dim, 6 * hidden_dim, bias=True),
         )
-        # Small-init for faster convergence (not zero-init which blocks learning)
-        nn.init.normal_(self.mlp[-1].weight, std=0.02)
+        # Zero-init weight for stable identity-start (DiT paper design)
+        # Non-zero bias to break symmetry and allow initial learning signal
+        nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, c: torch.Tensor) -> tuple:
@@ -254,7 +255,14 @@ class AdaLNZero(nn.Module):
         params = self.mlp(c)  # (B, 6*H) or (B, T, 6*H)
         if params.ndim == 2:
             params = params.unsqueeze(1)  # (B, 1, 6*H) for broadcast
-        return params.chunk(6, dim=-1)
+        chunks = params.chunk(6, dim=-1)
+        # Clamp γ and α to prevent runaway modulation (NaN prevention)
+        γ1, β1, α1, γ2, β2, α2 = chunks
+        γ1 = γ1.clamp(-5, 5)
+        α1 = α1.clamp(-5, 5)
+        γ2 = γ2.clamp(-5, 5)
+        α2 = α2.clamp(-5, 5)
+        return γ1, β1, α1, γ2, β2, α2
 
 
 class DiTBlock(nn.Module):
@@ -321,7 +329,7 @@ class DiTBlock(nn.Module):
         cond_seq: Optional[torch.Tensor] = None,  # (B, T_cond, H_cond) — for cross-attn
     ) -> torch.Tensor:
         # AdaLN-Zero params
-        γ1, β1, α1, γ2, β2, α2 = self.adaln(c)  # each (B, 1, H)
+        γ1, β1, α1, γ2, β2, α2 = self.adaln(c)  # each (B, 1, H) or (B, T, H)
 
         # 1. Self-Attention with AdaLN modulation and RoPE
         h = self.norm1(x)
@@ -430,7 +438,7 @@ class DiTVelocityNet(nn.Module):
         # RoPE embedding (no more absolute pos_embed)
         self.rope = RotaryEmbedding(dim=hidden_dim // n_heads)
 
-        # DiT blocks
+        # DiT blocks (stable via zero-init AdaLN + clamp + bf16)
         self.blocks = nn.ModuleList([
             DiTBlock(
                 hidden_dim=hidden_dim,

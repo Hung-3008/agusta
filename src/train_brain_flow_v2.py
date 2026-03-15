@@ -411,7 +411,7 @@ def train(args):
         pct_start=tr_cfg["warmup_ratio"],
     )
 
-    scaler = torch.amp.GradScaler("cuda", enabled=tr_cfg["use_amp"])
+    # No GradScaler needed for bf16 (same exponent range as fp32)
 
     # 5. Output dir
     out_dir = Path(PROJECT_ROOT) / cfg.get("output_dir", "outputs/brain_flow_v2")
@@ -447,15 +447,13 @@ def train(args):
                 for b, vl in enumerate(batch["valid_len"]):
                     mask[b, 0, int(vl):] = 0.0
 
-            with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"]):
+            with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
                 loss = model(mod_features, latents, mask=mask)
 
             optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), tr_cfg["grad_clip"])
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             scheduler.step()
 
             train_losses.append(loss.item())
