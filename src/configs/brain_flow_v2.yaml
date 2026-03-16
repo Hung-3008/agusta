@@ -119,6 +119,10 @@ training:
   prior_weight_start: 1.0     # Phase 1: strong prior focus
   prior_weight_end: 0.1       # Phase 2: mostly flow matching
   prior_anneal_epochs: 100    # Anneal over first N epochs
+  # Data augmentation
+  latent_noise_scale: 0.05    # Gaussian noise on target latents (VAE sampling sim)
+  mixup_alpha: 0.2            # Beta distribution α for mixup (0=off)
+  reg_weight: 0.1             # Direct fMRI regression loss weight (auxiliary)
 
 # --- Output ---
 output_dir: outputs/brain_flow_v2_new_cond_fixed

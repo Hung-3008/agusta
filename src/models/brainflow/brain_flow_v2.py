@@ -704,6 +704,7 @@ class BrainFlowCFMv2(nn.Module):
         decoder_params: dict = None,
         cfm_params: dict = None,
         cfg_drop_prob: float = 0.1,
+        n_voxels: int = 1000,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -747,6 +748,13 @@ class BrainFlowCFMv2(nn.Module):
                 spk_emb_dim=0,
             )
 
+        # Direct fMRI regression head (auxiliary, TRIBE-style)
+        self.fmri_head = nn.Sequential(
+            nn.Linear(cond_dim, cond_dim),
+            nn.GELU(),
+            nn.Linear(cond_dim, n_voxels),
+        )
+
     def _encode_condition(
         self,
         modality_features: dict[str, torch.Tensor],
@@ -763,12 +771,14 @@ class BrainFlowCFMv2(nn.Module):
         modality_features: dict[str, torch.Tensor],  # {mod: (B, T, D_mod)}
         latent: torch.Tensor,                          # (B, T, Z)
         mask: torch.Tensor = None,                     # (B, 1, T)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute CFM loss and prior loss.
+        fmri_target: torch.Tensor = None,              # (B, T, V) optional
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute CFM loss, prior loss, and optional fMRI regression loss.
 
         Returns:
             diff_loss: scalar CFM flow matching loss.
             prior_loss: scalar MSE between mu_cond and target latent.
+            reg_loss: scalar MSE between fMRI prediction and target (0 if no target).
         """
         B, T, _ = latent.shape
 
@@ -791,16 +801,21 @@ class BrainFlowCFMv2(nn.Module):
         mu_cond = self.cond_to_mu(cond_aligned)  # (B, T_lat, Z)
 
         # Prior loss: push mu towards target latent (Matcha-TTS style)
-        # Computed BEFORE CFG dropout so encoder always receives gradient
         mask_T = mask.transpose(1, 2)  # (B, T, 1)
         prior_loss = F.mse_loss(mu_cond * mask_T, latent * mask_T)
+
+        # 3. Direct fMRI regression (auxiliary, TRIBE-style)
+        reg_loss = torch.tensor(0.0, device=latent.device)
+        if fmri_target is not None:
+            fmri_pred = self.fmri_head(cond_aligned)  # (B, T, V)
+            reg_loss = F.mse_loss(fmri_pred * mask_T, fmri_target * mask_T)
 
         # Also zero mu_cond for dropped samples (bypass projection bias)
         if cfg_keep is not None:
             mu_cond = mu_cond * cfg_keep
         mu_cond = mu_cond.transpose(1, 2)    # (B, Z, T_lat)
 
-        # 3. CFM loss
+        # 4. CFM loss
         latent_T = latent.transpose(1, 2)  # (B, Z, T)
 
         if self.decoder_type == "dit":
@@ -810,7 +825,7 @@ class BrainFlowCFMv2(nn.Module):
         else:
             diff_loss, _ = self.decoder.compute_loss(x1=latent_T, mask=mask, mu=mu_cond)
 
-        return diff_loss, prior_loss
+        return diff_loss, prior_loss, reg_loss
 
     @torch.inference_mode()
     def synthesise(

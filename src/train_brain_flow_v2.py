@@ -279,7 +279,7 @@ class BrainFlowV2Dataset(Dataset):
                 dim = mod_cfg.get("dim", 1024)
                 mod_features[mod_name] = torch.zeros(self.feat_seq_len, dim, dtype=torch.float32)
 
-        # Load latent
+        # Load latent (mu) and optionally logvar for posterior sampling
         subj = self.subjects[0]
         lat_path = self.latent_dir / subj / task / stim_type / f"{norm_name}.npy"
         if not lat_path.exists():
@@ -290,8 +290,25 @@ class BrainFlowV2Dataset(Dataset):
             pad = self.seq_len - actual_len
             lat_data = np.pad(lat_data, ((0, pad), (0, 0)), mode="constant")
 
+        latent = torch.from_numpy(lat_data.copy())
+
+        # Online posterior sampling: z = μ + σε (train only)
+        if self.split == "train":
+            logvar_name = f"{norm_name}_logvar.npy"
+            logvar_path = lat_path.parent / logvar_name
+            if not logvar_path.exists():
+                logvar_name = f"{clip_stem}_logvar.npy"
+                logvar_path = lat_path.parent / logvar_name
+            if logvar_path.exists():
+                logvar_data = np.load(logvar_path, mmap_mode="r")[start:end].astype(np.float32)
+                if actual_len < self.seq_len:
+                    logvar_data = np.pad(logvar_data, ((0, pad), (0, 0)), mode="constant")
+                logvar = torch.from_numpy(logvar_data.copy())
+                # Reparameterize: z = μ + exp(0.5 * logvar) * ε
+                latent = latent + torch.exp(0.5 * logvar) * torch.randn_like(latent)
+
         result = {
-            "latent": torch.from_numpy(lat_data.copy()),
+            "latent": latent,
             "valid_len": actual_len,
             "clip_key": f"{task}/{stim_type}/{norm_name}",
             "start_idx": start,
@@ -299,15 +316,14 @@ class BrainFlowV2Dataset(Dataset):
         }
         result.update(mod_features)  # mod_name → (T, D_mod)
 
-        # For val: also load ground truth fMRI
-        if self.split == "val":
-            fmri_data = self._load_fmri_clip(subj, task, norm_name)
-            if fmri_data is not None:
-                fmri_window = fmri_data[start:end].astype(np.float32)
-                if actual_len < self.seq_len:
-                    pad = self.seq_len - actual_len
-                    fmri_window = np.pad(fmri_window, ((0, pad), (0, 0)), mode="constant")
-                result["fmri"] = torch.from_numpy(fmri_window.copy())
+        # Load ground truth fMRI (for regression head + val evaluation)
+        fmri_data = self._load_fmri_clip(subj, task, norm_name)
+        if fmri_data is not None:
+            fmri_window = fmri_data[start:end].astype(np.float32)
+            if actual_len < self.seq_len:
+                pad = self.seq_len - actual_len
+                fmri_window = np.pad(fmri_window, ((0, pad), (0, 0)), mode="constant")
+            result["fmri"] = torch.from_numpy(fmri_window.copy())
 
         return result
 
@@ -523,6 +539,7 @@ def train(args):
         decoder_params=bf_cfg["decoder"],
         cfm_params=bf_cfg["cfm"],
         cfg_drop_prob=bf_cfg.get("cfg_drop_prob", 0.1),
+        n_voxels=cfg["fmri"].get("n_voxels", 1000),
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -579,13 +596,14 @@ def train(args):
 
     history_file = out_dir / "history.csv"
     with open(history_file, "w") as f:
-        f.write("epoch,train_loss,train_diff_loss,train_prior_loss,prior_weight,val_latent_pearson,val_fmri_pcc,lr\n")
+        f.write("epoch,train_loss,train_diff_loss,train_prior_loss,train_reg_loss,prior_weight,val_latent_pearson,val_fmri_pcc,lr\n")
 
     for epoch in range(1, tr_cfg["n_epochs"] + 1):
         model.train()
         train_losses = []
         train_diff_losses = []
         train_prior_losses = []
+        train_reg_losses = []
 
         # Prior weight annealing: linear from start → end over anneal_epochs
         pw_start = tr_cfg.get("prior_weight_start", 1.0)
@@ -601,6 +619,7 @@ def train(args):
 
             mod_features = _extract_modality_features(batch, modality_names, device)
             latents = batch["latent"].to(device)
+            fmri = batch["fmri"].to(device) if "fmri" in batch else None
 
             # Build CFM mask
             B, T, _ = latents.shape
@@ -609,9 +628,28 @@ def train(args):
                 for b, vl in enumerate(batch["valid_len"]):
                     mask[b, 0, int(vl):] = 0.0
 
+            # --- Data Augmentation (train only) ---
+            # 1. Stochastic latent noise: simulate VAE sampling variability
+            latent_noise_scale = tr_cfg.get("latent_noise_scale", 0.0)
+            if latent_noise_scale > 0:
+                latents = latents + latent_noise_scale * torch.randn_like(latents)
+
+            # 2. Mixup: blend random pairs for smoother latent space
+            mixup_alpha = tr_cfg.get("mixup_alpha", 0.0)
+            if mixup_alpha > 0 and B > 1:
+                lam = np.random.beta(mixup_alpha, mixup_alpha)
+                perm = torch.randperm(B, device=device)
+                latents = lam * latents + (1 - lam) * latents[perm]
+                mask = torch.min(mask, mask[perm])  # conservative: valid only where both valid
+                for mod_name in mod_features:
+                    mod_features[mod_name] = lam * mod_features[mod_name] + (1 - lam) * mod_features[mod_name][perm]
+                if fmri is not None:
+                    fmri = lam * fmri + (1 - lam) * fmri[perm]
+
+            reg_weight = tr_cfg.get("reg_weight", 0.1)
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
-                diff_loss, prior_loss = model(mod_features, latents, mask=mask)
-                loss = diff_loss + prior_weight * prior_loss
+                diff_loss, prior_loss, reg_loss = model(mod_features, latents, mask=mask, fmri_target=fmri)
+                loss = diff_loss + prior_weight * prior_loss + reg_weight * reg_loss
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -622,6 +660,7 @@ def train(args):
             train_losses.append(loss.item())
             train_diff_losses.append(diff_loss.item())
             train_prior_losses.append(prior_loss.item())
+            train_reg_losses.append(reg_loss.item())
             global_step += 1
 
             # EMA update
@@ -631,7 +670,7 @@ def train(args):
                 pbar.set_postfix({
                     "loss": f"{np.mean(train_losses[-50:]):.4f}",
                     "diff": f"{np.mean(train_diff_losses[-50:]):.4f}",
-                    "prior": f"{np.mean(train_prior_losses[-50:]):.4f}",
+                    "reg": f"{np.mean(train_reg_losses[-50:]):.4f}",
                     "pw": f"{prior_weight:.2f}",
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                 })
@@ -774,9 +813,10 @@ def train(args):
             mean_train_loss = float(np.mean(train_losses))
             mean_diff_loss = float(np.mean(train_diff_losses))
             mean_prior_loss = float(np.mean(train_prior_losses))
+            mean_reg_loss = float(np.mean(train_reg_losses))
             current_lr = scheduler.get_last_lr()[0]
             with open(history_file, "a") as f:
-                f.write(f"{epoch},{mean_train_loss:.6f},{mean_diff_loss:.6f},{mean_prior_loss:.6f},{prior_weight:.4f},{mean_corr:.6f},{mean_fmri_corr:.6f},{current_lr:.2e}\n")
+                f.write(f"{epoch},{mean_train_loss:.6f},{mean_diff_loss:.6f},{mean_prior_loss:.6f},{mean_reg_loss:.6f},{prior_weight:.4f},{mean_corr:.6f},{mean_fmri_corr:.6f},{current_lr:.2e}\n")
 
             # Restore original weights after validation
             ema.restore(model)

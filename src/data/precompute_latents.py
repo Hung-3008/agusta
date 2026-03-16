@@ -73,7 +73,8 @@ def encode_clip(
     vae, fmri_data: np.ndarray, subject_id: int,
     device: torch.device, num_trial: int = 1,
     chunk_size: int = 200,
-) -> np.ndarray:
+    return_logvar: bool = False,
+) -> tuple[np.ndarray, np.ndarray | None]:
     """Encode a full clip's fMRI to latent space.
 
     Parameters
@@ -86,13 +87,17 @@ def encode_clip(
         1 = deterministic μ, >1 = sample and average.
     chunk_size : int
         Max TRs to encode at once (avoids OOM for long clips).
+    return_logvar : bool
+        If True, also return log_var for posterior sampling.
 
     Returns
     -------
     latent : (n_trs, latent_dim) float32
+    logvar : (n_trs, latent_dim) float32 or None
     """
     n_trs = fmri_data.shape[0]
     all_latents = []
+    all_logvars = [] if return_logvar else None
 
     for start in range(0, n_trs, chunk_size):
         end = min(start + chunk_size, n_trs)
@@ -102,6 +107,9 @@ def encode_clip(
         if num_trial <= 1:
             # Deterministic: just use μ
             z = vae.get_latent(chunk, sid)  # (1, T_chunk, Z)
+            if return_logvar:
+                _, mu_out, logvar = vae.encode(chunk, sid)
+                all_logvars.append(logvar.squeeze(0).cpu().numpy())
         else:
             # Multi-trial averaging
             zs = []
@@ -111,10 +119,15 @@ def encode_clip(
                 zs.append(z_sample)
             vae.eval()
             z = torch.stack(zs).mean(dim=0)  # (1, T_chunk, Z)
+            if return_logvar:
+                _, mu_out, logvar = vae.encode(chunk, sid)
+                all_logvars.append(logvar.squeeze(0).cpu().numpy())
 
         all_latents.append(z.squeeze(0).cpu().numpy())  # (T_chunk, Z)
 
-    return np.concatenate(all_latents, axis=0)  # (n_trs, Z)
+    latent = np.concatenate(all_latents, axis=0)  # (n_trs, Z)
+    logvar_out = np.concatenate(all_logvars, axis=0) if return_logvar else None
+    return latent, logvar_out
 
 
 def main():
@@ -223,7 +236,8 @@ def main():
 
                     # Output path
                     out_path = latent_dir / subject / task / stim_type / f"{clip_name}.npy"
-                    if out_path.exists():
+                    logvar_path = out_path.parent / f"{clip_name}_logvar.npy"
+                    if out_path.exists() and logvar_path.exists():
                         total_clips += 1
                         continue
 
@@ -245,14 +259,20 @@ def main():
                     data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
 
                     # Encode through VAE
-                    latent = encode_clip(
+                    latent, logvar = encode_clip(
                         vae, data, subject_id, device,
                         num_trial=num_trial,
+                        return_logvar=True,
                     )  # (n_trs, Z)
 
-                    # Save
+                    # Save mu (latent)
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     np.save(out_path, latent)
+
+                    # Save logvar for posterior sampling
+                    if logvar is not None:
+                        logvar_path = out_path.parent / f"{clip_name}_logvar.npy"
+                        np.save(logvar_path, logvar)
 
                     total_clips += 1
                     total_trs += latent.shape[0]
