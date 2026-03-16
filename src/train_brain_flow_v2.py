@@ -7,9 +7,12 @@ Usage:
 
 import argparse
 import logging
+import copy
+import math as pymath
 import random
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 from functools import lru_cache
 
@@ -17,7 +20,7 @@ import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
 from scipy.stats import pearsonr
@@ -69,8 +72,14 @@ class BrainFlowV2Dataset(Dataset):
         # Directories
         self.latent_dir = Path(PROJECT_ROOT) / cfg["latent_dir"]
         self.features_dir = Path(PROJECT_ROOT) / cfg["raw_features"]["dir"]
+        self.layer_aggregation = cfg["raw_features"].get("layer_aggregation", "mean")
         npy_dir = cfg.get("raw_features_npy_dir")
-        self.features_npy_dir = Path(PROJECT_ROOT) / npy_dir if npy_dir else None
+        if npy_dir:
+            if self.layer_aggregation == "cat":
+                npy_dir = f"{npy_dir}_{self.layer_aggregation}"
+            self.features_npy_dir = Path(PROJECT_ROOT) / npy_dir
+        else:
+            self.features_npy_dir = None
         self.fmri_dir = Path(cfg["_fmri_dir"])
 
         # fMRI params
@@ -89,13 +98,24 @@ class BrainFlowV2Dataset(Dataset):
         self.seq_len = max(1, int(round(self.context_dur / self.tr)))
         self.stride = max(1, int(round(self.stride_dur / self.tr)))
 
+        # Causal feature context: extra past TRs for feature input
+        self.feature_context_trs = cfg["sliding_window"].get("feature_context_trs", 0)
+        self.feat_seq_len = self.seq_len + self.feature_context_trs
+
         # HRF delay: features at TR t-delay correspond to fMRI at TR t
         self.hrf_delay = cfg["fmri"].get("hrf_delay", 3)
+
+        # Temporal jitter: random ±N TR offset on feature windows (train only)
+        self.temporal_jitter = cfg["sliding_window"].get("temporal_jitter", 0) if split == "train" else 0
 
         self.samples = self._build_index()
 
         # Cache for opened H5 files (val only)
         self._fmri_cache = {}
+
+        # In-memory LRU cache for NPY feature clips
+        # Key: (mod_name, task, stim_type, norm_name) → np.ndarray
+        self._feat_cache = {}
 
     def _normalize_clip_name(self, clip_name: str, task: str) -> str:
         """Strip task prefix from clip name."""
@@ -205,16 +225,35 @@ class BrainFlowV2Dataset(Dataset):
         feat_start = start - self.hrf_delay
         feat_end = end - self.hrf_delay
 
+        # Temporal jitter: random ±N TR offset (train only)
+        if self.temporal_jitter > 0:
+            jitter = random.randint(-self.temporal_jitter, self.temporal_jitter)
+            feat_start = max(0, feat_start + jitter)
+            feat_end = feat_start + actual_len
+
+        # Extended causal context: load extra past TRs of features
+        context_start = max(0, feat_start - self.feature_context_trs)
+        target_feat_len = actual_len + self.feature_context_trs
+
         # Load per-modality features
         mod_features = {}
         for mod_name, mod_cfg in self.modalities.items():
             try:
                 feat = None
-                # Try NPY first (fast path)
+                # Try NPY first (fast path) with in-memory cache
                 if self.features_npy_dir is not None:
-                    npy_path = self.features_npy_dir / mod_name / task / stim_type / f"{norm_name}.npy"
-                    if npy_path.exists():
-                        feat = np.load(npy_path, mmap_mode="r")[feat_start:feat_end].astype(np.float32)
+                    cache_key = (mod_name, task, stim_type, norm_name)
+                    if cache_key in self._feat_cache:
+                        clip_data = self._feat_cache[cache_key]
+                    else:
+                        npy_path = self.features_npy_dir / mod_name / task / stim_type / f"{norm_name}.npy"
+                        if npy_path.exists():
+                            clip_data = np.load(npy_path)  # Load fully into RAM
+                            self._feat_cache[cache_key] = clip_data
+                        else:
+                            clip_data = None
+                    if clip_data is not None:
+                        feat = clip_data[context_start:feat_end].astype(np.float32)
 
                 # Fallback to H5 (slow path)
                 if feat is None:
@@ -223,17 +262,22 @@ class BrainFlowV2Dataset(Dataset):
                         task, stim_type, clip_stem, self.layer_aggregation,
                     )
                     raw = resample_features_to_tr(raw, self.feature_freq, self.tr, n_trs)
-                    feat = raw[0].T[feat_start:feat_end].astype(np.float32)  # (n_trs, dim) → window
+                    feat = raw[0].T[context_start:feat_end].astype(np.float32)
 
-                # Zero-pad if short
-                if actual_len < self.seq_len:
-                    pad = self.seq_len - actual_len
+                # Left-pad with zeros if not enough past context
+                if feat.shape[0] < target_feat_len:
+                    pad_len = target_feat_len - feat.shape[0]
+                    feat = np.pad(feat, ((pad_len, 0), (0, 0)), mode="constant")
+
+                # Right-pad if short clip at end
+                if feat.shape[0] < self.feat_seq_len:
+                    pad = self.feat_seq_len - feat.shape[0]
                     feat = np.pad(feat, ((0, pad), (0, 0)), mode="constant")
 
                 mod_features[mod_name] = torch.from_numpy(feat.copy())
             except (FileNotFoundError, KeyError, ValueError) as e:
                 dim = mod_cfg.get("dim", 1024)
-                mod_features[mod_name] = torch.zeros(self.seq_len, dim, dtype=torch.float32)
+                mod_features[mod_name] = torch.zeros(self.feat_seq_len, dim, dtype=torch.float32)
 
         # Load latent
         subj = self.subjects[0]
@@ -268,24 +312,77 @@ class BrainFlowV2Dataset(Dataset):
         return result
 
 
+class ClipGroupedBatchSampler(Sampler):
+    """Groups windows from the same clip into the same batch.
+
+    On HDD, random access across many files is the bottleneck.
+    By grouping windows from the same clip, each NPY file is
+    loaded once per batch → sequential reads instead of random seeks.
+    Clips are shuffled each epoch, but windows within a clip are sequential.
+    """
+
+    def __init__(self, dataset, batch_size, drop_last=True):
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+
+        # Group sample indices by clip
+        self.clip_groups = defaultdict(list)
+        for idx, info in enumerate(dataset.samples):
+            clip_key = (info["task"], info["stim_type"], info["clip_stem"])
+            self.clip_groups[clip_key].append(idx)
+
+        self.clip_keys = list(self.clip_groups.keys())
+
+    def __iter__(self):
+        # Shuffle clip order each epoch
+        clip_order = list(self.clip_keys)
+        random.shuffle(clip_order)
+
+        # Collect all indices in clip-grouped order
+        all_indices = []
+        for clip_key in clip_order:
+            indices = self.clip_groups[clip_key]
+            random.shuffle(indices)  # Shuffle within clip
+            all_indices.extend(indices)
+
+        # Yield batches
+        batch = []
+        for idx in all_indices:
+            batch.append(idx)
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+        if batch and not self.drop_last:
+            yield batch
+
+    def __len__(self):
+        n = len(sum(self.clip_groups.values(), []))
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size
+
+
 def get_dataloaders(cfg):
     train_set = BrainFlowV2Dataset(cfg, split="train")
     val_set = BrainFlowV2Dataset(cfg, split="val")
 
     dl_cfg = cfg["dataloader"]
+    batch_size = dl_cfg["batch_size"]
+
+    # Use clip-grouped sampler to minimize HDD random seeks
+    train_sampler = ClipGroupedBatchSampler(train_set, batch_size, drop_last=True)
+
     train_loader = DataLoader(
         train_set,
-        batch_size=dl_cfg["batch_size"],
-        shuffle=True,
-        num_workers=dl_cfg["num_workers"],
+        batch_sampler=train_sampler,
+        num_workers=0,  # Single process for in-memory cache efficiency
         pin_memory=dl_cfg["pin_memory"],
-        drop_last=True,
     )
     val_loader = DataLoader(
         val_set,
         batch_size=dl_cfg["val_batch_size"],
         shuffle=False,
-        num_workers=dl_cfg["num_workers"],
+        num_workers=0,  # Single process for in-memory cache efficiency
         pin_memory=dl_cfg["pin_memory"],
         drop_last=False,
     )
@@ -338,6 +435,53 @@ def _extract_modality_features(batch, modality_names, device):
         if mod_name in batch:
             mod_features[mod_name] = batch[mod_name].to(device)
     return mod_features
+
+
+# =============================================================================
+# EMA Model
+# =============================================================================
+
+class EMAModel:
+    """Exponential Moving Average of model weights for stable inference.
+
+    Maintains a shadow copy of model parameters updated as:
+        shadow = decay * shadow + (1 - decay) * current
+    """
+
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    @torch.no_grad()
+    def update(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
+
+    def apply_shadow(self, model):
+        """Replace model params with EMA params (for eval)."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    def restore(self, model):
+        """Restore original params (after eval)."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+
+    def state_dict(self):
+        return {"shadow": self.shadow, "decay": self.decay}
+
+    def load_state_dict(self, state_dict):
+        self.shadow = state_dict["shadow"]
+        self.decay = state_dict["decay"]
 
 
 def train(args):
@@ -404,12 +548,16 @@ def train(args):
     if args.fast_dev_run:
         total_steps = 2
 
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=tr_cfg["lr"],
-        total_steps=total_steps,
-        pct_start=tr_cfg["warmup_ratio"],
-    )
+    warmup_steps = int(total_steps * tr_cfg.get("warmup_ratio", 0.05))
+    min_lr = tr_cfg.get("min_lr", 1e-6)
+
+    def cosine_with_warmup(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return min_lr / tr_cfg["lr"] + (1 - min_lr / tr_cfg["lr"]) * 0.5 * (1 + pymath.cos(pymath.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_with_warmup)
 
     # No GradScaler needed for bf16 (same exponent range as fp32)
 
@@ -420,17 +568,31 @@ def train(args):
     # Modality names for extracting from batch
     modality_names = list(cfg["raw_features"]["modalities"].keys())
 
+    # EMA
+    ema_decay = tr_cfg.get("ema_decay", 0.999)
+    ema = EMAModel(model, decay=ema_decay)
+    logger.info("EMA initialized with decay=%.4f", ema_decay)
+
     # 6. Training Loop
     best_val_corr = -1.0
     global_step = 0
 
     history_file = out_dir / "history.csv"
     with open(history_file, "w") as f:
-        f.write("epoch,train_loss,val_latent_pearson,val_fmri_pcc,lr\n")
+        f.write("epoch,train_loss,train_diff_loss,train_prior_loss,prior_weight,val_latent_pearson,val_fmri_pcc,lr\n")
 
     for epoch in range(1, tr_cfg["n_epochs"] + 1):
         model.train()
         train_losses = []
+        train_diff_losses = []
+        train_prior_losses = []
+
+        # Prior weight annealing: linear from start → end over anneal_epochs
+        pw_start = tr_cfg.get("prior_weight_start", 1.0)
+        pw_end = tr_cfg.get("prior_weight_end", 0.1)
+        pw_anneal = tr_cfg.get("prior_anneal_epochs", 100)
+        progress = min(epoch / max(pw_anneal, 1), 1.0)
+        prior_weight = pw_start * (1 - progress) + pw_end * progress
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{tr_cfg['n_epochs']}")
         for batch_idx, batch in enumerate(pbar):
@@ -448,7 +610,8 @@ def train(args):
                     mask[b, 0, int(vl):] = 0.0
 
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
-                loss = model(mod_features, latents, mask=mask)
+                diff_loss, prior_loss = model(mod_features, latents, mask=mask)
+                loss = diff_loss + prior_weight * prior_loss
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -457,11 +620,19 @@ def train(args):
             scheduler.step()
 
             train_losses.append(loss.item())
+            train_diff_losses.append(diff_loss.item())
+            train_prior_losses.append(prior_loss.item())
             global_step += 1
+
+            # EMA update
+            ema.update(model)
 
             if global_step % tr_cfg["log_every_n_steps"] == 0:
                 pbar.set_postfix({
                     "loss": f"{np.mean(train_losses[-50:]):.4f}",
+                    "diff": f"{np.mean(train_diff_losses[-50:]):.4f}",
+                    "prior": f"{np.mean(train_prior_losses[-50:]):.4f}",
+                    "pw": f"{prior_weight:.2f}",
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                 })
 
@@ -469,6 +640,8 @@ def train(args):
         mean_corr = 0.0
         mean_fmri_corr = 0.0
         if epoch % tr_cfg["val_every_n_epochs"] == 0 or args.fast_dev_run:
+            # Use EMA weights for validation
+            ema.apply_shadow(model)
             model.eval()
 
             logger.info("Running validation...")
@@ -493,8 +666,10 @@ def train(args):
                     gen_latents = model.synthesise(
                         mod_features,
                         n_timesteps=50,
-                        temperature=0.8,
+                        temperature=0.0,  # Deterministic center-path ODE
                         guidance_scale=tr_cfg.get("guidance_scale", 1.5),
+                        n_output_trs=latents.shape[1],
+                        n_ensembles=1,
                     )
 
                     # Decode to fMRI if VAE available
@@ -592,28 +767,40 @@ def train(args):
             metric_for_best = mean_fmri_corr if vae is not None else mean_corr
             if metric_for_best > best_val_corr:
                 best_val_corr = metric_for_best
-                torch.save(model.state_dict(), out_dir / "best.pt")
-                logger.info("Saved new best model to %s", out_dir / "best.pt")
+                torch.save(model.state_dict(), out_dir / "best.pt")  # EMA weights
+                logger.info("Saved new best EMA model to %s", out_dir / "best.pt")
 
             # Save history
             mean_train_loss = float(np.mean(train_losses))
+            mean_diff_loss = float(np.mean(train_diff_losses))
+            mean_prior_loss = float(np.mean(train_prior_losses))
             current_lr = scheduler.get_last_lr()[0]
             with open(history_file, "a") as f:
-                f.write(f"{epoch},{mean_train_loss:.6f},{mean_corr:.6f},{mean_fmri_corr:.6f},{current_lr:.2e}\n")
+                f.write(f"{epoch},{mean_train_loss:.6f},{mean_diff_loss:.6f},{mean_prior_loss:.6f},{prior_weight:.4f},{mean_corr:.6f},{mean_fmri_corr:.6f},{current_lr:.2e}\n")
+
+            # Restore original weights after validation
+            ema.restore(model)
 
         torch.save({
             "epoch": epoch,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
+            "ema": ema.state_dict(),
         }, out_dir / "last.pt")
 
     logger.info("Training complete. Best val PCC: %.4f", best_val_corr)
 
 
 if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Path to brain_flow_v2.yaml")
+    parser.add_argument("--config", type=str, default="src/configs/brain_flow_v2.yaml")
     parser.add_argument("--fast_dev_run", action="store_true", help="Run 2 batches to test pipeline")
     args = parser.parse_args()
     train(args)

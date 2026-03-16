@@ -48,7 +48,12 @@ def main():
     subjects = cfg["subjects"]
     ref_subject = subjects[0]
 
-    output_dir = Path(PROJECT_ROOT) / cfg.get("raw_features_npy_dir", "Data/raw_features_npy")
+    # Change output dir based on layer aggregation to avoid mixing "mean" and "cat"
+    base_npy_dir = cfg.get("raw_features_npy_dir", "Data/raw_features_npy")
+    if layer_agg == "cat":
+        base_npy_dir = f"{base_npy_dir}_{layer_agg}"
+    
+    output_dir = Path(PROJECT_ROOT) / base_npy_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     splits_cfg = cfg.get("splits", {})

@@ -88,6 +88,28 @@ class RoPETransformerEncoderLayer(nn.Module):
 
 
 # =============================================================================
+# Residual MLP Block for Deep Projectors
+# =============================================================================
+
+class _ResidualBlock(nn.Module):
+    """Pre-norm residual MLP block: LN → Linear → GELU → Dropout → Linear + skip."""
+
+    def __init__(self, dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return x + self.mlp(self.norm(x))
+
+
+# =============================================================================
 # TRIBE-style Condition Encoder
 # =============================================================================
 
@@ -95,19 +117,19 @@ class MultiModalConditionEncoder(nn.Module):
     """Encode raw multimodal features into conditioning vectors.
 
     TRIBE-inspired design:
-      1. Per-modality MLP projectors: raw_dim → hidden_dim // N_modalities
+      1. Per-modality deep MLP projectors: raw_dim → hidden_dim // N_modalities
       2. Concatenate all modalities → (B, T, hidden_dim)
       3. Transformer encoder for temporal context
       4. Modality dropout for training robustness
 
     Args:
         modality_dims: dict mapping modality name → input dimension.
-            e.g. {"video": 5632, "audio": 1280, "text": 15360, "omni": 3584}
         hidden_dim: Transformer hidden dimension (default: 768).
         n_layers: Number of Transformer encoder layers (default: 4).
         n_heads: Number of attention heads (default: 8).
         dropout: Dropout rate (default: 0.1).
         modality_dropout: Probability of dropping an entire modality (default: 0.2).
+        projector_depth: Number of residual blocks in each per-modality projector (default: 1).
     """
 
     def __init__(
@@ -118,6 +140,7 @@ class MultiModalConditionEncoder(nn.Module):
         n_heads: int = 8,
         dropout: float = 0.1,
         modality_dropout: float = 0.2,
+        projector_depth: int = 1,
     ):
         super().__init__()
         self.modality_dims = modality_dims
@@ -125,19 +148,26 @@ class MultiModalConditionEncoder(nn.Module):
         self.modality_dropout = modality_dropout
         self.n_modalities = len(modality_dims)
 
-        # Per-modality MLP projectors
-        # Each modality projects raw_dim → hidden_dim (bottleneck) → per_mod_dim
+        # Per-modality deep MLP projectors with residual connections
         per_mod_dim = hidden_dim // self.n_modalities
         self.projectors = nn.ModuleDict()
         for mod_name, raw_dim in modality_dims.items():
-            self.projectors[mod_name] = nn.Sequential(
-                nn.Linear(raw_dim, hidden_dim),       # raw → full hidden (large bottleneck)
-                nn.LayerNorm(hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, per_mod_dim),    # hidden → per_mod_dim
-                nn.LayerNorm(per_mod_dim),
-            )
+            layers = []
+            # Initial projection: raw_dim → hidden_dim
+            layers.append(nn.Linear(raw_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(dropout))
+
+            # Residual blocks at hidden_dim
+            for _ in range(projector_depth - 1):
+                layers.append(_ResidualBlock(hidden_dim, dropout))
+
+            # Final projection: hidden_dim → per_mod_dim
+            layers.append(nn.Linear(hidden_dim, per_mod_dim))
+            layers.append(nn.LayerNorm(per_mod_dim))
+
+            self.projectors[mod_name] = nn.Sequential(*layers)
 
         # Actual hidden dim after concat (handle rounding)
         actual_hidden = per_mod_dim * self.n_modalities
@@ -296,19 +326,10 @@ class DiTBlock(nn.Module):
         self.proj = nn.Linear(hidden_dim, hidden_dim)
         self.attn_drop = dropout
 
-        # Cross-attention (optional)
-        self.use_cross_attention = use_cross_attention
-        if use_cross_attention:
-            cross_dim = cross_attention_dim or hidden_dim
-            self.norm_cross = nn.LayerNorm(hidden_dim, elementwise_affine=False)
-            self.cross_attn = nn.MultiheadAttention(
-                embed_dim=hidden_dim,
-                num_heads=n_heads,
-                kdim=cross_dim,
-                vdim=cross_dim,
-                dropout=dropout,
-                batch_first=True,
-            )
+        self.attn_drop = dropout
+
+        # We will use Joint Attention, so we no longer need separate cross-attention
+        self.use_cross_attention = False
 
         # FFN
         self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
@@ -322,22 +343,31 @@ class DiTBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,              # (B, T, H)
-        c: torch.Tensor,              # (B, cond_dim) — timestep + global cond
-        cos: torch.Tensor = None,     # (1, 1, T, head_dim) — RoPE frequencies
-        sin: torch.Tensor = None,     # (1, 1, T, head_dim) — RoPE frequencies
-        cond_seq: Optional[torch.Tensor] = None,  # (B, T_cond, H_cond) — for cross-attn
+        x: torch.Tensor,              # (B, T_lat, H)
+        c: torch.Tensor,              # (B, T_lat, H) — aligned AdaLN cond
+        cos: torch.Tensor = None,     # (1, 1, T_lat+T_feat, head_dim) — RoPE frequencies for joint sequence
+        sin: torch.Tensor = None,     # (1, 1, T_lat+T_feat, head_dim) — RoPE frequencies for joint sequence
+        cond_seq: Optional[torch.Tensor] = None,  # (B, T_feat, H) — mapped feature tokens
     ) -> torch.Tensor:
-        # AdaLN-Zero params
-        γ1, β1, α1, γ2, β2, α2 = self.adaln(c)  # each (B, 1, H) or (B, T, H)
+        # AdaLN-Zero params for latent tokens
+        γ1, β1, α1, γ2, β2, α2 = self.adaln(c)  # each (B, T_lat, H)
 
-        # 1. Self-Attention with AdaLN modulation and RoPE
-        h = self.norm1(x)
-        h = (1 + γ1) * h + β1
+        # 1. Normalize both streams
+        h_x = self.norm1(x)
+        h_x = (1 + γ1) * h_x + β1
         
-        B, T, C = h.shape
-        qkv = self.qkv(h).view(B, T, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]   # (B, n_heads, T, head_dim)
+        # Joint Attention mechanism
+        if cond_seq is not None:
+            # We don't apply AdaLN to features, just regular LayerNorm
+            h_c = self.norm1(cond_seq)
+            # Concatenate latent and condition tokens along sequence dimension
+            h_joint = torch.cat([h_x, h_c], dim=1)  # (B, T_lat + T_feat, H)
+        else:
+            h_joint = h_x
+
+        B, T_joint, C = h_joint.shape
+        qkv = self.qkv(h_joint).view(B, T_joint, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]   # (B, n_heads, T_joint, head_dim)
         
         if cos is not None and sin is not None:
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
@@ -346,23 +376,31 @@ class DiTBlock(nn.Module):
             q, k, v, 
             dropout_p=self.attn_drop if self.training else 0.0
         )
-        attn = attn.transpose(1, 2).reshape(B, T, C)
-        h = self.proj(attn)
-        x = x + α1 * h
+        attn = attn.transpose(1, 2).reshape(B, T_joint, C)
+        h_joint_out = self.proj(attn)
+        
+        # Split back: we only care about updating the latent tokens
+        T_lat = x.shape[1]
+        h_x_out = h_joint_out[:, :T_lat, :]
+        
+        if cond_seq is not None:
+            # Also update condition tokens for deep joint reasoning (they act as KV-cache for next layers)
+            h_c_out = h_joint_out[:, T_lat:, :]
+            cond_seq = cond_seq + h_c_out
+            
+        x = x + α1 * h_x_out
 
-        # 2. Cross-Attention (condition sequence)
-        if self.use_cross_attention and cond_seq is not None:
-            h = self.norm_cross(x)
-            h, _ = self.cross_attn(query=h, key=cond_seq, value=cond_seq)
-            x = x + h
-
-        # 3. FFN with AdaLN modulation
+        # 3. FFN with AdaLN modulation (only on latent tokens)
         h = self.norm2(x)
         h = (1 + γ2) * h + β2
         h = self.ffn(h)
         x = x + α2 * h
+        
+        if cond_seq is not None:
+            h_c = self.norm2(cond_seq)
+            cond_seq = cond_seq + self.ffn(h_c)
 
-        return x
+        return x, cond_seq
 
 
 class SinusoidalTimestepEmbedding(nn.Module):
@@ -429,8 +467,12 @@ class DiTVelocityNet(nn.Module):
         # Timestep embedding
         self.time_embed = SinusoidalTimestepEmbedding(hidden_dim)
 
-        # Global condition projection (mean-pooled cond_seq → cond vector)
-        self.cond_proj = nn.Linear(cond_dim, hidden_dim)
+        # Global condition projection (map cond_seq to internal hidden_dim if needed)
+        # Note: cond_seq is already mapped to H_cond by encoder.
+        if cond_dim != hidden_dim:
+            self.cond_proj = nn.Linear(cond_dim, hidden_dim)
+        else:
+            self.cond_proj = nn.Identity()
 
         # Total conditioning dim for AdaLN = timestep + global_cond
         adaln_cond_dim = hidden_dim  # combined via addition
@@ -445,8 +487,7 @@ class DiTVelocityNet(nn.Module):
                 cond_dim=adaln_cond_dim,
                 n_heads=n_heads,
                 dropout=dropout,
-                use_cross_attention=use_cross_attention,
-                cross_attention_dim=cond_dim,
+                use_cross_attention=False,
             )
             for _ in range(n_blocks)
         ])
@@ -473,28 +514,38 @@ class DiTVelocityNet(nn.Module):
         Returns:
             velocity: (B, latent_dim, T)
         """
-        B, _, T = x.shape
+        B, _, T_lat = x.shape
+        T_feat = cond_seq.shape[1] if cond_seq is not None else 0
 
         # Transpose to (B, T, latent_dim)
-        x = x.transpose(1, 2)          # (B, T, D)
-        mu_T = mu.transpose(1, 2)      # (B, T, D)
-        x = self.input_proj(x) + self.mu_proj(mu_T)  # (B, T, H) — add conditioning
+        x = x.transpose(1, 2)          # (B, T_lat, D)
+        mu_T = mu.transpose(1, 2)      # (B, T_lat, D)
+        x = self.input_proj(x) + self.mu_proj(mu_T)  # (B, T_lat, H)
 
-        # Get RoPE frequencies
-        cos, sin = self.rope(x, seq_dim=1)
-
-        # Conditioning: timestep + per-timestep condition
-        t_emb = self.time_embed(t)     # (B, H)
+        # Map condition sequence to hidden dimension
         if cond_seq is not None:
-            # Per-timestep conditioning (preserves temporal info)
-            c_per_t = self.cond_proj(cond_seq)   # (B, T_cond, H)
-            c = t_emb.unsqueeze(1) + c_per_t     # (B, T_cond, H)
+            cond_seq_mapped = self.cond_proj(cond_seq)  # (B, T_feat, H)
+        else:
+            cond_seq_mapped = None
+
+        # Create joint RoPE frequencies for [latent, features] sequence
+        # We need RoPE up to T_lat + T_feat
+        # We'll just generate RoPE once for the maximum possible length
+        dummy_seq = torch.zeros(1, T_lat + T_feat, self.hidden_dim, device=x.device, dtype=x.dtype)
+        cos, sin = self.rope(dummy_seq, seq_dim=1)
+
+        # Conditioning: timestep + aligned per-timestep condition
+        t_emb = self.time_embed(t)     # (B, H)
+        if cond_seq_mapped is not None:
+            # Use only aligned portion for AdaLN (last T positions, matching x)
+            cond_aligned = cond_seq_mapped[:, -T_lat:, :]  # (B, T_lat, H)
+            c = t_emb.unsqueeze(1) + cond_aligned     # (B, T_lat, H)
         else:
             c = t_emb
 
-        # DiT blocks
+        # DiT blocks with Joint Attention
         for block in self.blocks:
-            x = block(x, c, cos=cos, sin=sin, cond_seq=cond_seq)
+            x, cond_seq_mapped = block(x, c, cos=cos, sin=sin, cond_seq=cond_seq_mapped)
 
         # Output
         x = self.final_norm(x)
@@ -712,11 +763,12 @@ class BrainFlowCFMv2(nn.Module):
         modality_features: dict[str, torch.Tensor],  # {mod: (B, T, D_mod)}
         latent: torch.Tensor,                          # (B, T, Z)
         mask: torch.Tensor = None,                     # (B, 1, T)
-    ) -> torch.Tensor:
-        """Compute CFM loss.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute CFM loss and prior loss.
 
         Returns:
-            loss: scalar CFM loss.
+            diff_loss: scalar CFM flow matching loss.
+            prior_loss: scalar MSE between mu_cond and target latent.
         """
         B, T, _ = latent.shape
 
@@ -724,7 +776,7 @@ class BrainFlowCFMv2(nn.Module):
             mask = torch.ones(B, 1, T, device=latent.device, dtype=latent.dtype)
 
         # 1. Encode conditioning
-        cond_seq = self._encode_condition(modality_features)  # (B, T, H_cond)
+        cond_seq = self._encode_condition(modality_features)  # (B, T_feat, H_cond)
 
         # CFG dropout: zero out entire conditioning vector for random samples
         cfg_keep = None
@@ -733,12 +785,20 @@ class BrainFlowCFMv2(nn.Module):
             cfg_keep = (torch.rand(B, 1, 1, device=cond_seq.device) > self.cfg_drop_prob).float()
             cond_seq = cond_seq * cfg_keep
 
-        # 2. Project conditioning → latent space
-        mu_cond = self.cond_to_mu(cond_seq)  # (B, T, Z)
+        # 2. Project aligned conditioning → latent space
+        # Use only last T_lat positions (aligned with target fMRI)
+        cond_aligned = cond_seq[:, -T:, :]  # (B, T_lat, H_cond)
+        mu_cond = self.cond_to_mu(cond_aligned)  # (B, T_lat, Z)
+
+        # Prior loss: push mu towards target latent (Matcha-TTS style)
+        # Computed BEFORE CFG dropout so encoder always receives gradient
+        mask_T = mask.transpose(1, 2)  # (B, T, 1)
+        prior_loss = F.mse_loss(mu_cond * mask_T, latent * mask_T)
+
         # Also zero mu_cond for dropped samples (bypass projection bias)
         if cfg_keep is not None:
             mu_cond = mu_cond * cfg_keep
-        mu_cond = mu_cond.transpose(1, 2)    # (B, Z, T)
+        mu_cond = mu_cond.transpose(1, 2)    # (B, Z, T_lat)
 
         # 3. CFM loss
         latent_T = latent.transpose(1, 2)  # (B, Z, T)
@@ -750,46 +810,69 @@ class BrainFlowCFMv2(nn.Module):
         else:
             diff_loss, _ = self.decoder.compute_loss(x1=latent_T, mask=mask, mu=mu_cond)
 
-        return diff_loss
+        return diff_loss, prior_loss
 
     @torch.inference_mode()
     def synthesise(
         self,
         modality_features: dict[str, torch.Tensor],
         n_timesteps: int = 20,
-        temperature: float = 1.0,
+        temperature: float = 0.0,
         guidance_scale: float = 1.0,
+        n_output_trs: int = None,  # If None, infer from features
+        n_ensembles: int = 1,
     ) -> torch.Tensor:
         """Generate fMRI latents from multimodal features.
 
         Args:
-            modality_features: dict {mod_name: (B, T, D_mod)}.
+            modality_features: dict {mod_name: (B, T_feat, D_mod)}.
             n_timesteps: ODE solver steps.
-            temperature: Initial noise variance.
+            temperature: Initial noise variance. If 0.0, path is purely deterministic.
             guidance_scale: CFG scale (>1.0 pushes away from unconditional).
+            n_output_trs: Number of output TRs to generate (T_lat).
+                If None, defaults to T_feat (backward compat).
+            n_ensembles: Number of stochastic passes to average (if temp > 0).
 
         Returns:
-            latent: (B, T, Z) — generated latents.
+            latent: (B, T_lat, Z) — generated latents.
         """
         ref = next(iter(modality_features.values()))
-        B, T = ref.shape[0], ref.shape[1]
+        B, T_feat = ref.shape[0], ref.shape[1]
         device = ref.device
-        mask = torch.ones(B, 1, T, device=device, dtype=ref.dtype)
 
-        cond_seq = self._encode_condition(modality_features)  # (B, T, H_cond)
+        # Determine output length
+        T_lat = n_output_trs if n_output_trs is not None else T_feat
+        mask = torch.ones(B, 1, T_lat, device=device, dtype=ref.dtype)
 
+        cond_seq = self._encode_condition(modality_features)  # (B, T_feat, H_cond)
+        
+        # Determine aligned conditioning only once
         if self.decoder_type == "dit":
-            mu_cond = self.cond_to_mu(cond_seq).transpose(1, 2)  # (B, Z, T)
-            z_1 = self.decoder(
-                mu=mu_cond, mask=mask,
-                n_timesteps=n_timesteps, temperature=temperature,
-                cond_seq=cond_seq, guidance_scale=guidance_scale,
-            )
+            cond_aligned = cond_seq[:, -T_lat:, :]  # (B, T_lat, H)
+            mu_cond = self.cond_to_mu(cond_aligned).transpose(1, 2)  # (B, Z, T_lat)
         else:
-            mu_cond = self.cond_to_mu(cond_seq).transpose(1, 2)
-            z_1 = self.decoder(
-                mu=mu_cond, mask=mask,
-                n_timesteps=n_timesteps, temperature=temperature,
-            )
+            cond_aligned = cond_seq[:, -T_lat:, :]
+            mu_cond = self.cond_to_mu(cond_aligned).transpose(1, 2)
 
-        return z_1.transpose(1, 2)  # (B, T, Z)
+        # Force 1 ensemble if perfectly deterministic
+        if temperature <= 0.0:
+            n_ensembles = 1
+
+        z_1_acc = 0.0
+        for _ in range(n_ensembles):
+            if self.decoder_type == "dit":
+                z_1_sample = self.decoder(
+                    mu=mu_cond, mask=mask,
+                    n_timesteps=n_timesteps, temperature=temperature,
+                    cond_seq=cond_seq, guidance_scale=guidance_scale,
+                )
+            else:
+                z_1_sample = self.decoder(
+                    mu=mu_cond, mask=mask,
+                    n_timesteps=n_timesteps, temperature=temperature,
+                )
+            z_1_acc = z_1_acc + z_1_sample
+
+        z_1 = z_1_acc / n_ensembles
+
+        return z_1.transpose(1, 2)  # (B, T_lat, Z)
