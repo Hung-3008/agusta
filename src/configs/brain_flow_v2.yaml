@@ -97,6 +97,13 @@ brainflow:
   cfm:
     solver: euler
     sigma_min: 0.0001
+
+  # Latent-CFM: fine-tune VAE encoder last layer + KL regularization
+  latent_cfm:
+    enabled: true
+    beta_kl: 0.001               # KL divergence weight (controls info in f)
+    consistency_weight: 0.1      # Push f ≈ mu_cond to mitigate train/test gap
+    f_drop_prob: 0.3             # Curriculum dropout: prob of using mu_cond instead of f
     
   cfg_drop_prob: 0.1
 

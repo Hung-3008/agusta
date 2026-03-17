@@ -1,8 +1,8 @@
-"""Train BrainFlow CFM v2 — TRIBE-style encoder + DiT/U-Net decoder.
+"""Train BrainFlow TTS — Matcha-TTS architecture adapted for multimodal → fMRI.
 
 Usage:
-    python src/train_brain_flow_v2.py --config src/configs/brain_flow_v2.yaml
-    python src/train_brain_flow_v2.py --config src/configs/brain_flow_v2.yaml --fast_dev_run
+    python src/train_brain_flow_tts.py --config src/configs/brain_flow_tts.yaml
+    python src/train_brain_flow_tts.py --config src/configs/brain_flow_tts.yaml --fast_dev_run
 """
 
 import argparse
@@ -10,7 +10,6 @@ import logging
 import copy
 import math as pymath
 import random
-import shutil
 import sys
 import time
 from collections import defaultdict
@@ -37,11 +36,11 @@ from src.data.dataset import (
     resample_features_to_tr,
     _get_fmri_filepath,
 )
-from src.models.brainflow.brain_flow_v2 import BrainFlowCFMv2
+from src.models.brainflow.brain_flow_tts import BrainFlowTTS
 from src.data.precompute_latents import load_vae
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
-logger = logging.getLogger("train_cfm_v2")
+logger = logging.getLogger("train_brain_flow_tts")
 
 
 def resolve_paths_v2(cfg: dict, project_root: Path) -> dict:
@@ -516,16 +515,16 @@ def train(args):
         cfg["training"]["n_epochs"] = 1
         cfg["training"]["val_every_n_epochs"] = 1
 
-    # 2. Load frozen VAE (needed for both Latent-CFM and fMRI eval)
+    # 2. Load frozen VAE decoder for fMRI eval
     try:
         vae = load_vae(cfg, device)
-        logger.info("Loaded frozen VAE for Latent-CFM and fMRI evaluation")
+        logger.info("Loaded frozen VAE decoder for fMRI evaluation")
     except Exception as e:
-        logger.warning("Could not load VAE: %s. fMRI PCC will be 0, Latent-CFM disabled.", e)
+        logger.warning("Could not load VAE: %s. fMRI PCC will be 0.", e)
         vae = None
 
     # 3. Init Model
-    logger.info("Initializing BrainFlowCFMv2...")
+    logger.info("Initializing BrainFlowTTS...")
     bf_cfg = cfg["brainflow"]
 
     # Build modality_dims from config
@@ -539,24 +538,14 @@ def train(args):
 
     logger.info("Modality dimensions: %s", modality_dims)
 
-    # Latent-CFM: pass VAE to model if enabled
-    latent_cfm_cfg = bf_cfg.get("latent_cfm", {})
-    use_latent_cfm = latent_cfm_cfg.get("enabled", False)
-    vae_for_lcfm = vae if (vae is not None and use_latent_cfm) else None
-    if vae_for_lcfm is not None:
-        logger.info("Latent-CFM enabled: passing VAE encoder to model")
-
-    model = BrainFlowCFMv2(
+    model = BrainFlowTTS(
         modality_dims=modality_dims,
         latent_dim=bf_cfg["latent_dim"],
         encoder_params=bf_cfg["encoder"],
-        decoder_type=bf_cfg.get("decoder_type", "dit"),
         decoder_params=bf_cfg["decoder"],
         cfm_params=bf_cfg["cfm"],
         cfg_drop_prob=bf_cfg.get("cfg_drop_prob", 0.1),
         n_voxels=cfg["fmri"].get("n_voxels", 1000),
-        vae_encoder=vae_for_lcfm,
-        latent_cfm_params=latent_cfm_cfg,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -591,10 +580,6 @@ def train(args):
     out_dir = Path(PROJECT_ROOT) / cfg.get("output_dir", "outputs/brain_flow_v2")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save config for reproducibility
-    shutil.copy2(args.config, out_dir / "config.yaml")
-    logger.info("Saved config to %s", out_dir / "config.yaml")
-
     # Modality names for extracting from batch
     modality_names = list(cfg["raw_features"]["modalities"].keys())
 
@@ -609,7 +594,7 @@ def train(args):
 
     history_file = out_dir / "history.csv"
     with open(history_file, "w") as f:
-        f.write("epoch,train_loss,train_diff_loss,train_prior_loss,train_reg_loss,train_kl_loss,train_consist_loss,prior_weight,val_latent_pearson,val_fmri_pcc,lr\n")
+        f.write("epoch,train_loss,train_diff_loss,train_prior_loss,train_reg_loss,prior_weight,val_latent_pearson,val_fmri_pcc,lr\n")
 
     for epoch in range(1, tr_cfg["n_epochs"] + 1):
         model.train()
@@ -618,8 +603,6 @@ def train(args):
         train_prior_losses = []
         train_reg_losses = []
 
-        train_kl_losses = []
-        train_consist_losses = []
 
         # Prior weight annealing: linear from start → end over anneal_epochs
         pw_start = tr_cfg.get("prior_weight_start", 1.0)
@@ -661,20 +644,12 @@ def train(args):
                     fmri = lam * fmri + (1 - lam) * fmri[perm]
 
             reg_weight = tr_cfg.get("reg_weight", 0.1)
-            beta_kl = latent_cfm_cfg.get("beta_kl", 0.001)
-            consistency_weight = latent_cfm_cfg.get("consistency_weight", 0.1)
 
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
-                diff_loss, prior_loss, reg_loss, kl_loss, consistency_loss = model(
+                diff_loss, prior_loss, reg_loss = model(
                     mod_features, latents, mask=mask, fmri_target=fmri,
                 )
-                loss = (
-                    diff_loss
-                    + prior_weight * prior_loss
-                    + reg_weight * reg_loss
-                    + beta_kl * kl_loss
-                    + consistency_weight * consistency_loss
-                )
+                loss = diff_loss + prior_weight * prior_loss + reg_weight * reg_loss
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -686,8 +661,6 @@ def train(args):
             train_diff_losses.append(diff_loss.item())
             train_prior_losses.append(prior_loss.item())
             train_reg_losses.append(reg_loss.item())
-            train_kl_losses.append(kl_loss.item() if torch.is_tensor(kl_loss) else kl_loss)
-            train_consist_losses.append(consistency_loss.item() if torch.is_tensor(consistency_loss) else consistency_loss)
             global_step += 1
 
             # EMA update
@@ -732,10 +705,9 @@ def train(args):
                     gen_latents = model.synthesise(
                         mod_features,
                         n_timesteps=50,
-                        temperature=0.0,  # Deterministic center-path ODE
+                        temperature=0.667,  # Matcha-TTS default
                         guidance_scale=tr_cfg.get("guidance_scale", 1.5),
                         n_output_trs=latents.shape[1],
-                        n_ensembles=1,
                     )
 
                     # Decode to fMRI if VAE available
@@ -841,11 +813,9 @@ def train(args):
             mean_diff_loss = float(np.mean(train_diff_losses))
             mean_prior_loss = float(np.mean(train_prior_losses))
             mean_reg_loss = float(np.mean(train_reg_losses))
-            mean_kl_loss = float(np.mean(train_kl_losses))
-            mean_consist_loss = float(np.mean(train_consist_losses))
             current_lr = scheduler.get_last_lr()[0]
             with open(history_file, "a") as f:
-                f.write(f"{epoch},{mean_train_loss:.6f},{mean_diff_loss:.6f},{mean_prior_loss:.6f},{mean_reg_loss:.6f},{mean_kl_loss:.6f},{mean_consist_loss:.6f},{prior_weight:.4f},{mean_corr:.6f},{mean_fmri_corr:.6f},{current_lr:.2e}\n")
+                f.write(f"{epoch},{mean_train_loss:.6f},{mean_diff_loss:.6f},{mean_prior_loss:.6f},{mean_reg_loss:.6f},{prior_weight:.4f},{mean_corr:.6f},{mean_fmri_corr:.6f},{current_lr:.2e}\n")
 
             # Restore original weights after validation
             ema.restore(model)
@@ -869,7 +839,7 @@ if __name__ == "__main__":
         pass
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="src/configs/brain_flow_v2.yaml")
+    parser.add_argument("--config", type=str, default="src/configs/brain_flow_tts.yaml")
     parser.add_argument("--fast_dev_run", action="store_true", help="Run 2 batches to test pipeline")
     args = parser.parse_args()
     train(args)

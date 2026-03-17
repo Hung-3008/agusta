@@ -508,6 +508,7 @@ class DiTVelocityNet(nn.Module):
         spks=None,              # unused, for API compat
         cond=None,              # unused, for API compat
         cond_seq: torch.Tensor = None,  # (B, T_cond, cond_dim) — from encoder
+        f_emb: torch.Tensor = None,     # (B, T_lat, hidden_dim) — Latent-CFM structural conditioning
     ) -> torch.Tensor:
         """Predict velocity field.
 
@@ -542,6 +543,12 @@ class DiTVelocityNet(nn.Module):
             c = t_emb.unsqueeze(1) + cond_aligned     # (B, T_lat, H)
         else:
             c = t_emb
+
+        # Latent-CFM: add structural conditioning from VAE encoder
+        if f_emb is not None:
+            if c.ndim == 2:
+                c = c.unsqueeze(1).expand(-1, T_lat, -1)
+            c = c + f_emb
 
         # DiT blocks with Joint Attention
         for block in self.blocks:
@@ -594,6 +601,7 @@ class DiTCFM(nn.Module):
         temperature: float = 1.0,
         cond_seq: torch.Tensor = None,
         guidance_scale: float = 1.0,
+        f_emb: torch.Tensor = None,  # (B, T_lat, hidden_dim) — Latent-CFM
     ) -> torch.Tensor:
         """ODE sampling (Euler solver) with optional Classifier-Free Guidance."""
         z = torch.randn_like(mu) * temperature
@@ -615,12 +623,16 @@ class DiTCFM(nn.Module):
                     cond_seq_both = torch.cat([cond_seq, torch.zeros_like(cond_seq)], dim=0)
                 else:
                     cond_seq_both = None
+                if f_emb is not None:
+                    f_emb_both = torch.cat([f_emb, torch.zeros_like(f_emb)], dim=0)
+                else:
+                    f_emb_both = None
                 
-                v_both = self.estimator(x_both, mask_both, mu_both, t_both, cond_seq=cond_seq_both)
+                v_both = self.estimator(x_both, mask_both, mu_both, t_both, cond_seq=cond_seq_both, f_emb=f_emb_both)
                 v_cond, v_uncond = v_both[:B], v_both[B:]
                 dphi_dt = v_uncond + guidance_scale * (v_cond - v_uncond)
             else:
-                dphi_dt = self.estimator(x, mask, mu, t.expand(B), cond_seq=cond_seq)
+                dphi_dt = self.estimator(x, mask, mu, t.expand(B), cond_seq=cond_seq, f_emb=f_emb)
                 
             x = x + dt * dphi_dt
             t = t + dt
@@ -635,9 +647,10 @@ class DiTCFM(nn.Module):
         mask: torch.Tensor,       # (B, 1, T)
         mu: torch.Tensor,         # (B, latent_dim, T) — unused but kept for API
         cond_seq: torch.Tensor = None,
-        noise_scale: float = 0.0,  # Pure OT-CFM (no Brownian Bridge stochasticity)
+        noise_scale: float = 0.0,
+        f_emb: torch.Tensor = None,  # (B, T_lat, hidden_dim) — Latent-CFM
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute OT-CFM loss with Brownian Bridge stochasticity."""
+        """Compute OT-CFM loss with optional Latent-CFM conditioning."""
         b, _, T = x1.shape
 
         # Random timestep
@@ -654,21 +667,17 @@ class DiTCFM(nn.Module):
             bridge_std = torch.sqrt(t * (1 - t) + 1e-8)
             epsilon = torch.randn_like(x1)
             y = y + noise_scale * bridge_std * epsilon
-            
-            # Derivative of the noise term wrt t: c * (1 - 2t) / (2 * sqrt(t(1-t)))
-            # Clamp denominator to avoid division by zero near t=0 or t=1
             denom = 2 * torch.clamp(bridge_std, min=1e-5)
             noise_deriv = noise_scale * ((1 - 2 * t) / denom) * epsilon
         else:
             noise_deriv = 0.0
             
         # Target velocity: u = dy/dt
-        # Base linear derivative: x1 - (1-σ_min)z
         u = x1 - (1 - self.sigma_min) * z + noise_deriv
         u = u * mask
 
         # Predict velocity
-        v_pred = self.estimator(y, mask, mu, t.squeeze(), cond_seq=cond_seq)
+        v_pred = self.estimator(y, mask, mu, t.squeeze(), cond_seq=cond_seq, f_emb=f_emb)
 
         # Masked MSE loss
         loss = F.mse_loss(v_pred, u, reduction="sum") / (
@@ -705,6 +714,8 @@ class BrainFlowCFMv2(nn.Module):
         cfm_params: dict = None,
         cfg_drop_prob: float = 0.1,
         n_voxels: int = 1000,
+        vae_encoder=None,
+        latent_cfm_params: dict = None,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -755,6 +766,45 @@ class BrainFlowCFMv2(nn.Module):
             nn.Linear(cond_dim, n_voxels),
         )
 
+        # === Latent-CFM branch (paper: Efficient Flow Matching using Latent Variables) ===
+        self.use_latent_cfm = vae_encoder is not None
+        if self.use_latent_cfm:
+            lcfm = latent_cfm_params or {}
+
+            # Store the full VAE object (we'll use its encoder components)
+            # Freeze encoder trunk: enc_in + enc_blocks
+            self.vae_enc_in = vae_encoder.enc_in
+            self.vae_enc_blocks = vae_encoder.enc_blocks
+            for p in self.vae_enc_in.parameters():
+                p.requires_grad = False
+            for p in self.vae_enc_blocks.parameters():
+                p.requires_grad = False
+
+            # Freeze subject embedding if present
+            self._vae_use_subject = getattr(vae_encoder, 'use_subject', False)
+            if self._vae_use_subject:
+                self.vae_subject_embed = vae_encoder.subject_embed
+                for p in self.vae_subject_embed.parameters():
+                    p.requires_grad = False
+
+            # Trainable last layer (Conv1d, warm-started from pretrained VAE)
+            # enc_out_mu/enc_out_lv: Conv1d(hidden_dim, latent_dim, kernel_size=1)
+            hidden_ch = vae_encoder.enc_out_mu.in_channels
+            self.ft_enc_mu = nn.Conv1d(hidden_ch, latent_dim, kernel_size=1)
+            self.ft_enc_lv = nn.Conv1d(hidden_ch, latent_dim, kernel_size=1)
+            with torch.no_grad():
+                self.ft_enc_mu.weight.copy_(vae_encoder.enc_out_mu.weight)
+                self.ft_enc_mu.bias.copy_(vae_encoder.enc_out_mu.bias)
+                self.ft_enc_lv.weight.copy_(vae_encoder.enc_out_lv.weight)
+                self.ft_enc_lv.bias.copy_(vae_encoder.enc_out_lv.bias)
+
+            # Project f → decoder hidden dim (for AdaLN conditioning)
+            dec_hidden = (decoder_params or {}).get('hidden_dim', 384)
+            self.f_proj = nn.Linear(latent_dim, dec_hidden)
+
+            # Curriculum dropout: probability of using mu_cond instead of f
+            self.f_drop_prob = lcfm.get('f_drop_prob', 0.3)
+
     def _encode_condition(
         self,
         modality_features: dict[str, torch.Tensor],
@@ -772,13 +822,11 @@ class BrainFlowCFMv2(nn.Module):
         latent: torch.Tensor,                          # (B, T, Z)
         mask: torch.Tensor = None,                     # (B, 1, T)
         fmri_target: torch.Tensor = None,              # (B, T, V) optional
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute CFM loss, prior loss, and optional fMRI regression loss.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute CFM loss, prior loss, regression loss, KL loss, consistency loss.
 
         Returns:
-            diff_loss: scalar CFM flow matching loss.
-            prior_loss: scalar MSE between mu_cond and target latent.
-            reg_loss: scalar MSE between fMRI prediction and target (0 if no target).
+            diff_loss, prior_loss, reg_loss, kl_loss, consistency_loss
         """
         B, T, _ = latent.shape
 
@@ -791,12 +839,10 @@ class BrainFlowCFMv2(nn.Module):
         # CFG dropout: zero out entire conditioning vector for random samples
         cfg_keep = None
         if self.training and self.cfg_drop_prob > 0.0:
-            # shape (B, 1, 1) broadcasts over T and cond_dim
             cfg_keep = (torch.rand(B, 1, 1, device=cond_seq.device) > self.cfg_drop_prob).float()
             cond_seq = cond_seq * cfg_keep
 
         # 2. Project aligned conditioning → latent space
-        # Use only last T_lat positions (aligned with target fMRI)
         cond_aligned = cond_seq[:, -T:, :]  # (B, T_lat, H_cond)
         mu_cond = self.cond_to_mu(cond_aligned)  # (B, T_lat, Z)
 
@@ -810,22 +856,72 @@ class BrainFlowCFMv2(nn.Module):
             fmri_pred = self.fmri_head(cond_aligned)  # (B, T, V)
             reg_loss = F.mse_loss(fmri_pred * mask_T, fmri_target * mask_T)
 
-        # Also zero mu_cond for dropped samples (bypass projection bias)
+        # 4. Latent-CFM: extract f from target fMRI via frozen VAE encoder
+        kl_loss = torch.tensor(0.0, device=latent.device)
+        consistency_loss = torch.tensor(0.0, device=latent.device)
+        f_emb = None
+
+        if self.use_latent_cfm:
+            if self.training and fmri_target is not None:
+                B_f, T_f, V_f = fmri_target.shape
+
+                # Encode fMRI through frozen VAE encoder trunk (TCN: Conv1d)
+                x_enc = fmri_target.transpose(1, 2)  # (B, V, T)
+                if self._vae_use_subject:
+                    subj_id = torch.zeros(B_f, dtype=torch.long, device=fmri_target.device)
+                    s_emb_vae = self.vae_subject_embed(subj_id).unsqueeze(-1)  # (B, E, 1)
+                    s_emb_vae = s_emb_vae.expand(-1, -1, T_f)  # (B, E, T)
+                    x_enc = torch.cat([x_enc, s_emb_vae], dim=1)  # (B, V+E, T)
+
+                with torch.no_grad():
+                    h_vae = self.vae_enc_blocks(self.vae_enc_in(x_enc))  # (B, H, T)
+
+                # Fine-tuned Conv1d last layer → (B, Z, T) → transpose to (B, T, Z)
+                mu_f = self.ft_enc_mu(h_vae).transpose(1, 2)  # (B, T, Z)
+                logvar_f = self.ft_enc_lv(h_vae).clamp(-10, 10).transpose(1, 2)  # (B, T, Z)
+
+                # Sample f ~ N(mu_f, sigma_f^2)
+                f = mu_f + torch.exp(0.5 * logvar_f) * torch.randn_like(mu_f)
+
+                # KL loss: KL(q(f|fmri) || N(0,I))
+                kl_loss = -0.5 * (1 + logvar_f - mu_f.pow(2) - logvar_f.exp()).mean()
+
+                # Project to decoder hidden space
+                f_emb = self.f_proj(f)  # (B, T, H_decoder)
+
+                # Consistency loss: push f close to mu_cond (mitigate train/test gap)
+                if cfg_keep is not None:
+                    consistency_loss = F.mse_loss(
+                        mu_f * mask_T * cfg_keep, mu_cond * mask_T * cfg_keep
+                    )
+                else:
+                    consistency_loss = F.mse_loss(mu_f * mask_T, mu_cond * mask_T)
+
+                # Curriculum dropout: sometimes use mu_cond instead of f
+                if self.f_drop_prob > 0 and torch.rand(1).item() < self.f_drop_prob:
+                    f_emb = self.f_proj(mu_cond)
+            else:
+                # Inference: use mu_cond as surrogate for f
+                f_emb = self.f_proj(mu_cond)
+
+        # Apply CFG zero to mu_cond and f_emb
         if cfg_keep is not None:
             mu_cond = mu_cond * cfg_keep
+            if f_emb is not None:
+                f_emb = f_emb * cfg_keep
         mu_cond = mu_cond.transpose(1, 2)    # (B, Z, T_lat)
 
-        # 4. CFM loss
+        # 5. CFM loss
         latent_T = latent.transpose(1, 2)  # (B, Z, T)
 
         if self.decoder_type == "dit":
             diff_loss, _ = self.decoder.compute_loss(
-                x1=latent_T, mask=mask, mu=mu_cond, cond_seq=cond_seq,
+                x1=latent_T, mask=mask, mu=mu_cond, cond_seq=cond_seq, f_emb=f_emb,
             )
         else:
             diff_loss, _ = self.decoder.compute_loss(x1=latent_T, mask=mask, mu=mu_cond)
 
-        return diff_loss, prior_loss, reg_loss
+        return diff_loss, prior_loss, reg_loss, kl_loss, consistency_loss
 
     @torch.inference_mode()
     def synthesise(
@@ -834,40 +930,28 @@ class BrainFlowCFMv2(nn.Module):
         n_timesteps: int = 20,
         temperature: float = 0.0,
         guidance_scale: float = 1.0,
-        n_output_trs: int = None,  # If None, infer from features
+        n_output_trs: int = None,
         n_ensembles: int = 1,
     ) -> torch.Tensor:
-        """Generate fMRI latents from multimodal features.
-
-        Args:
-            modality_features: dict {mod_name: (B, T_feat, D_mod)}.
-            n_timesteps: ODE solver steps.
-            temperature: Initial noise variance. If 0.0, path is purely deterministic.
-            guidance_scale: CFG scale (>1.0 pushes away from unconditional).
-            n_output_trs: Number of output TRs to generate (T_lat).
-                If None, defaults to T_feat (backward compat).
-            n_ensembles: Number of stochastic passes to average (if temp > 0).
-
-        Returns:
-            latent: (B, T_lat, Z) — generated latents.
-        """
+        """Generate fMRI latents from multimodal features."""
         ref = next(iter(modality_features.values()))
         B, T_feat = ref.shape[0], ref.shape[1]
         device = ref.device
 
-        # Determine output length
         T_lat = n_output_trs if n_output_trs is not None else T_feat
         mask = torch.ones(B, 1, T_lat, device=device, dtype=ref.dtype)
 
         cond_seq = self._encode_condition(modality_features)  # (B, T_feat, H_cond)
-        
-        # Determine aligned conditioning only once
-        if self.decoder_type == "dit":
-            cond_aligned = cond_seq[:, -T_lat:, :]  # (B, T_lat, H)
-            mu_cond = self.cond_to_mu(cond_aligned).transpose(1, 2)  # (B, Z, T_lat)
-        else:
-            cond_aligned = cond_seq[:, -T_lat:, :]
-            mu_cond = self.cond_to_mu(cond_aligned).transpose(1, 2)
+
+        cond_aligned = cond_seq[:, -T_lat:, :]  # (B, T_lat, H)
+        mu_cond = self.cond_to_mu(cond_aligned)  # (B, T_lat, Z)
+
+        # Latent-CFM: use mu_cond as f surrogate at inference
+        f_emb = None
+        if self.use_latent_cfm:
+            f_emb = self.f_proj(mu_cond)  # (B, T_lat, H_decoder)
+
+        mu_cond_T = mu_cond.transpose(1, 2)  # (B, Z, T_lat)
 
         # Force 1 ensemble if perfectly deterministic
         if temperature <= 0.0:
@@ -877,13 +961,14 @@ class BrainFlowCFMv2(nn.Module):
         for _ in range(n_ensembles):
             if self.decoder_type == "dit":
                 z_1_sample = self.decoder(
-                    mu=mu_cond, mask=mask,
+                    mu=mu_cond_T, mask=mask,
                     n_timesteps=n_timesteps, temperature=temperature,
                     cond_seq=cond_seq, guidance_scale=guidance_scale,
+                    f_emb=f_emb,
                 )
             else:
                 z_1_sample = self.decoder(
-                    mu=mu_cond, mask=mask,
+                    mu=mu_cond_T, mask=mask,
                     n_timesteps=n_timesteps, temperature=temperature,
                 )
             z_1_acc = z_1_acc + z_1_sample
