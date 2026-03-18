@@ -1,4 +1,4 @@
-"""Train BrainFlow CFM — Deep-Flow inspired architecture.
+"""Train BrainFlow CFM — Direct fMRI output.
 
 Usage:
     
@@ -26,7 +26,7 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.precompute_latents import load_vae
+
 from src.data.dataset import (
     load_config,
     load_feature_clip_perfile,
@@ -53,12 +53,12 @@ def resolve_paths(cfg: dict, project_root: Path) -> dict:
 # =============================================================================
 
 class BrainFlowDataset(Dataset):
-    """Many-to-One dataset: N context TRs of features → 1 target fMRI latent.
+    """Many-to-One dataset: N context TRs of features → 1 target fMRI vector.
 
     Each sample consists of:
     - Features: (feature_context_trs + 1) TRs of multimodal features
       (10 past + 1 current, shifted by HRF delay)
-    - Latent: 1 fMRI latent vector at the target TR
+    - fMRI: 1 fMRI vector (1000-d) at the target TR
 
     Features are loaded from per-clip H5/NPY files and resampled to TR grid.
     """
@@ -69,8 +69,8 @@ class BrainFlowDataset(Dataset):
         self.subjects = cfg["subjects"]
         self.splits_cfg = cfg.get("splits", {})
 
+
         # Directories
-        self.latent_dir = Path(PROJECT_ROOT) / cfg["latent_dir"]
         self.features_dir = Path(PROJECT_ROOT) / cfg["raw_features"]["dir"]
         self.layer_aggregation = cfg["raw_features"].get("layer_aggregation", "mean")
         npy_dir = cfg.get("raw_features_npy_dir")
@@ -103,11 +103,11 @@ class BrainFlowDataset(Dataset):
         # Temporal jitter
         self.temporal_jitter = cfg["sliding_window"].get("temporal_jitter", 0) if split == "train" else 0
 
-        self.samples = self._build_index()
-
-        # Caches
+        # Caches (must init before _build_index which uses _load_fmri_clip)
         self._fmri_cache = {}
         self._feat_cache = {}
+
+        self.samples = self._build_index()
 
     def _normalize_clip_name(self, clip_name: str, task: str) -> str:
         prefix = f"{task}_"
@@ -138,15 +138,15 @@ class BrainFlowDataset(Dataset):
                 for clip_stem in clip_stems:
                     subj = self.subjects[0]
                     norm_name = self._normalize_clip_name(clip_stem, task)
-                    lat_path = self.latent_dir / subj / task / stim_type / f"{norm_name}.npy"
 
-                    if not lat_path.exists():
-                        lat_path = self.latent_dir / subj / task / stim_type / f"{clip_stem}.npy"
-                    if not lat_path.exists():
+                    # Use fMRI to determine n_trs
+                    fmri_data = self._load_fmri_clip(subj, task, norm_name)
+                    if fmri_data is None:
+                        fmri_data = self._load_fmri_clip(subj, task, clip_stem)
+                    if fmri_data is None:
                         continue
 
-                    lat_shape = np.load(lat_path, mmap_mode="r").shape
-                    n_trs = lat_shape[0]
+                    n_trs = fmri_data.shape[0]
 
                     # Each target TR becomes one sample
                     for target_tr in range(0, n_trs, self.stride):
@@ -261,38 +261,24 @@ class BrainFlowDataset(Dataset):
                 dim = mod_cfg.get("dim", 1024)
                 mod_features[mod_name] = torch.zeros(self.feat_seq_len, dim, dtype=torch.float32)
 
-        # Load single latent vector
+        # Load ground truth fMRI
         subj = self.subjects[0]
-        lat_path = self.latent_dir / subj / task / stim_type / f"{norm_name}.npy"
-        if not lat_path.exists():
-            lat_path = self.latent_dir / subj / task / stim_type / f"{clip_stem}.npy"
-        lat_data = np.load(lat_path, mmap_mode="r")[target_tr].astype(np.float32)  # (Z,)
-        latent = torch.from_numpy(lat_data.copy())
-
-        # Online posterior sampling (train only)
-        if self.split == "train":
-            logvar_name = f"{norm_name}_logvar.npy"
-            logvar_path = lat_path.parent / logvar_name
-            if not logvar_path.exists():
-                logvar_name = f"{clip_stem}_logvar.npy"
-                logvar_path = lat_path.parent / logvar_name
-            if logvar_path.exists():
-                logvar_data = np.load(logvar_path, mmap_mode="r")[target_tr].astype(np.float32)
-                logvar = torch.from_numpy(logvar_data.copy())
-                latent = latent + torch.exp(0.5 * logvar) * torch.randn_like(latent)
+        fmri_data = self._load_fmri_clip(subj, task, norm_name)
+        if fmri_data is None:
+            fmri_data = self._load_fmri_clip(subj, task, clip_stem)
+        if fmri_data is not None and target_tr < fmri_data.shape[0]:
+            fmri_target = torch.from_numpy(fmri_data[target_tr].copy())  # (V,)
+        else:
+            n_voxels = self.cfg["fmri"].get("n_voxels", 1000)
+            fmri_target = torch.zeros(n_voxels, dtype=torch.float32)
 
         result = {
-            "latent": latent,          # (Z,) single vector
+            "fmri": fmri_target,       # (V,) single vector — training target
             "clip_key": f"{task}/{stim_type}/{norm_name}",
             "target_tr": target_tr,
             "n_trs": n_trs,
         }
         result.update(mod_features)  # mod_name → (feat_seq_len, D_mod)
-
-        # Load ground truth fMRI (for evaluation)
-        fmri_data = self._load_fmri_clip(subj, task, norm_name)
-        if fmri_data is not None and target_tr < fmri_data.shape[0]:
-            result["fmri"] = torch.from_numpy(fmri_data[target_tr].copy())  # (V,)
 
         return result
 
@@ -487,16 +473,8 @@ def train(args):
         cfg["training"]["n_epochs"] = 1
         cfg["training"]["val_every_n_epochs"] = 1
 
-    # 2. Load frozen VAE (for fMRI eval only)
-    try:
-        vae = load_vae(cfg, device)
-        logger.info("Loaded frozen VAE for fMRI evaluation")
-    except Exception as e:
-        logger.warning("Could not load VAE: %s. fMRI PCC will be 0.", e)
-        vae = None
-
-    # 3. Init Model
-    logger.info("Initializing BrainFlowCFM (Deep-Flow inspired)...")
+    # 2. Init Model
+    logger.info("Initializing BrainFlowCFM (Direct fMRI output)...")
     bf_cfg = cfg["brainflow"]
 
     modality_dims = {}
@@ -509,26 +487,77 @@ def train(args):
 
     logger.info("Modality dimensions: %s", modality_dims)
 
+    output_dim = bf_cfg.get("output_dim", cfg["fmri"]["n_voxels"])
+
     model = BrainFlowCFM(
         modality_dims=modality_dims,
-        latent_dim=bf_cfg["latent_dim"],
+        output_dim=output_dim,
         encoder_params=bf_cfg["encoder"],
         velocity_net_params=bf_cfg.get("velocity_net", {}),
         cfm_params=bf_cfg.get("cfm", {}),
         cfg_drop_prob=bf_cfg.get("cfg_drop_prob", 0.1),
-        n_voxels=cfg["fmri"].get("n_voxels", 1000),
     ).to(device)
+
+    # Load pre-trained encoder (Stage 2)
+    if args.pretrained_encoder:
+        enc_path = Path(args.pretrained_encoder)
+        if enc_path.exists():
+            enc_state = torch.load(enc_path, map_location=device, weights_only=False)
+            model.encoder.load_state_dict(enc_state)
+            logger.info("Loaded pre-trained encoder from %s", enc_path)
+
+            # Also load pretrained regression head → mu_proj
+            head_path = enc_path.parent / "best.pt"
+            if head_path.exists():
+                full_state = torch.load(head_path, map_location=device, weights_only=False)
+                head_keys = {k: v for k, v in full_state.items() if k.startswith("head.")}
+                if head_keys:
+                    mu_state = {}
+                    for k, v in head_keys.items():
+                        new_k = k.replace("head.0.", "")
+                        mu_state[new_k] = v
+                    model.mu_proj.load_state_dict(mu_state)
+                    logger.info("Loaded pretrained head → mu_proj from %s", head_path)
+                del full_state
+        else:
+            logger.error("Pre-trained encoder not found: %s", enc_path)
+            sys.exit(1)
+
+    # Freeze encoder if requested (but keep final_norm trainable)
+    if args.freeze_encoder:
+        for p in model.encoder.parameters():
+            p.requires_grad = False
+        for p in model.mu_proj.parameters():
+            p.requires_grad = False
+        for p in model.encoder.final_norm.parameters():
+            p.requires_grad = True
+        logger.info("Encoder + mu_proj FROZEN — final_norm + velocity net trainable")
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Model parameters: %s", f"{n_params:,}")
 
-    # 4. Optimizer & Scheduler
+    # 3. Optimizer & Scheduler
     tr_cfg = cfg["training"]
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=tr_cfg["lr"],
-        weight_decay=tr_cfg["weight_decay"],
-    )
+
+    if args.freeze_encoder:
+        # Train decoder + encoder.final_norm
+        trainable_params = list(model.decoder.parameters()) + \
+                          list(model.encoder.final_norm.parameters())
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=tr_cfg["lr"],
+            weight_decay=tr_cfg["weight_decay"],
+        )
+        logger.info("Optimizer: decoder + final_norm, lr=%.2e", tr_cfg["lr"])
+    else:
+        encoder_lr_scale = tr_cfg.get("encoder_lr_scale", 3.0)
+        encoder_lr = tr_cfg["lr"] * encoder_lr_scale
+        optimizer = torch.optim.AdamW([
+            {"params": model.encoder.parameters(), "lr": encoder_lr},
+            {"params": model.decoder.parameters(), "lr": tr_cfg["lr"]},
+        ], weight_decay=tr_cfg["weight_decay"])
+        logger.info("Optimizer: encoder lr=%.2e (%.1fx), decoder lr=%.2e",
+                    encoder_lr, encoder_lr_scale, tr_cfg["lr"])
 
     total_steps = len(train_loader) * tr_cfg["n_epochs"]
     if args.fast_dev_run:
@@ -537,15 +566,18 @@ def train(args):
     warmup_steps = int(total_steps * tr_cfg.get("warmup_ratio", 0.05))
     min_lr = tr_cfg.get("min_lr", 1e-6)
 
+    base_lr = tr_cfg["lr"]
+
     def cosine_with_warmup(step):
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
         progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        return min_lr / tr_cfg["lr"] + (1 - min_lr / tr_cfg["lr"]) * 0.5 * (1 + pymath.cos(pymath.pi * progress))
+        return min_lr / base_lr + (1 - min_lr / base_lr) * 0.5 * (1 + pymath.cos(pymath.pi * progress))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_with_warmup)
+    n_param_groups = len(optimizer.param_groups)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [cosine_with_warmup] * n_param_groups)
 
-    # 5. Output dir
+    # 4. Output dir
     out_dir = Path(PROJECT_ROOT) / cfg.get("output_dir", "outputs/brainflow")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -584,7 +616,7 @@ def train(args):
     history_file = out_dir / "history.csv"
     if start_epoch == 1:
         with open(history_file, "w") as f:
-            f.write("epoch,train_loss,val_latent_pearson,val_fmri_pcc,lr\n")
+            f.write("epoch,train_loss,val_fmri_pcc,lr\n")
 
     for epoch in range(start_epoch, tr_cfg["n_epochs"] + 1):
         model.train()
@@ -596,24 +628,21 @@ def train(args):
                 break
 
             mod_features = _extract_modality_features(batch, modality_names, device)
-            latents = batch["latent"].to(device)     # (B, Z)
+            fmri_target = batch["fmri"].to(device)     # (B, V)
 
             # --- Data Augmentation ---
-            B = latents.shape[0]
-            latent_noise_scale = tr_cfg.get("latent_noise_scale", 0.0)
-            if latent_noise_scale > 0:
-                latents = latents + latent_noise_scale * torch.randn_like(latents)
+            B = fmri_target.shape[0]
 
             mixup_alpha = tr_cfg.get("mixup_alpha", 0.0)
             if mixup_alpha > 0 and B > 1:
                 lam = np.random.beta(mixup_alpha, mixup_alpha)
                 perm = torch.randperm(B, device=device)
-                latents = lam * latents + (1 - lam) * latents[perm]
+                fmri_target = lam * fmri_target + (1 - lam) * fmri_target[perm]
                 for mod_name in mod_features:
                     mod_features[mod_name] = lam * mod_features[mod_name] + (1 - lam) * mod_features[mod_name][perm]
 
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
-                loss = model(mod_features, latents)
+                loss = model(mod_features, fmri_target)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -634,7 +663,6 @@ def train(args):
                 })
 
         # Validation
-        mean_corr = 0.0
         mean_fmri_corr = 0.0
         if epoch % tr_cfg["val_every_n_epochs"] == 0 or args.fast_dev_run:
             ema.apply_shadow(model)
@@ -642,8 +670,6 @@ def train(args):
 
             logger.info("Running validation...")
 
-            lat_pred_acc = {}
-            lat_tgt_acc = {}
             fmri_pred_acc = {}
             fmri_tgt_acc = {}
 
@@ -653,67 +679,39 @@ def train(args):
                         break
 
                     mod_features = _extract_modality_features(batch, modality_names, device)
-                    latents = batch["latent"].to(device)  # (B, Z)
+                    fmri_target = batch["fmri"].to(device)  # (B, V) — normalized
 
-                    gen_latents = model.synthesise(
+                    gen_fmri = model.synthesise(
                         mod_features,
                         n_timesteps=50,
                         temperature=0.0,
-                        guidance_scale=tr_cfg.get("guidance_scale", 1.5),
+                        guidance_scale=tr_cfg.get("guidance_scale", 1.0),
                         n_ensembles=1,
-                    )  # (B, Z)
-
-                    # Decode to fMRI if VAE available
-                    gen_fmri = None
-                    if vae is not None and "fmri" in batch:
-                        true_fmri = batch["fmri"].to(device)  # (B, V)
-                        dummy_subj = torch.zeros(B, dtype=torch.long, device=device)
-                        # Need to unsqueeze for VAE decode (expects B,T,Z)
-                        gen_fmri = vae.decode(gen_latents.unsqueeze(1), dummy_subj).squeeze(1)
+                    )  # (B, V)
 
                     # Accumulate per-clip, per-TR
                     clip_keys = batch["clip_key"]
                     target_trs = batch["target_tr"]
                     n_trs_batch = batch["n_trs"]
 
-                    for b in range(gen_latents.shape[0]):
+                    B = gen_fmri.shape[0]
+                    for b in range(B):
                         ck = clip_keys[b]
                         tr_idx = int(target_trs[b].item())
                         n_t = int(n_trs_batch[b].item())
-                        lat_dim = gen_latents.shape[-1]
+                        fmri_dim = gen_fmri.shape[-1]
 
-                        if ck not in lat_pred_acc:
-                            lat_pred_acc[ck] = {"sum": torch.zeros(n_t, lat_dim), "count": torch.zeros(n_t)}
-                            lat_tgt_acc[ck] = {"sum": torch.zeros(n_t, lat_dim), "count": torch.zeros(n_t)}
+                        if ck not in fmri_pred_acc:
+                            fmri_pred_acc[ck] = {"sum": torch.zeros(n_t, fmri_dim), "count": torch.zeros(n_t)}
+                            fmri_tgt_acc[ck] = {"sum": torch.zeros(n_t, fmri_dim), "count": torch.zeros(n_t)}
 
-                        lat_pred_acc[ck]["sum"][tr_idx] += gen_latents[b].cpu()
-                        lat_pred_acc[ck]["count"][tr_idx] += 1
-                        lat_tgt_acc[ck]["sum"][tr_idx] += latents[b].cpu()
-                        lat_tgt_acc[ck]["count"][tr_idx] += 1
-
-                        if gen_fmri is not None:
-                            fmri_dim = gen_fmri.shape[-1]
-                            if ck not in fmri_pred_acc:
-                                fmri_pred_acc[ck] = {"sum": torch.zeros(n_t, fmri_dim), "count": torch.zeros(n_t)}
-                                fmri_tgt_acc[ck] = {"sum": torch.zeros(n_t, fmri_dim), "count": torch.zeros(n_t)}
-                            fmri_pred_acc[ck]["sum"][tr_idx] += gen_fmri[b].cpu()
-                            fmri_pred_acc[ck]["count"][tr_idx] += 1
-                            fmri_tgt_acc[ck]["sum"][tr_idx] += true_fmri[b].cpu()
-                            fmri_tgt_acc[ck]["count"][tr_idx] += 1
+                        fmri_pred_acc[ck]["sum"][tr_idx] += gen_fmri[b].cpu()
+                        fmri_pred_acc[ck]["count"][tr_idx] += 1
+                        fmri_tgt_acc[ck]["sum"][tr_idx] += fmri_target[b].cpu()
+                        fmri_tgt_acc[ck]["count"][tr_idx] += 1
 
             # Average overlapping predictions
-            all_gen_lat, all_tgt_lat = [], []
             all_gen_fmri, all_tgt_fmri = [], []
-
-            for ck in sorted(lat_pred_acc.keys()):
-                count = lat_pred_acc[ck]["count"]
-                valid_mask = count > 0
-                if valid_mask.sum() < 2:
-                    continue
-                avg_pred = lat_pred_acc[ck]["sum"][valid_mask] / count[valid_mask].unsqueeze(-1)
-                avg_tgt = lat_tgt_acc[ck]["sum"][valid_mask] / lat_tgt_acc[ck]["count"][valid_mask].unsqueeze(-1)
-                all_gen_lat.append(avg_pred)
-                all_tgt_lat.append(avg_tgt)
 
             for ck in sorted(fmri_pred_acc.keys()):
                 count = fmri_pred_acc[ck]["count"]
@@ -726,16 +724,6 @@ def train(args):
                 all_tgt_fmri.append(avg_tgt)
 
             # Compute PCC
-            if all_gen_lat:
-                all_gen_lat = torch.cat(all_gen_lat, dim=0)
-                all_tgt_lat = torch.cat(all_tgt_lat, dim=0)
-                lat_pcc_per_dim = pearson_corr_per_dim(
-                    all_gen_lat.unsqueeze(0), all_tgt_lat.unsqueeze(0)
-                )
-                mean_corr = float(lat_pcc_per_dim.mean().item())
-            else:
-                mean_corr = 0.0
-
             if all_gen_fmri:
                 all_gen_fmri = torch.cat(all_gen_fmri, dim=0)
                 all_tgt_fmri = torch.cat(all_tgt_fmri, dim=0)
@@ -747,14 +735,13 @@ def train(args):
                 mean_fmri_corr = 0.0
 
             logger.info(
-                "Epoch %d | Val Latent PCC: %.4f | Val fMRI PCC: %.4f",
-                epoch, mean_corr, mean_fmri_corr,
+                "Epoch %d | Val fMRI PCC: %.4f",
+                epoch, mean_fmri_corr,
             )
 
             # Best model
-            metric_for_best = mean_fmri_corr if vae is not None else mean_corr
-            if metric_for_best > best_val_corr:
-                best_val_corr = metric_for_best
+            if mean_fmri_corr > best_val_corr:
+                best_val_corr = mean_fmri_corr
                 torch.save(model.state_dict(), out_dir / "best.pt")
                 logger.info("Saved new best EMA model to %s", out_dir / "best.pt")
 
@@ -762,7 +749,7 @@ def train(args):
             mean_train_loss = float(np.mean(train_losses))
             current_lr = scheduler.get_last_lr()[0]
             with open(history_file, "a") as f:
-                f.write(f"{epoch},{mean_train_loss:.6f},{mean_corr:.6f},{mean_fmri_corr:.6f},{current_lr:.2e}\n")
+                f.write(f"{epoch},{mean_train_loss:.6f},{mean_fmri_corr:.6f},{current_lr:.2e}\n")
 
             # Restore original weights
             ema.restore(model)
@@ -790,5 +777,9 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="src/configs/brain_flow.yaml")
     parser.add_argument("--fast_dev_run", action="store_true", help="Run 2 batches to test pipeline")
     parser.add_argument("--resume", action="store_true", help="Resume training from last.pt")
+    parser.add_argument("--pretrained_encoder", type=str, default=None,
+                        help="Path to pre-trained encoder weights (best_encoder.pt)")
+    parser.add_argument("--freeze_encoder", action="store_true",
+                        help="Freeze encoder weights (use with --pretrained_encoder)")
     args = parser.parse_args()
     train(args)

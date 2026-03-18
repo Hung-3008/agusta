@@ -73,7 +73,7 @@ dataloader:
 # BrainFlow model config
 # =====================================================================
 brainflow:
-  latent_dim: 64
+  output_dim: 1000             # direct fMRI output (no VAE)
 
   # Encoder: Temporal Fusion (11 TRs → 1 context vector)
   encoder:
@@ -84,13 +84,15 @@ brainflow:
     modality_dropout: 0.3
     projector_depth: 2
 
-  # Velocity net: MLP (no attention needed for single-vector output)
+  # Velocity net: DiT-1D (Patch-based Transformer)
   velocity_net:
-    hidden_dim: 384
-    n_layers: 6         # deeper MLP for sufficient capacity
-    n_heads: 8          # unused, kept for compatibility
+    type: dit1d
+    d_model: 256
+    n_heads: 8
+    n_layers: 4
+    patch_size: 20       # 1000 / 20 = 50 patches
     time_dim: 256
-    dropout: 0.1
+    dropout: 0.15
 
   cfm:
     solver: euler
@@ -110,8 +112,8 @@ training:
   grad_clip: 1.0
   use_amp: true
   log_every_n_steps: 20
-  val_every_n_epochs: 10
-  guidance_scale: 1.5
+  val_every_n_epochs: 5
+  guidance_scale: 1.0
   ema_decay: 0.999
   # Data augmentation
   latent_noise_scale: 0.05

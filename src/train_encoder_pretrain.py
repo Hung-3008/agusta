@@ -275,7 +275,6 @@ def train(args):
             f.write("epoch,train_loss,train_mse,train_pcc,val_pcc,lr\n")
 
     val_every = pretrain_cfg.get("val_every_n_epochs", 5)
-    fmri_std = cfg["fmri"].get("fmri_std", 0.6)
 
     logger.info("Starting encoder pre-training: %d epochs, lr=%.2e, pcc_weight=%.2f, "
                 "early_stop=%d, head_wd=%.3f",
@@ -347,10 +346,6 @@ def train(args):
                     fmri_target = batch["fmri"].to(device)
 
                     pred = model(mod_features)  # (B, V)
-
-                    # Denormalize
-                    pred = pred * fmri_std
-                    fmri_target = fmri_target * fmri_std
 
                     clip_keys = batch["clip_key"]
                     target_trs = batch["target_tr"]
