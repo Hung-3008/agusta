@@ -4,7 +4,7 @@ Reads per-clip H5 feature files from algonauts_2025.features/,
 applies layer mean-pooling, resamples to TR grid, and saves as NPY.
 
 Usage:
-    python src/data/precompute_raw_features.py --config src/configs/brain_flow_v2.yaml
+    python src/data/precompute_raw_features.py --config src/configs/brain_flow.yaml
 """
 
 import argparse

@@ -1,13 +1,13 @@
-"""Evaluate BrainFlow v2 — generate fMRI predictions for Friends S7 submission.
+"""Evaluate BrainFlow — generate fMRI predictions for Friends S7 submission.
 
-Aligned with train_brain_flow_v2.py:
+Aligned with train_brainflow.py:
   - Same sliding window construction with HRF delay
   - Full sequence predictions (not just last TR)
   - Proper feature resampling matching training dataset
 
 Usage:
-    python src/evaluate_brainflow.py --config src/configs/brain_flow_v2.yaml
-    python src/evaluate_brainflow.py --config src/configs/brain_flow_v2.yaml --guidance_scale 3.0
+    python src/evaluate_brainflow.py --config src/configs/brain_flow.yaml
+    python src/evaluate_brainflow.py --config src/configs/brain_flow.yaml --guidance_scale 3.0
 """
 
 import sys
@@ -24,7 +24,7 @@ import numpy as np
 import zipfile
 from tqdm import tqdm
 
-from src.models.brainflow.brain_flow_v2 import BrainFlowCFMv2
+from src.models.brainflow.brain_flow import BrainFlowCFM
 from src.data.precompute_latents import load_vae
 from src.data.dataset import load_config, load_feature_clip_perfile, resample_features_to_tr
 
@@ -202,7 +202,7 @@ def predict_episode(
 @torch.inference_mode()
 def evaluate_brainflow():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="src/configs/brain_flow_v2.yaml")
+    parser.add_argument("--config", type=str, default="src/configs/brain_flow.yaml")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--n_timesteps", type=int, default=20)
@@ -222,7 +222,7 @@ def evaluate_brainflow():
     cfg["_fmri_dir"] = str(PROJECT_ROOT / cfg["data_root"] / cfg["fmri"]["dir"])
     features_dir = str(PROJECT_ROOT / cfg["raw_features"]["dir"])
 
-    out_dir = Path(cfg.get("output_dir", "outputs/brain_flow_v2_dit"))
+    out_dir = Path(cfg.get("output_dir", "outputs/brainflow"))
     output_dir = PROJECT_ROOT / "results" / "brain_flow_submission"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -250,13 +250,14 @@ def evaluate_brainflow():
 
     print(f"Modality dims: {modality_dims}")
 
-    model = BrainFlowCFMv2(
+    model = BrainFlowCFM(
         modality_dims=modality_dims,
         latent_dim=bf_cfg["latent_dim"],
         encoder_params=bf_cfg["encoder"],
-        decoder_type=bf_cfg.get("decoder_type", "dit"),
-        decoder_params=bf_cfg["decoder"],
-        cfm_params=bf_cfg["cfm"],
+        velocity_net_params=bf_cfg.get("velocity_net", {}),
+        cfm_params=bf_cfg.get("cfm", {}),
+        cfg_drop_prob=bf_cfg.get("cfg_drop_prob", 0.1),
+        n_voxels=cfg["fmri"].get("n_voxels", 1000),
     ).to(device)
 
     ckpt_path = out_dir / "best.pt"
