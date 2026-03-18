@@ -117,5 +117,21 @@ training:
   latent_noise_scale: 0.05
   mixup_alpha: 0.2
 
+# =====================================================================
+# Encoder pre-training config (Stage 1)
+# =====================================================================
+pretrain:
+  n_epochs: 50
+  lr: 2.0e-4
+  pcc_weight: 0.1
+  val_every_n_epochs: 5
+  head_hidden_mult: 1
+  head_dropout: 0.1
+  head_weight_decay: 0.1
+  encoder_dropout: 0.15
+  modality_dropout: 0.15
+  early_stop_patience: 15
+  min_lr: 1.0e-6
+
 # --- Output ---
 output_dir: outputs/brainflow
