@@ -1,9 +1,11 @@
 # =====================================================================
-# BrainFlow — Many-to-One Flow Matching
+# BrainFlow MOTFM — Flow Matching with MONAI UNet backbone
 # =====================================================================
-# Predicts 1 fMRI latent at time t from features of N past TRs + current TR.
-# Input: 11 TRs of multimodal features → Output: 1 fMRI latent (64-dim)
-# Run: python src/train_brainflow.py --config src/configs/brain_flow.yaml
+# Architecture adapted from MOTFM (Medical Optimal Transport Flow Matching).
+# Uses MONAI DiffusionModelUNet (spatial_dims=2) with pseudo-2D fMRI (32x32).
+# Uses Meta flow_matching library for OT-CFM path + ODE solver.
+#
+# Run: python src/train_brainflow_motfm.py --config src/configs/brain_flow_motfm.yaml
 # =====================================================================
 
 data_root: Data
@@ -56,10 +58,9 @@ splits:
     val: []
 
 # --- Sliding window (Many-to-One) ---
-# Each sample: 10 past TRs + 1 current TR of features → 1 fMRI latent
 sliding_window:
-  feature_context_trs: 10    # 10 past TRs of features
-  stride: 1                  # slide by 1 TR
+  feature_context_trs: 10
+  stride: 1
   temporal_jitter: 2
 
 # --- DataLoader ---
@@ -70,10 +71,10 @@ dataloader:
   pin_memory: true
 
 # =====================================================================
-# BrainFlow model config
+# BrainFlow MOTFM model config
 # =====================================================================
 brainflow:
-  output_dim: 1000             # direct fMRI output (no VAE)
+  output_dim: 1000
 
   # Encoder: Temporal Fusion (11 TRs → 1 context vector)
   encoder:
@@ -84,21 +85,30 @@ brainflow:
     modality_dropout: 0.3
     projector_depth: 2
 
-  # Velocity net: DiT-1D (Patch-based Transformer)
-  velocity_net:
-    type: dit1d
-    d_model: 256
-    n_heads: 8
-    n_layers: 4
-    patch_size: 20       # 1000 / 20 = 50 patches
-    time_dim: 256
-    dropout: 0.15
-
-  cfm:
-    solver: euler
-    sigma_min: 0.0001
+  # UNet velocity network (adapted from MOTFM)
+  # fMRI (1000) → pad to 1024 → reshape (1, 32, 32) pseudo-2D
+  unet:
+    spatial_dims: 2
+    in_channels: 1
+    out_channels: 1
+    num_res_blocks: [2, 2, 2, 2]
+    num_channels: [64, 128, 256, 512]
+    attention_levels: [False, False, True, True]
+    norm_num_groups: 32
+    num_head_channels: [64, 128, 256, 512]
+    transformer_num_layers: 2
+    with_conditioning: true
+    cross_attention_dim: 1024   # must match encoder hidden_dim
+    max_timestep: 1000
 
   cfg_drop_prob: 0.05
+
+# =====================================================================
+# Solver args (for validation sampling)
+# =====================================================================
+solver_args:
+  method: midpoint
+  time_points: 50
 
 # =====================================================================
 # Training config
@@ -116,11 +126,10 @@ training:
   guidance_scale: 1.0
   ema_decay: 0.999
   # Data augmentation
-  latent_noise_scale: 0.05
   mixup_alpha: 0.2
 
 # =====================================================================
-# Encoder pre-training config (Stage 1)
+# Encoder pre-training config (Stage 1) — optional
 # =====================================================================
 pretrain:
   n_epochs: 50
@@ -136,4 +145,4 @@ pretrain:
   min_lr: 1.0e-6
 
 # --- Output ---
-output_dir: outputs/brainflow
+output_dir: outputs/brainflow_motfm

@@ -213,35 +213,62 @@ def train(args):
     logger.info("Total params: %s (encoder: %s, head: %s)",
                 f"{n_params:,}", f"{n_enc_params:,}", f"{n_head_params:,}")
 
-    # 3. Optimizer & Scheduler
+    modality_names = list(cfg["raw_features"]["modalities"].keys())
+
+    # 2b. Scale head initialization to match target fMRI statistics
+    #     Default init produces output std ≈ 1/√fan_in ≈ 0.03-0.05,
+    #     but target fMRI has std ≈ 0.6. We scale so output starts at correct magnitude.
+    with torch.no_grad():
+        sample_batch = next(iter(train_loader))
+        target_std = sample_batch["fmri"].std().item()
+        # Find the last Linear layer in head
+        last_linear = None
+        for m in reversed(list(model.head.modules())):
+            if isinstance(m, nn.Linear):
+                last_linear = m
+                break
+        if last_linear is not None:
+            # Estimate current output std via a dummy forward pass
+            dummy_mod = _extract_modality_features(sample_batch, modality_names, device)
+            dummy_out = model(dummy_mod)
+            current_std = dummy_out.std().item()
+            if current_std > 1e-6:
+                scale_factor = target_std / current_std
+                last_linear.weight.data *= scale_factor
+                if last_linear.bias is not None:
+                    last_linear.bias.data *= scale_factor
+                logger.info("Scaled head output: current_std=%.4f → target_std=%.4f (scale=%.2f)",
+                            current_std, target_std, scale_factor)
+            else:
+                logger.warning("Head output std too small (%.6f), skipping scale", current_std)
+
+    # 3. Optimizer & Scheduler (OneCycleLR — inspired by TRIBE)
     tr_cfg = cfg["training"]
-    head_wd = pretrain_cfg.get("head_weight_decay", 0.1)
+    head_wd = pretrain_cfg.get("head_weight_decay", 0.0)
+    encoder_wd = pretrain_cfg.get("encoder_weight_decay", tr_cfg.get("weight_decay", 0.0))
 
     optimizer = torch.optim.AdamW([
-        {"params": model.encoder.parameters(), "lr": lr, "weight_decay": tr_cfg.get("weight_decay", 0.05)},
+        {"params": model.encoder.parameters(), "lr": lr, "weight_decay": encoder_wd},
         {"params": model.head.parameters(), "lr": lr, "weight_decay": head_wd},
     ])
 
     total_steps = len(train_loader) * n_epochs
     if args.fast_dev_run:
         total_steps = 2
-    warmup_steps = int(total_steps * tr_cfg.get("warmup_ratio", 0.05))
-    min_lr = pretrain_cfg.get("min_lr", 1e-6)
 
-    def cosine_with_warmup(step):
-        if step < warmup_steps:
-            return step / max(warmup_steps, 1)
-        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        return min_lr / lr + (1 - min_lr / lr) * 0.5 * (1 + pymath.cos(pymath.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [cosine_with_warmup, cosine_with_warmup])
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=[lr, lr],
+        total_steps=total_steps,
+        pct_start=0.1,
+        anneal_strategy='cos',
+        final_div_factor=lr / max(pretrain_cfg.get("min_lr", 1e-6), 1e-8),
+    )
 
     # 4. Output dir
     out_dir = Path(PROJECT_ROOT) / cfg.get("output_dir", "outputs/brainflow") / "pretrain_encoder"
     out_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(args.config, out_dir / "config.yaml")
-
-    modality_names = list(cfg["raw_features"]["modalities"].keys())
 
     # EMA
     ema_decay = tr_cfg.get("ema_decay", 0.999)
@@ -321,9 +348,13 @@ def train(args):
             global_step += 1
 
             if global_step % tr_cfg.get("log_every_n_steps", 20) == 0:
+                pred_std = pred.detach().std().item()
+                tgt_std = fmri_target.detach().std().item()
                 pbar.set_postfix({
                     "loss": f"{np.mean(losses[-50:]):.4f}",
                     "pcc": f"{np.mean(pccs[-50:]):.4f}",
+                    "p_std": f"{pred_std:.3f}",
+                    "t_std": f"{tgt_std:.3f}",
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                 })
 
