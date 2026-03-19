@@ -1,0 +1,131 @@
+# =====================================================================
+# BrainFlow MOTFM-VAE — Flow Matching in VAE Latent Space
+# =====================================================================
+# OT-CFM (Optimal Transport Conditional Flow Matching)
+# - Path: x_t = (1-t)*x_0 + t*x_1,  velocity target: dx = x_1 - x_0
+# - Loss: MSE(v_pred, dx) in 64-dim latent space
+# - Inference: ODE solve t=0→1 in latent, then decode via frozen VAE
+# =====================================================================
+
+data_root: Data
+
+fmri:
+  dir: algonauts_2025.competitors/fmri
+  tr: 1.49
+  n_voxels: 1000
+  excluded_samples_start: 5
+  excluded_samples_end: 5
+  hrf_delay: 5
+
+# --- Raw features ---
+raw_features:
+  dir: Data/algonauts_2025.features
+  sample_freq: 0.6711
+  layer_aggregation: mean
+  modalities:
+    video:
+      subdir: vjepa2_avg_feat
+      dim: 1408
+    audio:
+      subdir: whisper
+      dim: 1280
+    text:
+      subdir: Llama-3.2-3B
+      dim: 3072
+    omni:
+      subdir: qwen-2-5-omni-7b
+      dim: 3584
+
+# Precomputed NPY features
+raw_features_npy_dir: Data/raw_features_npy
+
+# --- Pre-computed VAE latents ---
+latent_dir: Data/latents_vae64
+
+# --- VAE decoder ---
+vae:
+  checkpoint: outputs/fmri_vae_64/best.pt
+  version: 5
+  latent_dim: 64
+  hidden_dim: 256
+  num_res_blocks: 4
+  dropout: 0.25
+  use_subject: false
+  subject_embed_dim: 64
+
+# --- Single subject ---
+subjects:
+  - sub-01
+
+subject_mode: single
+
+# --- Splits ---
+splits:
+  friends:
+    train: [s1, s2, s3, s4, s5]
+    val: [s6]
+  movie10:
+    train: [bourne, figures, life, wolf]
+    val: []
+
+# --- Sliding window ---
+sliding_window:
+  feature_context_trs: 10
+  stride: 1
+  temporal_jitter: 2
+
+# --- DataLoader ---
+dataloader:
+  batch_size: 256
+  val_batch_size: 256
+  num_workers: 4
+  pin_memory: true
+
+# =====================================================================
+# Model config
+# =====================================================================
+brainflow:
+  latent_dim: 64
+
+  # Encoder: Temporal Fusion (11 TRs → context sequence)
+  encoder:
+    hidden_dim: 1024
+    n_layers: 6
+    n_heads: 8
+    dropout: 0.1
+    modality_dropout: 0.15
+    projector_depth: 2
+
+  # Latent velocity network (MLP + AdaLN + Cross-Attention)
+  velocity_net:
+    latent_dim: 64
+    hidden_dim: 512
+    context_dim: 1024
+    n_blocks: 6
+    n_heads: 8
+    dropout: 0.1
+
+# =====================================================================
+# Solver args (validation inference)
+# =====================================================================
+solver_args:
+  method: midpoint
+  time_points: 50
+
+# =====================================================================
+# Training
+# =====================================================================
+training:
+  n_epochs: 200
+  lr: 3.0e-4
+  weight_decay: 0.0
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  use_amp: true
+  log_every_n_steps: 20
+  val_every_n_epochs: 5
+  ema_decay: 0.999
+
+# --- Output ---
+output_dir: outputs/brainflow_motfm_vae

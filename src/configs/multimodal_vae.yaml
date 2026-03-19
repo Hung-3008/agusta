@@ -1,0 +1,99 @@
+# =====================================================================
+# Multimodal MoE-VAE — Encode multi-feature → 512-dim latent
+# =====================================================================
+# Per-timestep encoding using MoE fusion and β-VAE with annealing.
+# Uses ALL-LAYER NPY features to support WeightedLayerPooling.
+# =====================================================================
+
+data_root: Data
+
+fmri:
+  dir: algonauts_2025.competitors/fmri
+  tr: 1.49
+  n_voxels: 1000
+
+# --- Features (all layers NPY) ---
+features_dir: Data/features_npy_multilayer
+data_mode: npy  # 'npy' for NPY files (now multi-layer)
+
+modalities:
+  video:
+    subdir: vjepa2_avg_feat
+    dim: 1408
+    n_layers: 13
+  audio:
+    subdir: whisper
+    dim: 1280
+    n_layers: 4
+  text_1b:
+    subdir: Llama-3.2-1B
+    dim: 2048
+    n_layers: 3
+  text_3b:
+    subdir: Llama-3.2-3B
+    dim: 3072
+    n_layers: 5
+  omni:
+    subdir: qwen-2-5-omni-7b
+    dim: 3584
+    n_layers: 9
+  vlm_14b:
+    subdir: InternVL3_14B
+    dim: 5120
+    n_layers: 5
+  vlm_8b:
+    subdir: internvl3_8b_8bit
+    dim: 3584
+    n_layers: 4
+  text_qw:
+    subdir: qwen2-5_3B
+    dim: 2048
+    n_layers: 7
+
+# --- Splits ---
+splits:
+  friends:
+    train: [s1, s2, s3, s4, s5]
+    val: [s6]
+  movie10:
+    train: [bourne, figures, life, wolf]
+    val: []
+
+# --- Model ---
+model:
+  latent_dim: 512
+  encoder_hidden: 1024
+  n_experts: 4
+  expert_hidden: 1024
+  decoder_hidden: 1024
+  dropout: 0.1
+
+# --- β-VAE annealing ---
+beta:
+  start: 0.0001
+  max: 0.01
+  warmup_epochs: 30
+
+# --- DataLoader ---
+dataloader:
+  batch_size: 512
+  val_batch_size: 512
+  num_workers: 8
+  pin_memory: true
+  stride: 1
+
+# --- Training ---
+training:
+  n_epochs: 200
+  lr: 3.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  use_amp: true
+  log_every_n_steps: 20
+  val_every_n_epochs: 5
+  ema_decay: 0.999
+
+# --- Output ---
+output_dir: outputs/multimodal_vae
