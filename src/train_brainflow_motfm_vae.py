@@ -40,6 +40,7 @@ from src.data.dataset import (
 )
 from src.models.brainflow.brain_flow_motfm_vae import BrainFlowMOTFM_VAE
 from src.models.brainflow.fmri_vae import build_vae
+from src.models.brainflow.moevae_temporal_encoder import build_moevae_temporal_encoder
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("train_brainflow_motfm_vae")
@@ -80,6 +81,9 @@ class BrainFlowVAEDataset(Dataset):
             self.features_npy_dir = Path(PROJECT_ROOT) / npy_dir
         else:
             self.features_npy_dir = None
+        # Multilayer NPY directory (shape T, n_layers, D) — uses original H5 subdirs
+        multilayer_dir = cfg.get("multilayer_npy_dir")
+        self.multilayer_npy_dir = Path(PROJECT_ROOT) / multilayer_dir if multilayer_dir else None
         self.fmri_dir = Path(cfg["_fmri_dir"])
 
         # Latent directory
@@ -123,13 +127,21 @@ class BrainFlowVAEDataset(Dataset):
             for stim_type in stim_types:
                 first_mod = next(iter(self.modalities))
                 mod_cfg = self.modalities[first_mod]
-                clip_dir = self.features_dir / mod_cfg["subdir"] / task / stim_type
 
-                if not clip_dir.exists():
-                    logger.warning("Feature dir missing: %s", clip_dir)
-                    continue
+                # Try to discover clips from multilayer NPY dir, then H5 dir
+                clip_stems = []
+                if self.multilayer_npy_dir is not None:
+                    subdir = mod_cfg.get("subdir", first_mod)
+                    npy_clip_dir = self.multilayer_npy_dir / subdir / task / stim_type
+                    if npy_clip_dir.exists():
+                        clip_stems = sorted(p.stem for p in npy_clip_dir.glob("*.npy"))
 
-                clip_stems = sorted(p.stem for p in clip_dir.glob("*.h5"))
+                if not clip_stems:
+                    clip_dir = self.features_dir / mod_cfg["subdir"] / task / stim_type
+                    if not clip_dir.exists():
+                        logger.warning("Feature dir missing: %s", clip_dir)
+                        continue
+                    clip_stems = sorted(p.stem for p in clip_dir.glob("*.h5"))
 
                 for clip_stem in clip_stems:
                     subj = self.subjects[0]
@@ -227,7 +239,36 @@ class BrainFlowVAEDataset(Dataset):
         for mod_name, mod_cfg in self.modalities.items():
             try:
                 feat = None
-                if self.features_npy_dir is not None:
+
+                # Try 1: Multilayer NPY (T, n_layers, D) → mean-pool → (T, D)
+                if feat is None and self.multilayer_npy_dir is not None:
+                    subdir = mod_cfg.get("subdir", mod_name)
+                    cache_key = ("ml", mod_name, task, stim_type, norm_name)
+                    if cache_key in self._feat_cache:
+                        clip_data = self._feat_cache[cache_key]
+                    else:
+                        npy_path = self.multilayer_npy_dir / subdir / task / stim_type / f"{norm_name}.npy"
+                        if not npy_path.exists():
+                            npy_path = self.multilayer_npy_dir / subdir / task / stim_type / f"{clip_stem}.npy"
+                        if npy_path.exists():
+                            raw = np.load(npy_path)  # (T, L, D)
+                            if raw.ndim == 3:
+                                clip_data = raw.mean(axis=1).astype(np.float32)  # (T, D)
+                            else:
+                                clip_data = raw.astype(np.float32)  # already (T, D)
+                            self._feat_cache[cache_key] = clip_data
+                        else:
+                            clip_data = None
+                    if clip_data is not None:
+                        safe_start = max(0, feat_start)
+                        safe_end = min(clip_data.shape[0], feat_end)
+                        if safe_start < safe_end:
+                            feat = clip_data[safe_start:safe_end]
+                        else:
+                            feat = np.zeros((0, clip_data.shape[-1]), dtype=np.float32)
+
+                # Try 2: Pre-pooled NPY (T, D)
+                if feat is None and self.features_npy_dir is not None:
                     cache_key = (mod_name, task, stim_type, norm_name)
                     if cache_key in self._feat_cache:
                         clip_data = self._feat_cache[cache_key]
@@ -246,6 +287,7 @@ class BrainFlowVAEDataset(Dataset):
                         else:
                             feat = np.zeros((0, clip_data.shape[1]), dtype=np.float32)
 
+                # Try 3: Raw H5 fallback
                 if feat is None:
                     raw = load_feature_clip_perfile(
                         str(self.features_dir), mod_name, mod_cfg,
@@ -552,11 +594,41 @@ def train(args):
 
     logger.info("Modality dimensions: %s", modality_dims)
 
+    # Build encoder — MoEVAE hybrid or default TemporalFusionEncoder
+    external_encoder = None
+    if args.moevae_checkpoint:
+        moevae_ckpt = Path(args.moevae_checkpoint)
+        if not moevae_ckpt.exists():
+            logger.error("MoEVAE checkpoint not found: %s", moevae_ckpt)
+            sys.exit(1)
+
+        # Load MoEVAE modality configs from its config
+        moevae_cfg = cfg.get("moevae", {})
+        moevae_modality_configs = moevae_cfg.get("modalities", {})
+        if not moevae_modality_configs:
+            # Fallback: derive from raw_features modalities (assume n_layers=1 if missing)
+            for mod_name, mod_cfg in cfg["raw_features"]["modalities"].items():
+                moevae_modality_configs[mod_name] = {
+                    "dim": mod_cfg["dim"],
+                    "n_layers": mod_cfg.get("n_layers", 1),
+                }
+
+        temporal_cfg = bf_cfg.get("temporal_transformer", bf_cfg.get("encoder", {}))
+        external_encoder = build_moevae_temporal_encoder(
+            moevae_checkpoint=str(moevae_ckpt),
+            modality_configs=moevae_modality_configs,
+            moevae_params=moevae_cfg.get("model", {}),
+            temporal_params=temporal_cfg,
+            device=device,
+        )
+        logger.info("Using MoEVAE temporal encoder from %s", moevae_ckpt)
+
     model = BrainFlowMOTFM_VAE(
         modality_dims=modality_dims,
         latent_dim=bf_cfg.get("latent_dim", 64),
         encoder_params=bf_cfg["encoder"],
         velocity_net_params=bf_cfg.get("velocity_net", {}),
+        encoder=external_encoder,
     ).to(device)
 
     # 3. Load frozen VAE decoder
@@ -814,5 +886,7 @@ if __name__ == "__main__":
                         help="Path to pre-trained encoder weights (best_encoder.pt)")
     parser.add_argument("--freeze_encoder", action="store_true",
                         help="Freeze encoder weights (use with --pretrained_encoder)")
+    parser.add_argument("--moevae_checkpoint", type=str, default=None,
+                        help="Path to pretrained MoEVAE checkpoint for hybrid encoder")
     args = parser.parse_args()
     train(args)

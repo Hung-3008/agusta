@@ -39,6 +39,9 @@ raw_features:
 # Precomputed NPY features
 raw_features_npy_dir: Data/raw_features_npy
 
+# Multilayer NPY features (T, n_layers, D) — mean-pooled at load time
+multilayer_npy_dir: Data/features_npy_multilayer
+
 # --- Pre-computed VAE latents ---
 latent_dir: Data/latents_vae64
 
@@ -103,6 +106,36 @@ brainflow:
     context_dim: 1024
     n_blocks: 6
     n_heads: 8
+    dropout: 0.1
+
+  # Temporal transformer (used when --moevae_checkpoint is given)
+  temporal_transformer:
+    hidden_dim: 1024
+    n_layers: 4
+    n_heads: 8
+    dropout: 0.1
+
+# --- MoEVAE config (used when --moevae_checkpoint is given) ---
+moevae:
+  modalities:
+    video:
+      dim: 1408
+      n_layers: 13
+    audio:
+      dim: 1280
+      n_layers: 4
+    text:
+      dim: 3072
+      n_layers: 5
+    omni:
+      dim: 3584
+      n_layers: 9
+  model:
+    latent_dim: 512
+    encoder_hidden: 1024
+    n_experts: 4
+    expert_hidden: 1024
+    decoder_hidden: 1024
     dropout: 0.1
 
 # =====================================================================

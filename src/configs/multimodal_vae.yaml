@@ -12,9 +12,9 @@ fmri:
   tr: 1.49
   n_voxels: 1000
 
-# --- Features (all layers NPY) ---
-features_dir: Data/features_npy_multilayer
-data_mode: npy  # 'npy' for NPY files (now multi-layer)
+# --- Features (mean-pooled NPY, preloaded into RAM) ---
+features_dir: Data/features_npy_pooled
+data_mode: npy
 
 modalities:
   video:
@@ -78,7 +78,7 @@ beta:
 dataloader:
   batch_size: 512
   val_batch_size: 512
-  num_workers: 8
+  num_workers: 0
   pin_memory: true
   stride: 1
 

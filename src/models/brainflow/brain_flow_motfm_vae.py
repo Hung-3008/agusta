@@ -368,16 +368,21 @@ class BrainFlowMOTFM_VAE(nn.Module):
         latent_dim: int = 64,
         encoder_params: dict = None,
         velocity_net_params: dict = None,
+        encoder: nn.Module = None,
     ):
         super().__init__()
         self.latent_dim = latent_dim
 
-        # 1. Encoder (from existing BrainFlow)
-        self.encoder = TemporalFusionEncoder(
-            modality_dims=modality_dims,
-            **(encoder_params or {}),
-        )
-        cond_dim = (encoder_params or {}).get("hidden_dim", 512)
+        # 1. Encoder — use external encoder if provided, else create default
+        if encoder is not None:
+            self.encoder = encoder
+            cond_dim = encoder.hidden_dim
+        else:
+            self.encoder = TemporalFusionEncoder(
+                modality_dims=modality_dims,
+                **(encoder_params or {}),
+            )
+            cond_dim = (encoder_params or {}).get("hidden_dim", 512)
 
         # 2. Latent velocity network
         vn_cfg = dict(velocity_net_params or {})
