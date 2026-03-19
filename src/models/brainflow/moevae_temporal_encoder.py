@@ -170,37 +170,110 @@ class MoEVAETemporalEncoder(nn.Module):
         return h
 
 
-def build_moevae_temporal_encoder(
-    moevae_checkpoint: str,
-    modality_configs: dict,
-    moevae_params: dict = None,
-    temporal_params: dict = None,
-    device: torch.device = None,
-) -> MoEVAETemporalEncoder:
-    """Build MoEVAETemporalEncoder from a pretrained MoEVAE checkpoint.
+class MoEVAEDirectEncoder(nn.Module):
+    """Direct MoEVAE encoder: Frozen MoEVAE per-TR, no temporal transformer.
+
+    Variant A: minimal trainable params. Relies on VelocityNet's cross-attention
+    to implicitly learn temporal patterns from the sequence of MoEVAE embeddings.
+
+    Per TR:  multimodal features → [Frozen MoEVAE] → μ (B, Z_vae=512)
+    Stack TRs → (B, T, Z_vae) — fed directly to VelocityNet cross-attention.
 
     Parameters
     ----------
-    moevae_checkpoint : str
-        Path to pretrained MoEVAE checkpoint (best.pt or last.pt).
-    modality_configs : dict
-        {mod_name: {'dim': int, 'n_layers': int}} for MoEVAE.
-    moevae_params : dict
-        MoEVAE model params (latent_dim, encoder_hidden, etc.).
-    temporal_params : dict
-        Temporal transformer params (hidden_dim, n_layers, n_heads, dropout).
-    device : torch.device
-
-    Returns
-    -------
-    MoEVAETemporalEncoder
+    moevae : MultimodalMoEVAE
+        Pretrained MoEVAE model. Encoder parts will be frozen.
     """
+
+    def __init__(self, moevae: nn.Module):
+        super().__init__()
+        self.hidden_dim = moevae.latent_dim  # e.g., 512
+        self.vae_latent_dim = moevae.latent_dim
+
+        # ---- Frozen MoEVAE encoder components ----
+        self.layer_pools = moevae.layer_pools
+        self.modality_encoders = moevae.encoders
+        self.moe_fusion = moevae.moe_fusion
+        self.modality_names = moevae.modality_names
+
+        # Freeze all MoEVAE encoder parts
+        for p in self.layer_pools.parameters():
+            p.requires_grad = False
+        for p in self.modality_encoders.parameters():
+            p.requires_grad = False
+        for p in self.moe_fusion.parameters():
+            p.requires_grad = False
+
+        n_frozen = sum(p.numel() for p in self.parameters())
+        print(f"[MoEVAEDirectEncoder] frozen={n_frozen:,}, trainable=0, "
+              f"output_dim={self.hidden_dim}")
+
+    @torch.no_grad()
+    def _encode_single_tr(
+        self,
+        per_tr_features: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Run frozen MoEVAE encoder on a single TR's features → μ (B, Z_vae)."""
+        modality_mus = []
+
+        for mod_name in self.modality_names:
+            if mod_name in per_tr_features:
+                x = per_tr_features[mod_name]
+                if x.dim() == 2:
+                    x_pooled = x
+                elif x.dim() == 3:
+                    x_pooled = self.layer_pools[mod_name](x)
+                else:
+                    raise ValueError(f"Unexpected dim {x.dim()} for {mod_name}")
+                mu_mod, _ = self.modality_encoders[mod_name](x_pooled)
+                modality_mus.append(mu_mod)
+            else:
+                B = next(iter(per_tr_features.values())).shape[0]
+                device = next(iter(per_tr_features.values())).device
+                modality_mus.append(
+                    torch.zeros(B, self.vae_latent_dim, device=device)
+                )
+
+        mu_fused, _ = self.moe_fusion(modality_mus)
+        return mu_fused
+
+    def forward(
+        self,
+        modality_features: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Encode multimodal features → context sequence (B, T, Z_vae).
+
+        No temporal transformer — raw MoEVAE embeddings per TR.
+        VelocityNet cross-attention handles temporal modeling.
+        """
+        first_feat = next(iter(modality_features.values()))
+        B = first_feat.shape[0]
+        T = first_feat.shape[1]
+
+        tr_embeddings = []
+        for t in range(T):
+            per_tr = {}
+            for mod_name, feat in modality_features.items():
+                if feat.dim() == 3:
+                    per_tr[mod_name] = feat[:, t, :]
+                elif feat.dim() == 4:
+                    per_tr[mod_name] = feat[:, t, :, :]
+                else:
+                    raise ValueError(f"Unexpected shape {feat.shape} for {mod_name}")
+
+            mu_t = self._encode_single_tr(per_tr)
+            tr_embeddings.append(mu_t)
+
+        z_seq = torch.stack(tr_embeddings, dim=1)  # (B, T, Z_vae)
+        return z_seq
+
+
+def _load_moevae(moevae_checkpoint, modality_configs, moevae_params, device):
+    """Shared helper: build and load MoEVAE from checkpoint."""
     from src.models.brainflow.multimodal_vae import MultimodalMoEVAE
 
     moevae_p = moevae_params or {}
-    temporal_p = temporal_params or {}
 
-    # Build MoEVAE
     moevae = MultimodalMoEVAE(
         modality_configs=modality_configs,
         latent_dim=moevae_p.get("latent_dim", 512),
@@ -211,23 +284,70 @@ def build_moevae_temporal_encoder(
         dropout=moevae_p.get("dropout", 0.1),
     )
 
-    # Load checkpoint
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ckpt = torch.load(moevae_checkpoint, map_location=device, weights_only=False)
     if "ema_model" in ckpt:
         moevae.load_state_dict(ckpt["ema_model"])
-        print(f"[build_moevae_temporal_encoder] Loaded MoEVAE from EMA weights")
+        print(f"[load_moevae] Loaded from EMA weights")
     elif "model" in ckpt:
         moevae.load_state_dict(ckpt["model"])
-        print(f"[build_moevae_temporal_encoder] Loaded MoEVAE from model weights")
+        print(f"[load_moevae] Loaded from model weights")
     else:
         moevae.load_state_dict(ckpt)
-        print(f"[build_moevae_temporal_encoder] Loaded MoEVAE state dict")
+        print(f"[load_moevae] Loaded state dict directly")
 
-    # Build hybrid encoder
-    encoder = MoEVAETemporalEncoder(
+    return moevae
+
+
+def build_moevae_direct_encoder(
+    moevae_checkpoint: str,
+    modality_configs: dict,
+    moevae_params: dict = None,
+    device: torch.device = None,
+) -> MoEVAEDirectEncoder:
+    """Build MoEVAEDirectEncoder (Variant A: no temporal transformer).
+
+    Parameters
+    ----------
+    moevae_checkpoint : str
+        Path to pretrained MoEVAE checkpoint.
+    modality_configs : dict
+        {mod_name: {'dim': int, 'n_layers': int}}.
+    moevae_params : dict
+        MoEVAE model params.
+    device : torch.device
+    """
+    moevae = _load_moevae(moevae_checkpoint, modality_configs, moevae_params, device)
+    return MoEVAEDirectEncoder(moevae)
+
+
+def build_moevae_temporal_encoder(
+    moevae_checkpoint: str,
+    modality_configs: dict,
+    moevae_params: dict = None,
+    temporal_params: dict = None,
+    device: torch.device = None,
+) -> MoEVAETemporalEncoder:
+    """Build MoEVAETemporalEncoder (Variant B: with temporal transformer).
+
+    Parameters
+    ----------
+    moevae_checkpoint : str
+        Path to pretrained MoEVAE checkpoint.
+    modality_configs : dict
+        {mod_name: {'dim': int, 'n_layers': int}}.
+    moevae_params : dict
+        MoEVAE model params.
+    temporal_params : dict
+        Temporal transformer params (hidden_dim, n_layers, n_heads, dropout).
+    device : torch.device
+    """
+    temporal_p = temporal_params or {}
+    moevae = _load_moevae(moevae_checkpoint, modality_configs, moevae_params, device)
+
+    return MoEVAETemporalEncoder(
         moevae=moevae,
         hidden_dim=temporal_p.get("hidden_dim", 1024),
         n_layers=temporal_p.get("n_layers", 4),
@@ -236,4 +356,3 @@ def build_moevae_temporal_encoder(
         max_seq_len=temporal_p.get("max_seq_len", 64),
     )
 
-    return encoder

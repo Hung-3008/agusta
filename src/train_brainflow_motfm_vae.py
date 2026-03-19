@@ -40,7 +40,7 @@ from src.data.dataset import (
 )
 from src.models.brainflow.brain_flow_motfm_vae import BrainFlowMOTFM_VAE
 from src.models.brainflow.fmri_vae import build_vae
-from src.models.brainflow.moevae_temporal_encoder import build_moevae_temporal_encoder
+from src.models.brainflow.moevae_temporal_encoder import build_moevae_temporal_encoder, build_moevae_direct_encoder
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("train_brainflow_motfm_vae")
@@ -613,21 +613,38 @@ def train(args):
                     "n_layers": mod_cfg.get("n_layers", 1),
                 }
 
-        temporal_cfg = bf_cfg.get("temporal_transformer", bf_cfg.get("encoder", {}))
-        external_encoder = build_moevae_temporal_encoder(
-            moevae_checkpoint=str(moevae_ckpt),
-            modality_configs=moevae_modality_configs,
-            moevae_params=moevae_cfg.get("model", {}),
-            temporal_params=temporal_cfg,
-            device=device,
-        )
-        logger.info("Using MoEVAE temporal encoder from %s", moevae_ckpt)
+        if args.moevae_direct:
+            # Variant A: frozen MoEVAE only, no temporal transformer
+            external_encoder = build_moevae_direct_encoder(
+                moevae_checkpoint=str(moevae_ckpt),
+                modality_configs=moevae_modality_configs,
+                moevae_params=moevae_cfg.get("model", {}),
+                device=device,
+            )
+            logger.info("Using MoEVAE DIRECT encoder (no temporal transformer) from %s", moevae_ckpt)
+        else:
+            # Variant B: frozen MoEVAE + trainable temporal transformer
+            temporal_cfg = bf_cfg.get("temporal_transformer", bf_cfg.get("encoder", {}))
+            external_encoder = build_moevae_temporal_encoder(
+                moevae_checkpoint=str(moevae_ckpt),
+                modality_configs=moevae_modality_configs,
+                moevae_params=moevae_cfg.get("model", {}),
+                temporal_params=temporal_cfg,
+                device=device,
+            )
+            logger.info("Using MoEVAE temporal encoder from %s", moevae_ckpt)
+
+    # Adjust velocity_net context_dim to match encoder output
+    vn_params = dict(bf_cfg.get("velocity_net", {}))
+    if external_encoder is not None:
+        vn_params["context_dim"] = external_encoder.hidden_dim
+        logger.info("VelocityNet context_dim set to %d (from encoder)", external_encoder.hidden_dim)
 
     model = BrainFlowMOTFM_VAE(
         modality_dims=modality_dims,
         latent_dim=bf_cfg.get("latent_dim", 64),
         encoder_params=bf_cfg["encoder"],
-        velocity_net_params=bf_cfg.get("velocity_net", {}),
+        velocity_net_params=vn_params,
         encoder=external_encoder,
     ).to(device)
 
@@ -888,5 +905,7 @@ if __name__ == "__main__":
                         help="Freeze encoder weights (use with --pretrained_encoder)")
     parser.add_argument("--moevae_checkpoint", type=str, default=None,
                         help="Path to pretrained MoEVAE checkpoint for hybrid encoder")
+    parser.add_argument("--moevae_direct", action="store_true",
+                        help="Use MoEVAE direct encoder (no temporal transformer, Variant A)")
     args = parser.parse_args()
     train(args)
