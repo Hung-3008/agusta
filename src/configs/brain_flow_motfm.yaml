@@ -1,16 +1,13 @@
 # =====================================================================
 # BrainFlow MOTFM — Flow Matching with MONAI UNet backbone
 # =====================================================================
-# Architecture adapted from MOTFM (Medical Optimal Transport Flow Matching).
-# Uses MONAI DiffusionModelUNet (spatial_dims=2) with pseudo-2D fMRI (32x32).
-# Uses Meta flow_matching library for OT-CFM path + ODE solver.
-#
-# Run: python src/train_brainflow_motfm.py --config src/configs/brain_flow_motfm.yaml
+# OT-CFM (Optimal Transport Conditional Flow Matching)
+# - Path: x_t = (1-t)*x_0 + t*x_1,  velocity target: dx = x_1 - x_0
+# - Loss: MSE(v_pred, dx)
+# - Inference: ODE solve from t=0 → t=1
 # =====================================================================
 
 data_root: Data
-latent_dir: Data/latents_vae64
-vae_checkpoint: outputs/fmri_vae_64/best.pt
 
 fmri:
   dir: algonauts_2025.competitors/fmri
@@ -20,7 +17,7 @@ fmri:
   excluded_samples_end: 5
   hrf_delay: 5
 
-# --- Raw features (no PCA) ---
+# --- Raw features ---
 raw_features:
   dir: Data/algonauts_2025.features
   sample_freq: 0.6711
@@ -57,7 +54,7 @@ splits:
     train: [bourne, figures, life, wolf]
     val: []
 
-# --- Sliding window (Many-to-One) ---
+# --- Sliding window ---
 sliding_window:
   feature_context_trs: 10
   stride: 1
@@ -71,7 +68,7 @@ dataloader:
   pin_memory: true
 
 # =====================================================================
-# BrainFlow MOTFM model config
+# Model config
 # =====================================================================
 brainflow:
   output_dim: 1000
@@ -81,12 +78,12 @@ brainflow:
     hidden_dim: 1024
     n_layers: 6
     n_heads: 8
-    dropout: 0.3
-    modality_dropout: 0.3
+    dropout: 0.1
+    modality_dropout: 0.15
     projector_depth: 2
 
-  # UNet velocity network (adapted from MOTFM)
-  # fMRI (1000) → pad to 1024 → reshape (1, 32, 32) pseudo-2D
+  # UNet velocity network (MONAI DiffusionModelUNet)
+  # fMRI (1000) → pad to 1024 → reshape (1, 32, 32)
   unet:
     spatial_dims: 2
     in_channels: 1
@@ -98,24 +95,22 @@ brainflow:
     num_head_channels: [64, 128, 256, 512]
     transformer_num_layers: 2
     with_conditioning: true
-    cross_attention_dim: 1024   # must match encoder hidden_dim
+    cross_attention_dim: 1024
     max_timestep: 1000
 
-  cfg_drop_prob: 0.05
-
 # =====================================================================
-# Solver args (for validation sampling)
+# Solver args (validation inference)
 # =====================================================================
 solver_args:
   method: midpoint
   time_points: 50
 
 # =====================================================================
-# Training config
+# Training
 # =====================================================================
 training:
   n_epochs: 200
-  lr: 1.0e-4
+  lr: 3.0e-4
   weight_decay: 0.0
   warmup_ratio: 0.05
   min_lr: 1.0e-6
@@ -123,26 +118,7 @@ training:
   use_amp: true
   log_every_n_steps: 20
   val_every_n_epochs: 5
-  guidance_scale: 1.0
   ema_decay: 0.999
-  # Data augmentation
-  mixup_alpha: 0.2
-
-# =====================================================================
-# Encoder pre-training config (Stage 1) — optional
-# =====================================================================
-pretrain:
-  n_epochs: 50
-  lr: 2.0e-4
-  pcc_weight: 0.1
-  val_every_n_epochs: 5
-  head_hidden_mult: 4
-  head_dropout: 0.1
-  head_weight_decay: 0.0
-  encoder_dropout: 0.15
-  modality_dropout: 0.15
-  early_stop_patience: 15
-  min_lr: 1.0e-6
 
 # --- Output ---
 output_dir: outputs/brainflow_motfm

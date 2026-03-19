@@ -1,17 +1,13 @@
-"""BrainFlow MOTFM — Flow Matching with MONAI UNet backbone.
+"""BrainFlow MOTFM — OT-CFM with MONAI UNet backbone.
 
-Adapted from MOTFM (Medical Optimal Transport Flow Matching).
-Uses Meta's flow_matching library for OT-CFM path + ODE solver.
-Uses MONAI's DiffusionModelUNet (spatial_dims=2) as velocity network.
+OT-CFM (Optimal Transport Conditional Flow Matching):
+  - Path:  x_t = (1-t)*x_0 + t*x_1
+  - Target velocity:  dx = x_1 - x_0
+  - Loss:  MSE(v_pred, dx)
+  - Inference: ODE solve from t=0 → t=1
 
-fMRI (1000 voxels) is reshaped to pseudo-2D (1, 32, 32) with 24 padding.
-Encoder output provides cross-attention conditioning.
-
-Architecture:
-  - TemporalFusionEncoder: multimodal features → context (B, H)
-  - MergedModel (from MOTFM): wraps DiffusionModelUNet
-  - AffineProbPath + CondOTScheduler: OT-CFM path
-  - ODESolver: inference sampling
+fMRI (1000 voxels) → pad to 1024 → reshape (1, 32, 32) pseudo-2D.
+Encoder output provides cross-attention conditioning to UNet.
 """
 
 import math
@@ -151,7 +147,7 @@ class TemporalFusionEncoder(nn.Module):
         self,
         modality_features: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """Encode multimodal features → single context vector (B, H)."""
+        """Encode multimodal features → context sequence (B, T, H)."""
         B = None
         T = None
         all_tokens = []
@@ -192,9 +188,8 @@ class TemporalFusionEncoder(nn.Module):
         out = self.temporal_transformer(fused)
         out = self.final_norm(out)
 
-        # Take LAST token (= current TR, most recent info)
-        context = out[:, -1, :]
-        return context
+        # Return full sequence for multi-token cross-attention (B, T, H)
+        return out
 
 
 # =============================================================================
@@ -225,7 +220,7 @@ class MergedModel(nn.Module):
         Args:
             x: (B, 1, H, W) pseudo-2D fMRI.
             t: timesteps in [0,1], will be scaled to [0, max_timestep - 1].
-            cond: (B, 1, cross_attention_dim) context for cross-attention.
+            cond: (B, T, cross_attention_dim) context for cross-attention.
         """
         # Scale continuous t → discrete timesteps (from MOTFM)
         t = t * (self.max_timestep - 1)
@@ -263,11 +258,9 @@ class BrainFlowMOTFM(nn.Module):
         output_dim: int = 1000,
         encoder_params: dict = None,
         unet_params: dict = None,
-        cfg_drop_prob: float = 0.1,
     ):
         super().__init__()
         self.output_dim = output_dim
-        self.cfg_drop_prob = cfg_drop_prob
 
         # 1. Encoder (from existing BrainFlow)
         self.encoder = TemporalFusionEncoder(
@@ -302,27 +295,19 @@ class BrainFlowMOTFM(nn.Module):
         modality_features: dict[str, torch.Tensor],
         target: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute OT-CFM loss (training).
+        """Compute OT-CFM loss.
 
-        Same logic as MOTFM trainer.py:_compute_loss()
-
-        Args:
-            modality_features: {mod: (B, T_ctx, D_mod)}
-            target: (B, D) — ground truth fMRI (1000-d)
+        Path:  x_t = (1-t)*x_0 + t*x_1
+        Target: dx = x_1 - x_0
+        Loss:  MSE(v_pred, dx)
         """
         # Encode multimodal features → context
-        context = self.encoder(modality_features)  # (B, H)
-
-        # CFG dropout: zero out context randomly
-        if self.training and self.cfg_drop_prob > 0.0:
-            B = context.shape[0]
-            cfg_keep = (torch.rand(B, 1, device=context.device) > self.cfg_drop_prob).float()
-            context = context * cfg_keep
+        context = self.encoder(modality_features)  # (B, T, H)
 
         # Reshape fMRI to pseudo-2D for UNet
         x_1 = fmri_to_2d(target)  # (B, 1, 32, 32)
 
-        # OT-CFM: sample from noise → data path (from MOTFM)
+        # OT-CFM: sample path
         x_0 = torch.randn_like(x_1)  # N(0, I)
         t = torch.rand(x_1.shape[0], device=x_1.device)
         sample_info = self.path.sample(t=t, x_0=x_0, x_1=x_1)
@@ -334,7 +319,7 @@ class BrainFlowMOTFM(nn.Module):
             cond=context,
         )
 
-        # MSE loss (from MOTFM)
+        # MSE loss
         return F.mse_loss(v_pred, sample_info.dx_t)
 
     @torch.inference_mode()
@@ -342,20 +327,10 @@ class BrainFlowMOTFM(nn.Module):
         self,
         modality_features: dict[str, torch.Tensor],
         n_timesteps: int = 50,
-        guidance_scale: float = 1.0,
         solver_method: str = "midpoint",
     ) -> torch.Tensor:
-        """Generate fMRI using ODESolver (from MOTFM).
-
-        Args:
-            modality_features: {mod: (B, T_ctx, D_mod)}
-            n_timesteps: number of solver time points
-            guidance_scale: classifier-free guidance scale
-            solver_method: ODE solver method ("euler", "midpoint", "rk4")
-
-        Returns: (B, D) — generated fMRI (1000-d)
-        """
-        context = self.encoder(modality_features)  # (B, H)
+        """Generate fMRI by solving ODE from t=0 (noise) → t=1 (data)."""
+        context = self.encoder(modality_features)  # (B, T, H)
         B = context.shape[0]
         device = context.device
         dtype = context.dtype
@@ -363,36 +338,17 @@ class BrainFlowMOTFM(nn.Module):
         # Start from noise
         x_init = torch.randn(B, 1, IMG_H, IMG_W, device=device, dtype=dtype)
 
-        if guidance_scale != 1.0:
-            # Classifier-free guidance: manual Euler
-            context_uncond = torch.zeros_like(context)
-            t_span = torch.linspace(0, 1, n_timesteps + 1, device=device, dtype=dtype)
+        # ODE solve
+        solver = ODESolver(velocity_model=self.velocity_net)
+        T = torch.linspace(0, 1, n_timesteps, device=device, dtype=dtype)
 
-            x = x_init
-            for step in range(1, len(t_span)):
-                dt = t_span[step] - t_span[step - 1]
-                t_batch = t_span[step - 1].expand(B)
+        sol = solver.sample(
+            time_grid=T,
+            x_init=x_init,
+            method=solver_method,
+            step_size=1.0 / n_timesteps,
+            return_intermediates=False,
+            cond=context,
+        )
 
-                v_cond = self.velocity_net(x, t_batch, cond=context)
-                v_uncond = self.velocity_net(x, t_batch, cond=context_uncond)
-                v = v_uncond + guidance_scale * (v_cond - v_uncond)
-
-                x = x + dt * v
-
-            return fmri_from_2d(x)
-        else:
-            # Standard ODESolver (from MOTFM)
-            solver = ODESolver(velocity_model=self.velocity_net)
-            T = torch.linspace(0, 1, n_timesteps, device=device, dtype=dtype)
-
-            sol = solver.sample(
-                time_grid=T,
-                x_init=x_init,
-                method=solver_method,
-                step_size=1.0 / n_timesteps,
-                return_intermediates=False,
-                cond=context,
-            )
-
-            # sol is the final state (B, 1, H, W)
-            return fmri_from_2d(sol)
+        return fmri_from_2d(sol)

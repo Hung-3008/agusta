@@ -1,6 +1,4 @@
-"""Train BrainFlow MOTFM — Flow Matching with MONAI UNet backbone.
-
-Adapted from MOTFM trainer with BrainFlow data pipeline.
+"""Train BrainFlow MOTFM — OT-CFM with MONAI UNet backbone.
 
 Usage:
     python src/train_brainflow_motfm.py --config src/configs/brain_flow_motfm.yaml --fast_dev_run
@@ -451,7 +449,6 @@ def train(args):
         output_dim=bf_cfg.get("output_dim", cfg["fmri"]["n_voxels"]),
         encoder_params=bf_cfg["encoder"],
         unet_params=bf_cfg.get("unet", {}),
-        cfg_drop_prob=bf_cfg.get("cfg_drop_prob", 0.1),
     ).to(device)
 
     # Load pre-trained encoder if provided
@@ -490,14 +487,12 @@ def train(args):
         )
         logger.info("Optimizer: UNet + final_norm, lr=%.2e", tr_cfg["lr"])
     else:
-        encoder_lr_scale = tr_cfg.get("encoder_lr_scale", 3.0)
-        encoder_lr = tr_cfg["lr"] * encoder_lr_scale
-        optimizer = torch.optim.AdamW([
-            {"params": model.encoder.parameters(), "lr": encoder_lr},
-            {"params": model.velocity_net.parameters(), "lr": tr_cfg["lr"]},
-        ], weight_decay=tr_cfg["weight_decay"])
-        logger.info("Optimizer: encoder lr=%.2e (%.1fx), UNet lr=%.2e",
-                    encoder_lr, encoder_lr_scale, tr_cfg["lr"])
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=tr_cfg["lr"],
+            weight_decay=tr_cfg["weight_decay"],
+        )
+        logger.info("Optimizer: all params, lr=%.2e", tr_cfg["lr"])
 
     total_steps = len(train_loader) * tr_cfg["n_epochs"]
     if args.fast_dev_run:
@@ -574,16 +569,6 @@ def train(args):
             mod_features = _extract_modality_features(batch, modality_names, device)
             fmri_target = batch["fmri"].to(device)     # (B, V)
 
-            # Data Augmentation: Mixup
-            B = fmri_target.shape[0]
-            mixup_alpha = tr_cfg.get("mixup_alpha", 0.0)
-            if mixup_alpha > 0 and B > 1:
-                lam = np.random.beta(mixup_alpha, mixup_alpha)
-                perm = torch.randperm(B, device=device)
-                fmri_target = lam * fmri_target + (1 - lam) * fmri_target[perm]
-                for mod_name in mod_features:
-                    mod_features[mod_name] = lam * mod_features[mod_name] + (1 - lam) * mod_features[mod_name][perm]
-
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
                 loss = model(mod_features, fmri_target)
 
@@ -626,7 +611,6 @@ def train(args):
                     gen_fmri = model.synthesise(
                         mod_features,
                         n_timesteps=val_n_timesteps,
-                        guidance_scale=tr_cfg.get("guidance_scale", 1.0),
                         solver_method=val_solver_method,
                     )  # (B, V)
 
