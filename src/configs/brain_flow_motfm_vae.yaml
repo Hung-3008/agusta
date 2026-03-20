@@ -29,15 +29,27 @@ raw_features:
     audio:
       subdir: whisper
       dim: 1280
-    text:
+    text_1b:
+      subdir: Llama-3.2-1B
+      dim: 2048
+    text_3b:
       subdir: Llama-3.2-3B
       dim: 3072
     omni:
       subdir: qwen-2-5-omni-7b
       dim: 3584
+    vlm_14b:
+      subdir: InternVL3_14B
+      dim: 5120
+    vlm_8b:
+      subdir: internvl3_8b_8bit
+      dim: 3584
+    text_qw:
+      subdir: qwen2-5_3B
+      dim: 2048
 
-# Precomputed NPY features
-raw_features_npy_dir: Data/raw_features_npy
+# Precomputed NPY features (mean-pooled per timestep)
+raw_features_npy_dir: Data/features_npy_pooled
 
 # Multilayer NPY features (T, n_layers, D) — mean-pooled at load time
 multilayer_npy_dir: Data/features_npy_multilayer
@@ -124,12 +136,24 @@ moevae:
     audio:
       dim: 1280
       n_layers: 4
-    text:
+    text_1b:
+      dim: 2048
+      n_layers: 3
+    text_3b:
       dim: 3072
       n_layers: 5
     omni:
       dim: 3584
       n_layers: 9
+    vlm_14b:
+      dim: 5120
+      n_layers: 5
+    vlm_8b:
+      dim: 3584
+      n_layers: 4
+    text_qw:
+      dim: 2048
+      n_layers: 7
   model:
     latent_dim: 512
     encoder_hidden: 1024

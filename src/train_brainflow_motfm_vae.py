@@ -64,6 +64,9 @@ class BrainFlowVAEDataset(Dataset):
 
     Loads pre-computed VAE latent vectors as training targets instead of
     raw fMRI. Also loads raw fMRI for validation PCC computation.
+
+    Optionally loads precomputed MoEVAE context latents (moevae_latent_dir)
+    to avoid online MoEVAE inference during training.
     """
 
     def __init__(self, cfg, split="train"):
@@ -86,8 +89,12 @@ class BrainFlowVAEDataset(Dataset):
         self.multilayer_npy_dir = Path(PROJECT_ROOT) / multilayer_dir if multilayer_dir else None
         self.fmri_dir = Path(cfg["_fmri_dir"])
 
-        # Latent directory
+        # Latent directory (VAE 64-dim targets)
         self.latent_dir = Path(PROJECT_ROOT) / cfg["latent_dir"]
+
+        # MoEVAE precomputed context directory (512-dim per TR)
+        moevae_dir = cfg.get("moevae_latent_dir")
+        self.moevae_latent_dir = Path(PROJECT_ROOT) / moevae_dir if moevae_dir else None
 
         self.tr = cfg["fmri"]["tr"]
         self.excl_start = cfg["fmri"].get("excluded_samples_start", 0)
@@ -107,6 +114,7 @@ class BrainFlowVAEDataset(Dataset):
         self._fmri_cache = {}
         self._feat_cache = {}
         self._latent_cache = {}
+        self._moevae_cache = {}
         self.samples = self._build_index()
 
     def _normalize_clip_name(self, clip_name: str, task: str) -> str:
@@ -217,6 +225,22 @@ class BrainFlowVAEDataset(Dataset):
         self._latent_cache[cache_key] = data
         return data
 
+    def _load_moevae_clip(self, task, stim_type, clip_name):
+        """Load pre-computed MoEVAE context latent for a clip."""
+        if self.moevae_latent_dir is None:
+            return None
+        cache_key = (task, stim_type, clip_name)
+        if cache_key in self._moevae_cache:
+            return self._moevae_cache[cache_key]
+
+        moevae_path = self.moevae_latent_dir / task / stim_type / f"{clip_name}.npy"
+        if not moevae_path.exists():
+            return None
+
+        data = np.load(moevae_path).astype(np.float32)
+        self._moevae_cache[cache_key] = data
+        return data
+
     def __getitem__(self, idx):
         info = self.samples[idx]
         task = info["task"]
@@ -273,7 +297,8 @@ class BrainFlowVAEDataset(Dataset):
                     if cache_key in self._feat_cache:
                         clip_data = self._feat_cache[cache_key]
                     else:
-                        npy_path = self.features_npy_dir / mod_name / task / stim_type / f"{norm_name}.npy"
+                        subdir = mod_cfg.get("subdir", mod_name)
+                        npy_path = self.features_npy_dir / subdir / task / stim_type / f"{norm_name}.npy"
                         if npy_path.exists():
                             clip_data = np.load(npy_path)
                             self._feat_cache[cache_key] = clip_data
@@ -342,6 +367,23 @@ class BrainFlowVAEDataset(Dataset):
             "n_trs": n_trs,
         }
         result.update(mod_features)
+
+        # Load precomputed MoEVAE context if available
+        moevae_data = self._load_moevae_clip(task, stim_type, norm_name)
+        if moevae_data is None:
+            moevae_data = self._load_moevae_clip(task, stim_type, clip_stem)
+        if moevae_data is not None:
+            # Window the moevae context the same way as features
+            safe_start = max(0, feat_start)
+            safe_end = min(moevae_data.shape[0], feat_end)
+            if safe_start < safe_end:
+                ctx = moevae_data[safe_start:safe_end]
+            else:
+                ctx = np.zeros((0, moevae_data.shape[-1]), dtype=np.float32)
+            if ctx.shape[0] < self.feat_seq_len:
+                pad_len = self.feat_seq_len - ctx.shape[0]
+                ctx = np.pad(ctx, ((pad_len, 0), (0, 0)), mode="constant")
+            result["moevae_context"] = torch.from_numpy(ctx.copy())
 
         return result
 
@@ -569,6 +611,12 @@ def train(args):
     cfg = load_config(args.config)
     cfg = resolve_paths(cfg, PROJECT_ROOT)
 
+    # Set moevae_latent_dir if using precomputed context
+    use_precomputed_context = bool(args.moevae_precomputed)
+    if use_precomputed_context:
+        cfg["moevae_latent_dir"] = args.moevae_precomputed
+        logger.info("Using PRECOMPUTED MoEVAE context from: %s", args.moevae_precomputed)
+
     torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -596,7 +644,14 @@ def train(args):
 
     # Build encoder — MoEVAE hybrid or default TemporalFusionEncoder
     external_encoder = None
-    if args.moevae_checkpoint:
+    if use_precomputed_context:
+        # Precomputed mode: no encoder needed, set context_dim from MoEVAE latent
+        moevae_cfg = cfg.get("moevae", {})
+        moevae_latent_dim = moevae_cfg.get("model", {}).get("latent_dim", 512)
+        vn_params = dict(bf_cfg.get("velocity_net", {}))
+        vn_params["context_dim"] = moevae_latent_dim
+        logger.info("PRECOMPUTED mode: VelocityNet context_dim=%d (no encoder)", moevae_latent_dim)
+    elif args.moevae_checkpoint:
         moevae_ckpt = Path(args.moevae_checkpoint)
         if not moevae_ckpt.exists():
             logger.error("MoEVAE checkpoint not found: %s", moevae_ckpt)
@@ -633,12 +688,11 @@ def train(args):
                 device=device,
             )
             logger.info("Using MoEVAE temporal encoder from %s", moevae_ckpt)
-
-    # Adjust velocity_net context_dim to match encoder output
-    vn_params = dict(bf_cfg.get("velocity_net", {}))
-    if external_encoder is not None:
+        vn_params = dict(bf_cfg.get("velocity_net", {}))
         vn_params["context_dim"] = external_encoder.hidden_dim
         logger.info("VelocityNet context_dim set to %d (from encoder)", external_encoder.hidden_dim)
+    else:
+        vn_params = dict(bf_cfg.get("velocity_net", {}))
 
     model = BrainFlowMOTFM_VAE(
         modality_dims=modality_dims,
@@ -666,7 +720,12 @@ def train(args):
             logger.error("Pre-trained encoder not found: %s", enc_path)
             sys.exit(1)
 
-    # Freeze encoder if requested
+    # Freeze encoder if requested or using precomputed context
+    if use_precomputed_context:
+        for p in model.encoder.parameters():
+            p.requires_grad = False
+        logger.info("PRECOMPUTED mode: Encoder FROZEN — only VelocityNet trainable")
+
     if args.freeze_encoder:
         for p in model.encoder.parameters():
             p.requires_grad = False
@@ -681,7 +740,15 @@ def train(args):
     # 4. Optimizer & Scheduler
     tr_cfg = cfg["training"]
 
-    if args.freeze_encoder:
+    if use_precomputed_context:
+        trainable_params = list(model.velocity_net.parameters())
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=tr_cfg["lr"],
+            weight_decay=tr_cfg["weight_decay"],
+        )
+        logger.info("Optimizer: VelocityNet only, lr=%.2e", tr_cfg["lr"])
+    elif args.freeze_encoder:
         trainable_params = list(model.velocity_net.parameters()) + \
                           list(model.encoder.final_norm.parameters())
         optimizer = torch.optim.AdamW(
@@ -770,11 +837,15 @@ def train(args):
             if args.fast_dev_run and batch_idx >= 2:
                 break
 
-            mod_features = _extract_modality_features(batch, modality_names, device)
             latent_target = batch["latent"].to(device)  # (B, Z) — VAE latent
 
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
-                loss = model(mod_features, latent_target)
+                if use_precomputed_context and "moevae_context" in batch:
+                    context = batch["moevae_context"].to(device)  # (B, T, 512)
+                    loss = model.forward_with_context(context, latent_target)
+                else:
+                    mod_features = _extract_modality_features(batch, modality_names, device)
+                    loss = model(mod_features, latent_target)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -809,15 +880,23 @@ def train(args):
                     if args.fast_dev_run and batch_idx >= 2:
                         break
 
-                    mod_features = _extract_modality_features(batch, modality_names, device)
                     fmri_target = batch["fmri"].to(device)  # Raw fMRI for PCC
 
                     # Generate fMRI via latent → VAE decode
-                    gen_fmri = model.synthesise(
-                        mod_features,
-                        n_timesteps=val_n_timesteps,
-                        solver_method=val_solver_method,
-                    )  # (B, V) — decoded fMRI
+                    if use_precomputed_context and "moevae_context" in batch:
+                        context = batch["moevae_context"].to(device)
+                        gen_fmri = model.synthesise_with_context(
+                            context,
+                            n_timesteps=val_n_timesteps,
+                            solver_method=val_solver_method,
+                        )
+                    else:
+                        mod_features = _extract_modality_features(batch, modality_names, device)
+                        gen_fmri = model.synthesise(
+                            mod_features,
+                            n_timesteps=val_n_timesteps,
+                            solver_method=val_solver_method,
+                        )  # (B, V) — decoded fMRI
 
                     clip_keys = batch["clip_key"]
                     target_trs = batch["target_tr"]
@@ -907,5 +986,7 @@ if __name__ == "__main__":
                         help="Path to pretrained MoEVAE checkpoint for hybrid encoder")
     parser.add_argument("--moevae_direct", action="store_true",
                         help="Use MoEVAE direct encoder (no temporal transformer, Variant A)")
+    parser.add_argument("--moevae_precomputed", type=str, default=None,
+                        help="Path to precomputed MoEVAE latents dir (e.g. Data/moevae_latents)")
     args = parser.parse_args()
     train(args)

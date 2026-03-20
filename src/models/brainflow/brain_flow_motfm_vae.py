@@ -436,6 +436,33 @@ class BrainFlowMOTFM_VAE(nn.Module):
         # MSE loss
         return F.mse_loss(v_pred, sample_info.dx_t)
 
+    def forward_with_context(
+        self,
+        context: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute OT-CFM loss with precomputed encoder context.
+
+        Args:
+            context: (B, T, H) precomputed MoEVAE context.
+            target: (B, latent_dim) pre-computed VAE latent vector.
+
+        Returns:
+            loss: scalar MSE(v_pred, dx_t).
+        """
+        x_1 = target
+        x_0 = torch.randn_like(x_1)
+        t = torch.rand(x_1.shape[0], device=x_1.device)
+        sample_info = self.path.sample(t=t, x_0=x_0, x_1=x_1)
+
+        v_pred = self.velocity_net(
+            x=sample_info.x_t,
+            t=sample_info.t,
+            cond=context,
+        )
+
+        return F.mse_loss(v_pred, sample_info.dx_t)
+
     @torch.inference_mode()
     def synthesise(
         self,
@@ -478,6 +505,39 @@ class BrainFlowMOTFM_VAE(nn.Module):
             return fmri_pred.squeeze(1)  # (B, V)
         else:
             # No VAE decoder loaded — return raw latent
+            return z_pred
+
+    @torch.inference_mode()
+    def synthesise_with_context(
+        self,
+        context: torch.Tensor,
+        n_timesteps: int = 50,
+        solver_method: str = "midpoint",
+    ) -> torch.Tensor:
+        """Generate fMRI from precomputed context (no encoder pass)."""
+        B = context.shape[0]
+        device = context.device
+        dtype = context.dtype
+
+        x_init = torch.randn(B, self.latent_dim, device=device, dtype=dtype)
+        solver = ODESolver(velocity_model=self.velocity_net)
+        T = torch.linspace(0, 1, n_timesteps, device=device, dtype=dtype)
+
+        z_pred = solver.sample(
+            time_grid=T,
+            x_init=x_init,
+            method=solver_method,
+            step_size=1.0 / n_timesteps,
+            return_intermediates=False,
+            cond=context,
+        )
+
+        if self.vae_decoder is not None:
+            z_for_decode = z_pred.unsqueeze(1)
+            subject_id = torch.zeros(B, dtype=torch.long, device=device)
+            fmri_pred = self.vae_decoder(z_for_decode, subject_id)
+            return fmri_pred.squeeze(1)
+        else:
             return z_pred
 
     @torch.inference_mode()
