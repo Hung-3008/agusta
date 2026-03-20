@@ -60,8 +60,13 @@ class DirectFlowDataset(Dataset):
         self.splits_cfg = cfg.get("splits", {})
 
         self.fmri_dir = Path(cfg["_fmri_dir"])
-        self.context_dir = Path(PROJECT_ROOT) / cfg["context_latent_dir"]
-        self.context_dim = cfg.get("context_dim", 512)
+        
+        if "context_latent_dirs" in cfg:
+            self.context_dirs = [Path(PROJECT_ROOT) / d for d in cfg["context_latent_dirs"]]
+        else:
+            self.context_dirs = [Path(PROJECT_ROOT) / cfg["context_latent_dir"]]
+            
+        self.context_dim = cfg.get("context_dim", 5760)
 
         self.tr = cfg["fmri"]["tr"]
         self.excl_start = cfg["fmri"].get("excluded_samples_start", 0)
@@ -129,6 +134,20 @@ class DirectFlowDataset(Dataset):
         
         return data
 
+    _modality_dim_cache = {}
+
+    def _get_modality_dim(self, ctx_dir):
+        """Detect feature dimension for a modality by loading one sample file."""
+        key = str(ctx_dir)
+        if key in self._modality_dim_cache:
+            return self._modality_dim_cache[key]
+        # Find any .npy file in the modality directory
+        for f in ctx_dir.rglob("*.npy"):
+            dim = np.load(f).shape[-1]
+            self._modality_dim_cache[key] = dim
+            return dim
+        raise ValueError(f"No .npy files found in {ctx_dir}")
+
     def _build_index_and_preload(self):
         """Build sample index and preload all data into RAM."""
         samples = []
@@ -143,12 +162,13 @@ class DirectFlowDataset(Dataset):
                 continue
 
             for stim_type in stim_types:
-                ctx_clip_dir = self.context_dir / task / stim_type
-                if not ctx_clip_dir.exists():
-                    logger.warning("Context dir missing: %s", ctx_clip_dir)
+                # Use the first directory to find all available clip names
+                ref_ctx_dir = self.context_dirs[0] / task / stim_type
+                if not ref_ctx_dir.exists():
+                    logger.warning("Context dir missing: %s", ref_ctx_dir)
                     continue
 
-                clip_stems = sorted(p.stem for p in ctx_clip_dir.glob("*.npy"))
+                clip_stems = sorted(p.stem for p in ref_ctx_dir.glob("*.npy"))
 
                 for clip_stem in clip_stems:
                     norm_name = self._normalize_clip_name(clip_stem, task)
@@ -171,13 +191,32 @@ class DirectFlowDataset(Dataset):
                         n_trs = fmri_data.shape[0]
 
                         # Load context (shared across subjects — same stimulus!)
-                        ctx_path = ctx_clip_dir / f"{clip_stem}.npy"
-                        if not ctx_path.exists():
-                            ctx_path = ctx_clip_dir / f"{norm_name}.npy"
-                        if not ctx_path.exists():
-                            logger.warning("Context missing for %s/%s/%s", task, stim_type, clip_stem)
-                            continue
-                        ctx_data = np.load(ctx_path).astype(np.float32)
+                        # Zero-pad missing modalities (e.g. silent films have no text)
+                        ctx_arrays = []
+                        for ctx_dir in self.context_dirs:
+                            c_dir = ctx_dir / task / stim_type
+                            ctx_path = c_dir / f"{clip_stem}.npy"
+                            if not ctx_path.exists():
+                                ctx_path = c_dir / f"{norm_name}.npy"
+                            if not ctx_path.exists():
+                                ctx_path = c_dir / f"{task}_{norm_name}.npy"
+                            if ctx_path.exists():
+                                ctx_arrays.append(np.load(ctx_path).astype(np.float32))
+                            else:
+                                # Zero-pad: detect dim from any available file in this modality
+                                mod_dim = self._get_modality_dim(ctx_dir)
+                                if ctx_arrays:
+                                    ref_len = ctx_arrays[0].shape[0]
+                                else:
+                                    ref_len = n_trs  # fallback to fMRI length
+                                ctx_arrays.append(np.zeros((ref_len, mod_dim), dtype=np.float32))
+                        
+                        # Truncate to minimum temporal length (some models drop the last frame)
+                        min_len = min(arr.shape[0] for arr in ctx_arrays)
+                        ctx_arrays = [arr[:min_len] for arr in ctx_arrays]
+                        
+                        # Concatenate all modalities
+                        ctx_data = np.concatenate(ctx_arrays, axis=-1)
 
                         # Store in preloaded dict (keyed by subject too)
                         clip_id = f"{subj}/{task}/{stim_type}/{norm_name}"

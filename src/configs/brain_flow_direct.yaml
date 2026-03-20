@@ -20,9 +20,12 @@ fmri:
   use_global_stats: true
 
 # --- Pre-extracted encoder context latents ---
-# Shape per clip: (n_trs, 512)
-context_latent_dir: Data/dae_latents
-context_dim: 512
+# Multi-modal ensemble: V-JEPA (1408) + LLaMA-3.2-3B (3072) + Whisper (1280) = 5760-dim
+context_latent_dirs:
+  - Data/features_npy_pooled/vjepa2_avg_feat
+  - Data/features_npy_pooled/Llama-3.2-3B
+  - Data/features_npy_pooled/whisper
+context_dim: 5760
 
 # --- Multi-subject training ---
 subjects:
@@ -65,7 +68,7 @@ brainflow:
   velocity_net:
     output_dim: 1000
     hidden_dim: 1024
-    context_dim: 512
+    context_dim: 5760
     n_blocks: 8
     n_heads: 8
     dropout: 0.1
