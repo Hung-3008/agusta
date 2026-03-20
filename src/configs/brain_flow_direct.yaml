@@ -14,7 +14,7 @@ fmri:
   n_voxels: 1000
   excluded_samples_start: 5
   excluded_samples_end: 5
-  hrf_delay: 5
+  hrf_delay: 2
   # Global normalization stats (pre-computed per-voxel mean/std from train set)
   # Files: {fmri_dir}/{subject}/stats/global_mean.npy, global_std.npy
   use_global_stats: true
@@ -24,11 +24,14 @@ fmri:
 context_latent_dir: Data/dae_latents
 context_dim: 512
 
-# --- Single subject ---
+# --- Multi-subject training ---
 subjects:
   - sub-01
+  - sub-02
+  - sub-03
+  - sub-05
 
-subject_mode: single
+subject_mode: multi
 
 # --- Splits ---
 splits:
@@ -47,8 +50,8 @@ sliding_window:
 
 # --- DataLoader ---
 dataloader:
-  batch_size: 256
-  val_batch_size: 256
+  batch_size: 512
+  val_batch_size: 512
   num_workers: 4
   pin_memory: true
 
@@ -61,9 +64,9 @@ brainflow:
   # Velocity network: FiLM + CrossAttn per block
   velocity_net:
     output_dim: 1000
-    hidden_dim: 512
+    hidden_dim: 1024
     context_dim: 512
-    n_blocks: 6
+    n_blocks: 8
     n_heads: 8
     dropout: 0.1
 
@@ -80,7 +83,7 @@ solver_args:
 training:
   n_epochs: 200
   lr: 3.0e-4
-  weight_decay: 0.0
+  weight_decay: 0.01
   warmup_ratio: 0.05
   min_lr: 1.0e-6
   grad_clip: 1.0

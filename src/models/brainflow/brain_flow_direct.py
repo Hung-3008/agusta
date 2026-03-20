@@ -141,14 +141,16 @@ class DirectVelocityNet(nn.Module):
         output_dim: int = 1000,
         hidden_dim: int = 512,
         context_dim: int = 512,
-        n_blocks: int = 6,
+        n_blocks: int = 8,
         n_heads: int = 8,
         dropout: float = 0.1,
-        max_seq_len: int = 20, # Added for pos emb
+        max_seq_len: int = 11,
+        n_subjects: int = 4,
     ):
         super().__init__()
         self.output_dim = output_dim
         self.hidden_dim = hidden_dim
+        self.max_seq_len = max_seq_len
 
         # Input projection
         self.input_proj = nn.Sequential(
@@ -156,16 +158,26 @@ class DirectVelocityNet(nn.Module):
             nn.GELU(),
         )
 
-        # Time embedding
-        self.time_embed = nn.Sequential(
-            SinusoidalPosEmb(hidden_dim),
+        # Time embedding MLP
+        self.time_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Global Flattened Context MLP (Algonauts 2025 Trick)
+        # Maps the entire rigid window into a single global context vector
+        self.context_mlp = nn.Sequential(
+            nn.Linear(max_seq_len * context_dim, hidden_dim),
+            nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
         # Context Positional Embedding
         self.context_pos_emb = nn.Parameter(torch.randn(1, max_seq_len, context_dim) * 0.02)
+
+        # Subject Embedding (injected into t_emb for per-subject FiLM modulation)
+        self.subject_emb = nn.Embedding(n_subjects, hidden_dim)
 
         # Residual blocks with FiLM + cross-attention
         self.blocks = nn.ModuleList([
@@ -184,13 +196,15 @@ class DirectVelocityNet(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         cond: torch.Tensor = None,
+        subject_ids: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
         """
         Args:
-            x:    (B, output_dim) noisy fMRI at time t.
-            t:    (B,) or scalar, timestep in [0, 1].
-            cond: (B, T, context_dim) pre-extracted context sequence.
+            x:           (B, output_dim) noisy fMRI at time t.
+            t:           (B,) or scalar, timestep in [0, 1].
+            cond:        (B, T, context_dim) pre-extracted context sequence.
+            subject_ids: (B,) long tensor of subject indices.
 
         Returns:
             v_pred: (B, output_dim) predicted velocity.
@@ -199,7 +213,11 @@ class DirectVelocityNet(nn.Module):
             t = t.expand(x.shape[0])
 
         # Embeddings
-        t_emb = self.time_embed(t)  # (B, hidden_dim)
+        t_emb = self.time_mlp(SinusoidalPosEmb(self.hidden_dim)(t))  # (B, hidden_dim)
+
+        # Subject embedding (added to t_emb for per-subject FiLM modulation)
+        if subject_ids is not None:
+            t_emb = t_emb + self.subject_emb(subject_ids)
 
         # Prepare context
         if cond is not None and cond.dim() == 2:
@@ -209,7 +227,21 @@ class DirectVelocityNet(nn.Module):
             
         # Add Positional Embedding to context so cross-attention knows temporal order!
         seq_len = cond.shape[1]
-        cond = cond + self.context_pos_emb[:, :seq_len, :]
+        
+        # Pad or truncate to max_seq_len for global flatten
+        if seq_len < self.max_seq_len:
+            pad_len = self.max_seq_len - seq_len
+            # Pad along the sequence dimension (dim=1)
+            cond = F.pad(cond, (0, 0, 0, pad_len))
+        elif seq_len > self.max_seq_len:
+            cond = cond[:, :self.max_seq_len, :]
+            
+        cond = cond + self.context_pos_emb[:, :cond.shape[1], :] # Ensure positional embedding matches current sequence length
+
+        # Compute global flattened context and inject into time embedding!
+        # This gives a massive boost by providing rigid spatio-temporal structure
+        global_cond = self.context_mlp(cond.reshape(-1, self.max_seq_len * cond.shape[-1]))
+        t_emb = t_emb + global_cond
 
         # Forward
         h = self.input_proj(x)  # (B, hidden_dim)
@@ -236,6 +268,7 @@ class BrainFlowDirect(nn.Module):
         self,
         output_dim: int = 1000,
         velocity_net_params: dict = None,
+        n_subjects: int = 4,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -243,6 +276,7 @@ class BrainFlowDirect(nn.Module):
         # Velocity network
         vn_cfg = dict(velocity_net_params or {})
         vn_cfg.setdefault("output_dim", output_dim)
+        vn_cfg.setdefault("n_subjects", n_subjects)
         self.velocity_net = DirectVelocityNet(**vn_cfg)
 
         # OT-CFM path
@@ -256,19 +290,21 @@ class BrainFlowDirect(nn.Module):
         self,
         context: torch.Tensor,
         target: torch.Tensor,
+        subject_ids: torch.Tensor = None,
     ) -> torch.Tensor:
         """Compute OT-CFM loss in fMRI space.
 
         Args:
             context: (B, T, context_dim) pre-extracted encoder latents.
             target: (B, output_dim) ground truth fMRI.
+            subject_ids: (B,) long tensor of subject indices.
 
         Returns:
             loss: scalar MSE(v_pred, dx_t).
         """
         # OT-CFM: sample path
-        x_1 = target              # (B, D)
-        x_0 = torch.randn_like(x_1)  # N(0, I)
+        x_1 = target
+        x_0 = torch.randn_like(x_1)
         t = torch.rand(x_1.shape[0], device=x_1.device)
         sample_info = self.path.sample(t=t, x_0=x_0, x_1=x_1)
 
@@ -277,6 +313,7 @@ class BrainFlowDirect(nn.Module):
             x=sample_info.x_t,
             t=sample_info.t,
             cond=context,
+            subject_ids=subject_ids,
         )
 
         # MSE loss
@@ -288,6 +325,7 @@ class BrainFlowDirect(nn.Module):
         context: torch.Tensor,
         n_timesteps: int = 50,
         solver_method: str = "midpoint",
+        subject_ids: torch.Tensor = None,
     ) -> torch.Tensor:
         """Generate fMRI by solving ODE with context conditioning.
 
@@ -295,6 +333,7 @@ class BrainFlowDirect(nn.Module):
             context: (B, T, context_dim) pre-extracted encoder latents.
             n_timesteps: Number of ODE solver steps.
             solver_method: ODE solver method.
+            subject_ids: (B,) long tensor of subject indices.
 
         Returns:
             fmri_pred: (B, output_dim) predicted fMRI.
@@ -303,9 +342,6 @@ class BrainFlowDirect(nn.Module):
         device = context.device
         dtype = context.dtype
 
-        # For Brain Decoding (maximizing PCC), generating a random sample adds noise.
-        # The expected mean achieves the highest PCC. 
-        # In OT-CFM, solving from the mode of the prior (x_0 = 0) approximates the deterministic mean prediction.
         x_init = torch.zeros(B, self.output_dim, device=device, dtype=dtype)
 
         # ODE solve
@@ -319,6 +355,7 @@ class BrainFlowDirect(nn.Module):
             step_size=1.0 / n_timesteps,
             return_intermediates=False,
             cond=context,
-        )  # (B, output_dim)
+            subject_ids=subject_ids,
+        )
 
         return fmri_pred
