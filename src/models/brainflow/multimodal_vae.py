@@ -2,16 +2,15 @@
 
 Compresses 8 pretrained feature modalities (V-JEPA, Whisper, LLaMA, Qwen,
 InternVL, etc.) into a shared 512-dim latent space using:
-  - Weighted Layer Pooling: learnable per-layer weights within each modality
   - Per-modality Encoders: independent MLP → (μ, logσ²)
   - Mixture-of-Experts Fusion: gated expert network to fuse posteriors
   - Per-modality Decoders: reconstruct each modality from shared z
-  - β-VAE with annealing: avoids posterior collapse
+  - β-VAE with free_bits: prevents posterior collapse
 
 Per-timestep encoding: each TR is encoded independently.
 
 Architecture:
-    Modality features → WeightedLayerPool → ModalityEncoder → (μ_mod, logσ²_mod)
+    Modality features (pre-pooled) → ModalityEncoder → (μ_mod, logσ²_mod)
     All posteriors → MoEFusion → (μ_fused, logσ²_fused)
     z ~ N(μ_fused, σ²_fused)
     z → ModalityDecoder → reconstructed features (per modality)
@@ -342,17 +341,20 @@ class MultimodalMoEVAE(nn.Module):
         expert_hidden: int = 1024,
         decoder_hidden: int = 1024,
         dropout: float = 0.1,
+        free_bits: float = 0.5,
     ):
         super().__init__()
         self.modality_configs = modality_configs
         self.latent_dim = latent_dim
         self.modality_names = list(modality_configs.keys())
         self.n_modalities = len(self.modality_names)
+        self.free_bits = free_bits
 
-        # 1. Weighted Layer Pooling (one per modality)
+        # 1. Weighted Layer Pooling (optional, only for multi-layer inputs)
         self.layer_pools = nn.ModuleDict({
             name: WeightedLayerPool(cfg['n_layers'])
             for name, cfg in modality_configs.items()
+            if cfg.get('n_layers', 1) > 1
         })
 
         # 2. Per-modality encoders
@@ -492,11 +494,15 @@ class MultimodalMoEVAE(nn.Module):
     # Loss computation
     # -----------------------------------------------------------------
 
-    @staticmethod
-    def kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """KL(q(z|x) || N(0,I)), averaged over batch."""
-        kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
-        return kl.mean()
+    def kl_divergence(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """KL(q(z|x) || N(0,I)) with free_bits, sum over dims, mean over batch."""
+        # Per-dim KL: (B, Z)
+        kl_per_dim = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
+        # Free bits: clamp per-dim KL to minimum threshold
+        if self.free_bits > 0:
+            kl_per_dim = torch.clamp(kl_per_dim, min=self.free_bits)
+        # Sum over latent dims, mean over batch (standard VAE)
+        return kl_per_dim.sum(dim=-1).mean()
 
     def loss(
         self,

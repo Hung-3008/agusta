@@ -1,18 +1,13 @@
 # =====================================================================
-# Multimodal MoE-VAE — Encode multi-feature → 512-dim latent
+# Multimodal Deterministic Autoencoder (DAE)
 # =====================================================================
-# Per-timestep encoding using MoE fusion and β-VAE with annealing.
-# Uses ALL-LAYER NPY features to support WeightedLayerPooling.
+# No KL, no β annealing — reconstruction loss only.
+# Uses pre-pooled NPY features (mean-pooled per timestep).
 # =====================================================================
 
 data_root: Data
 
-fmri:
-  dir: algonauts_2025.competitors/fmri
-  tr: 1.49
-  n_voxels: 1000
-
-# --- Features (mean-pooled NPY, preloaded into RAM) ---
+# --- Features (pre-pooled NPY) ---
 features_dir: Data/features_npy_pooled
 data_mode: npy
 
@@ -20,35 +15,27 @@ modalities:
   video:
     subdir: vjepa2_avg_feat
     dim: 1408
-    n_layers: 13
   audio:
     subdir: whisper
     dim: 1280
-    n_layers: 4
   text_1b:
     subdir: Llama-3.2-1B
     dim: 2048
-    n_layers: 3
   text_3b:
     subdir: Llama-3.2-3B
     dim: 3072
-    n_layers: 5
   omni:
     subdir: qwen-2-5-omni-7b
     dim: 3584
-    n_layers: 9
   vlm_14b:
     subdir: InternVL3_14B
     dim: 5120
-    n_layers: 5
   vlm_8b:
     subdir: internvl3_8b_8bit
     dim: 3584
-    n_layers: 4
   text_qw:
     subdir: qwen2-5_3B
     dim: 2048
-    n_layers: 7
 
 # --- Splits ---
 splits:
@@ -67,16 +54,6 @@ model:
   expert_hidden: 1024
   decoder_hidden: 1024
   dropout: 0.1
-
-# --- β-VAE annealing ---
-# NOTE: KL is now sum-over-dims (not mean), so β should be ~1/512 of before
-beta:
-  start: 0.0000001
-  max: 0.00002
-  warmup_epochs: 30
-
-# Free bits: minimum KL per dimension to prevent collapse
-free_bits: 0.5
 
 # --- DataLoader ---
 dataloader:
@@ -100,4 +77,4 @@ training:
   ema_decay: 0.999
 
 # --- Output ---
-output_dir: outputs/multimodal_vae
+output_dir: outputs/multimodal_dae
