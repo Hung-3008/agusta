@@ -75,7 +75,6 @@ dataloader:
 # =====================================================================
 brainflow:
   output_dim: 1000
-  model_version: v2
 
   velocity_net:
     output_dim: 1000

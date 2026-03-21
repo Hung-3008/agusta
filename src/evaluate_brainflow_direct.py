@@ -24,7 +24,7 @@ import numpy as np
 import zipfile
 from tqdm import tqdm
 
-from src.models.brainflow.brain_flow_direct import BrainFlowDirect
+from src.models.brainflow.brain_flow_direct_v2 import BrainFlowDirectV2
 from src.data.dataset import load_config
 
 
@@ -144,9 +144,13 @@ def evaluate_brainflow_direct():
     bf_cfg = cfg["brainflow"]
     vn_cfg = bf_cfg.get("velocity_net", {})
 
-    model = BrainFlowDirect(
+    vn_params = dict(vn_cfg)
+    modality_dims = cfg.get("modality_dims", None)
+    if modality_dims:
+        vn_params["modality_dims"] = modality_dims
+    model = BrainFlowDirectV2(
         output_dim=bf_cfg["output_dim"],
-        velocity_net_params=vn_cfg,
+        velocity_net_params=vn_params,
         n_subjects=len(subjects),
     ).to(device)
 

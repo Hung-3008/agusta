@@ -28,7 +28,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset import load_config, _get_fmri_filepath
-from src.models.brainflow.brain_flow_direct import BrainFlowDirect
 from src.models.brainflow.brain_flow_direct_v2 import BrainFlowDirectV2
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
@@ -463,27 +462,17 @@ def train(args):
     # 2. Model
     bf_cfg = cfg["brainflow"]
     output_dim = bf_cfg.get("output_dim", cfg["fmri"]["n_voxels"])
-    model_version = bf_cfg.get("model_version", "v1")
 
-    if model_version == "v2":
-        logger.info("Initializing BrainFlowDirectV2 (TRIBE-inspired)...")
-        vn_params = dict(bf_cfg.get("velocity_net", {}))
-        # Inject modality_dims from config
-        modality_dims = cfg.get("modality_dims", None)
-        if modality_dims:
-            vn_params["modality_dims"] = modality_dims
-        model = BrainFlowDirectV2(
-            output_dim=output_dim,
-            velocity_net_params=vn_params,
-            n_subjects=len(cfg["subjects"]),
-        ).to(device)
-    else:
-        logger.info("Initializing BrainFlowDirect (v1)...")
-        model = BrainFlowDirect(
-            output_dim=output_dim,
-            velocity_net_params=bf_cfg.get("velocity_net", {}),
-            n_subjects=len(cfg["subjects"]),
-        ).to(device)
+    logger.info("Initializing BrainFlowDirectV2...")
+    vn_params = dict(bf_cfg.get("velocity_net", {}))
+    modality_dims = cfg.get("modality_dims", None)
+    if modality_dims:
+        vn_params["modality_dims"] = modality_dims
+    model = BrainFlowDirectV2(
+        output_dim=output_dim,
+        velocity_net_params=vn_params,
+        n_subjects=len(cfg["subjects"]),
+    ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Trainable parameters: %s", f"{n_params:,}")
