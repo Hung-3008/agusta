@@ -468,10 +468,12 @@ def train(args):
     modality_dims = cfg.get("modality_dims", None)
     if modality_dims:
         vn_params["modality_dims"] = modality_dims
+    sp_params = dict(bf_cfg.get("source_predictor", {}))
     model = BrainFlowDirectV2(
         output_dim=output_dim,
         velocity_net_params=vn_params,
         n_subjects=len(cfg["subjects"]),
+        source_predictor_params=sp_params,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -562,7 +564,8 @@ def train(args):
                 context = torch.zeros_like(context)
 
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
-                loss = model(context, fmri_target, subject_ids=subject_ids)
+                losses = model(context, fmri_target, subject_ids=subject_ids)
+                loss = losses["total_loss"]
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -575,8 +578,14 @@ def train(args):
             ema.update(model)
 
             if global_step % tr_cfg["log_every_n_steps"] == 0:
+                flow_l = losses["flow_loss"].item()
+                align_l = losses["align_loss"].item()
+                kld_l = losses["kld_loss"].item()
                 pbar.set_postfix({
                     "loss": f"{np.mean(train_losses[-50:]):.4f}",
+                    "flow": f"{flow_l:.4f}",
+                    "align": f"{align_l:.4f}",
+                    "kld": f"{kld_l:.4f}",
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                 })
 

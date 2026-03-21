@@ -1,23 +1,23 @@
-"""BrainFlow Direct v2 — TRIBE-Inspired Flow Matching in fMRI Space.
+"""BrainFlow Direct v2 — CSFM-Inspired Flow Matching in fMRI Space.
 
-Improvements over v1:
-  - Per-modality MLP projectors (supports N modalities of different dims)
-  - Modality dropout (0.3) for robustness
-  - Temporal Transformer Encoder to refine context before cross-attention
-  - SubjectLayers output head (per-subject linear projection)
-  - NO Global Flattened Context MLP (removed to prevent overfitting)
+Key features:
+  - Factored Cross-Modal Fusion (per-timestep M×M attention)
+  - CSFM: Condition-dependent source x₀ = μ(context) + ε·σ(context)
+  - Per-subject output heads (SubjectLayers)
+  - Align loss (μ → target) + var-KLD loss (regularize σ)
 
 Architecture:
   Context (B, T, [mod_dims...])
-    → Per-modality Projectors + Modality Dropout
-    → Concatenate → (B, T, hidden_dim)
-    → Temporal Transformer Encoder (4 layers)
-    → context_encoded (B, T, hidden_dim)
+    → FactoredCrossModalFusion → context_encoded (B, T, hidden_dim)
 
-  x_t (B, V) → Input Proj → h (B, hidden_dim)
-  t → SinPosEmb → MLP → t_emb + SubjectEmb
-  8× CrossAttentionResBlock(h, t_emb, context_encoded)
-  → LayerNorm → SubjectLayers → v_pred (B, V)
+  SourcePredictor:
+    context_encoded → pool → MLP → μ, log_var → x₀ (learned source)
+
+  VelocityNet:
+    x_t (B, V) → Input Proj → h (B, hidden_dim)
+    t → SinPosEmb → MLP → t_emb + SubjectEmb
+    8× CrossAttentionResBlock(h, t_emb, context_encoded)
+    → LayerNorm → SubjectLayers → v_pred (B, V)
 
 Usage:
     python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v2.yaml
@@ -58,35 +58,22 @@ class SinusoidalPosEmb(nn.Module):
 
 
 class SubjectLayers(nn.Module):
-    """Per-subject linear output head (from TRIBE/Brain-Diffuser).
-
-    Each subject gets its own weight matrix for the final projection,
-    allowing subject-specific adaptation while sharing the backbone.
-    """
+    """Per-subject linear output head (from TRIBE/Brain-Diffuser)."""
 
     def __init__(self, in_channels: int, out_channels: int, n_subjects: int, bias: bool = True):
         super().__init__()
         self.weights = nn.Parameter(torch.empty(n_subjects, in_channels, out_channels))
         self.bias = nn.Parameter(torch.empty(n_subjects, out_channels)) if bias else None
 
-        # Xavier-like init
         self.weights.data.normal_(0, 1.0 / in_channels ** 0.5)
         if self.bias is not None:
             self.bias.data.normal_(0, 1.0 / in_channels ** 0.5)
 
     def forward(self, x: torch.Tensor, subject_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, D_in) hidden state
-            subject_ids: (B,) long tensor of subject indices
-        Returns:
-            (B, D_out) per-subject projected output
-        """
-        # Gather per-subject weights
-        w = self.weights[subject_ids]  # (B, D_in, D_out)
+        w = self.weights[subject_ids]
         out = torch.einsum("bd,bdo->bo", x, w)
         if self.bias is not None:
-            b = self.bias[subject_ids]  # (B, D_out)
+            b = self.bias[subject_ids]
             out = out + b
         return out
 
@@ -96,21 +83,13 @@ class SubjectLayers(nn.Module):
 # =============================================================================
 
 class CrossAttentionResBlock(nn.Module):
-    """Residual block with FiLM (time) + cross-attention (processed context).
-
-    Architecture per block:
-        h = FiLM(LayerNorm(x), t_emb)     — time-conditioned modulation
-        h = x + FFN(h)                     — residual MLP
-        h = h + CrossAttn(h, context)      — attend to transformer-processed context
-    """
+    """Residual block with FiLM (time) + cross-attention (processed context)."""
 
     def __init__(self, dim: int, time_dim: int, context_dim: int, n_heads: int = 8, dropout: float = 0.1):
         super().__init__()
 
-        # FiLM from timestep
         self.film = nn.Linear(time_dim, dim * 2)
 
-        # FFN with pre-norm
         self.norm1 = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * 4),
@@ -120,7 +99,6 @@ class CrossAttentionResBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Cross-attention to processed context (same dim now!)
         self.norm_q = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(context_dim)
         self.cross_attn = nn.MultiheadAttention(
@@ -129,126 +107,199 @@ class CrossAttentionResBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x:       (B, D) hidden state
-            t_emb:   (B, D_t) timestep embedding
-            context: (B, T, C) transformer-processed context
-        """
-        # 1. FiLM modulated FFN
         scale_shift = self.film(t_emb)
         scale, shift = scale_shift.chunk(2, dim=-1)
         h = self.norm1(x) * (1 + scale) + shift
         x = x + self.ffn(h)
 
-        # 2. Cross-attention to context
-        q = self.norm_q(x).unsqueeze(1)           # (B, 1, D)
-        kv = self.norm_kv(context)                 # (B, T, C)
-        attn_out, _ = self.cross_attn(q, kv, kv)  # (B, 1, D)
-        x = x + attn_out.squeeze(1)               # (B, D)
+        q = self.norm_q(x).unsqueeze(1)
+        kv = self.norm_kv(context)
+        attn_out, _ = self.cross_attn(q, kv, kv)
+        x = x + attn_out.squeeze(1)
 
         return x
 
 
 # =============================================================================
-# TokenizedFusionBlock — All-to-All Modality-Time Fusion
+# FactoredCrossModalFusion — Efficient Cross-Modal Attention
 # =============================================================================
 
-class TokenizedFusionBlock(nn.Module):
-    """Tokenized All-to-All Modality-Time Fusion Block.
-    
-    Treats each (modality, time) pair as a distinct token.
-    1. Projects all modalities to a large common context_dim (e.g., 2048).
-    2. Adds separate temporal and modality positional embeddings.
-    3. Applies Modality Dropout.
-    4. Runs a Full Attention Transformer over the flattened (T * M) sequence.
+class FactoredCrossModalFusion(nn.Module):
+    """Factored Cross-Modal Attention Fusion.
+
+    Per-timestep M×M cross-modal attention instead of full T*M self-attention.
+    ~11× faster with comparable cross-modal reasoning.
     """
+
     def __init__(
-        self, 
-        modality_dims: list[int], 
-        context_dim: int = 2048, 
-        max_seq_len: int = 11, 
-        n_heads: int = 8, 
-        depth: int = 4, 
+        self,
+        modality_dims: list[int],
+        hidden_dim: int = 1024,
+        max_seq_len: int = 11,
+        n_heads: int = 8,
+        n_layers: int = 2,
         dropout: float = 0.1,
-        modality_dropout: float = 0.3
+        modality_dropout: float = 0.3,
     ):
         super().__init__()
-        self.modality_dims = modality_dims
         self.n_modalities = len(modality_dims)
-        self.context_dim = context_dim
+        self.hidden_dim = hidden_dim
         self.max_seq_len = max_seq_len
         self.modality_dropout = modality_dropout
 
-        # Per-modality projectors to common context_dim
         self.projectors = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(dim, context_dim),
-                nn.LayerNorm(context_dim),
-                nn.GELU()
-            ) for dim in modality_dims
+                nn.Linear(dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
+            for dim in modality_dims
         ])
 
-        # Learnable Embeddings coordinates
-        self.time_emb = nn.Parameter(torch.randn(1, max_seq_len, 1, context_dim) * 0.02)
-        self.modality_emb = nn.Parameter(torch.randn(1, 1, self.n_modalities, context_dim) * 0.02)
-
-        # Transformer Encoder for all-to-all cross-modal and cross-time fusion
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=context_dim,
-            nhead=n_heads,
-            dim_feedforward=context_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.modality_emb = nn.Parameter(
+            torch.randn(1, 1, self.n_modalities, hidden_dim) * 0.02
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+
+        self.cross_modal_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=n_heads,
+                dim_feedforward=hidden_dim * 4,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            for _ in range(n_layers)
+        ])
+
+        self.final_norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, modality_features: list[torch.Tensor]) -> torch.Tensor:
         B, T = modality_features[0].shape[:2]
-        
-        # 1. Project all to common D
+        T = min(T, self.max_seq_len)
+
         projected = []
         for feat, proj in zip(modality_features, self.projectors):
-            projected.append(proj(feat))  # (B, T, context_dim)
-            
-        # 2. Stack building the modality axis -> (B, T, M, context_dim)
+            projected.append(proj(feat[:, :T]))
+
         stacked = torch.stack(projected, dim=2)
-        
-        # 3. Add Positional Coordinates
-        T_safe = min(T, self.max_seq_len)
-        t_emb = self.time_emb[:, :T_safe, :, :]
-        if T > self.max_seq_len:
-            stacked = stacked[:, :self.max_seq_len, :, :]
-        
-        stacked = stacked + t_emb + self.modality_emb
-        
-        # 4. Modality Dropout
+        stacked = stacked + self.modality_emb
+
         if self.training and self.modality_dropout > 0:
-            keep_mask = (torch.rand(B, 1, self.n_modalities, 1, device=stacked.device) > self.modality_dropout).float()
-            # Ensure at least one modality survives per sample
+            keep_mask = (
+                torch.rand(B, 1, self.n_modalities, 1, device=stacked.device)
+                > self.modality_dropout
+            ).float()
             all_dropped = (keep_mask.sum(dim=2, keepdim=True) == 0).float()
-            keep_mask[:, :, 0:1, :] = torch.max(keep_mask[:, :, 0:1, :], all_dropped)
+            keep_mask[:, :, 0:1, :] = torch.max(
+                keep_mask[:, :, 0:1, :], all_dropped
+            )
             stacked = stacked * keep_mask
 
-        # 5. Flatten to sequence of length T_safe * M tokens
-        flattened = stacked.view(B, T_safe * self.n_modalities, self.context_dim)
-        
-        # 6. Deep Transformer Fusion
-        fused = self.transformer(flattened)
-        return fused
+        x = stacked.reshape(B * T, self.n_modalities, self.hidden_dim)
+
+        for layer in self.cross_modal_layers:
+            x = layer(x)
+
+        x = x.mean(dim=1)
+        context = x.reshape(B, T, self.hidden_dim)
+        return self.final_norm(context)
 
 
 # =============================================================================
-# DirectVelocityNetV2 — TRIBE-Inspired VelocityNet
+# SourcePredictor — CSFM-Inspired Condition-Dependent Source
+# =============================================================================
+
+class SourcePredictor(nn.Module):
+    """Predicts condition-dependent source x₀ for flow matching (CSFM).
+
+    Instead of x₀ = 0 or x₀ ~ N(0,I), learns x₀ = μ(context) + ε·σ(context).
+    This gives the ODE a head-start: shorter flow → easier velocity → better PCC.
+
+    Architecture:
+        context (B, T, D) → mean-pool → MLP → μ (B, output_dim)
+                                             → log_var (B, output_dim) [optional]
+        x₀ = μ + ε·σ  (training)
+        x₀ = μ        (inference)
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        output_dim: int,
+        n_subjects: int = 4,
+        use_variational: bool = True,
+    ):
+        super().__init__()
+        self.use_variational = use_variational
+
+        # Temporal pooling + hidden projection
+        self.pool_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Per-subject mean prediction (different subjects → different fMRI distributions)
+        self.mean_head = SubjectLayers(hidden_dim, output_dim, n_subjects, bias=True)
+
+        # Shared log-variance head (variance structure similar across subjects)
+        if use_variational:
+            self.log_var_head = nn.Linear(hidden_dim, output_dim)
+            # Init small variance: exp(-2) ≈ 0.135 std
+            nn.init.normal_(self.log_var_head.weight, std=1e-4)
+            nn.init.constant_(self.log_var_head.bias, -2.0)
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        subject_ids: torch.Tensor = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """
+        Args:
+            context:     (B, T, hidden_dim) fused context from fusion block.
+            subject_ids: (B,) long tensor of subject indices.
+
+        Returns:
+            x0:      (B, output_dim) sampled source point.
+            mu:      (B, output_dim) source mean.
+            log_var: (B, output_dim) or None.
+        """
+        # Mean-pool over temporal dimension
+        h = context.mean(dim=1)  # (B, hidden_dim)
+        h = self.pool_proj(h)
+
+        if subject_ids is None:
+            subject_ids = torch.zeros(h.shape[0], dtype=torch.long, device=h.device)
+
+        mu = self.mean_head(h, subject_ids)  # (B, output_dim)
+
+        if self.use_variational:
+            log_var = self.log_var_head(h)
+            log_var = torch.clamp(log_var, min=-10.0, max=2.0)
+
+            if self.training:
+                std = torch.exp(0.5 * log_var)
+                x0 = mu + torch.randn_like(mu) * std
+            else:
+                x0 = mu
+        else:
+            log_var = None
+            x0 = mu
+
+        return x0, mu, log_var
+
+
+# =============================================================================
+# DirectVelocityNetV2 — Velocity Network with Factored Fusion
 # =============================================================================
 
 class DirectVelocityNetV2(nn.Module):
-    """Velocity network v2 with Tokenized Modality-Time Fusion.
+    """Velocity network v2 with Factored Cross-Modal Fusion.
 
     Architecture:
-        1. TokenizedFusionBlock: Project all mods to context_dim, add coords, Full-Attn.
+        1. FactoredCrossModalFusion: per-modality proj → cross-modal attn → (B, T, D)
         2. Input: x_t (B, output_dim) → Linear → (B, hidden_dim)
         3. Time: sinusoidal → MLP → + subject embedding → t_emb
         4. N blocks of CrossAttentionResBlock(h, t_emb, context_encoded)
@@ -259,30 +310,28 @@ class DirectVelocityNetV2(nn.Module):
         self,
         output_dim: int = 1000,
         hidden_dim: int = 1024,
-        context_dim: int = 2048,
         modality_dims: list[int] = None,
         n_blocks: int = 8,
         n_heads: int = 8,
         dropout: float = 0.1,
         modality_dropout: float = 0.3,
-        context_transformer_depth: int = 4,
+        cross_modal_n_layers: int = 2,
         max_seq_len: int = 11,
         n_subjects: int = 4,
     ):
         super().__init__()
         self.output_dim = output_dim
         self.hidden_dim = hidden_dim
-        self.context_dim = context_dim
         self.modality_dims = modality_dims or [1408]
         self.n_modalities = len(self.modality_dims)
 
-        # --- Tokenized Fusion Block ---
-        self.fusion_block = TokenizedFusionBlock(
+        # --- Factored Cross-Modal Fusion ---
+        self.fusion_block = FactoredCrossModalFusion(
             modality_dims=self.modality_dims,
-            context_dim=context_dim,
+            hidden_dim=hidden_dim,
             max_seq_len=max_seq_len,
             n_heads=n_heads,
-            depth=context_transformer_depth,
+            n_layers=cross_modal_n_layers,
             dropout=dropout,
             modality_dropout=modality_dropout,
         )
@@ -300,51 +349,56 @@ class DirectVelocityNetV2(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # --- Subject Embedding (injected into t_emb) ---
+        # --- Subject Embedding ---
         self.subject_emb = nn.Embedding(n_subjects, hidden_dim)
 
-        # --- Velocity blocks: FiLM + CrossAttn ---
+        # --- Velocity blocks ---
         self.blocks = nn.ModuleList([
-            CrossAttentionResBlock(hidden_dim, hidden_dim, self.context_dim, n_heads, dropout)
+            CrossAttentionResBlock(hidden_dim, hidden_dim, hidden_dim, n_heads, dropout)
             for _ in range(n_blocks)
         ])
 
-        # --- Output: SubjectLayers (per-subject linear head) ---
+        # --- Output ---
         self.final_norm = nn.LayerNorm(hidden_dim)
         self.subject_output = SubjectLayers(hidden_dim, output_dim, n_subjects, bias=True)
 
-        # Zero-init the subject output for stable start
+        # Zero-init output for stable start
         nn.init.constant_(self.subject_output.weights, 0)
         if self.subject_output.bias is not None:
             nn.init.constant_(self.subject_output.bias, 0)
 
-    def _encode_context(self, modality_features: list[torch.Tensor]) -> torch.Tensor:
-        """Tokenize and fuse modality features.
+    def encode_context_from_cond(self, cond: torch.Tensor) -> torch.Tensor:
+        """Encode concatenated context tensor via fusion block.
 
         Args:
-            modality_features: list of (B, T, mod_dim_i) tensors
+            cond: (B, T, total_context_dim) pre-concatenated modality features.
 
         Returns:
-            context_encoded: (B, T * M, context_dim) fused context sequence
+            context_encoded: (B, T, hidden_dim) fused context.
         """
-        return self.fusion_block(modality_features)
+        splits = []
+        offset = 0
+        for dim in self.modality_dims:
+            splits.append(cond[:, :, offset:offset + dim])
+            offset += dim
+        return self.fusion_block(splits)
 
     def forward(
         self,
         x: torch.Tensor,
         t: torch.Tensor,
         cond: torch.Tensor = None,
-        modality_features: list[torch.Tensor] = None,
+        pre_encoded_context: torch.Tensor = None,
         subject_ids: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
         """
         Args:
-            x:                  (B, output_dim) noisy fMRI at time t.
-            t:                  (B,) or scalar, timestep in [0, 1].
-            cond:               (B, T, total_context_dim) pre-concatenated context (fallback).
-            modality_features:  list of (B, T, mod_dim_i) per-modality tensors.
-            subject_ids:        (B,) long tensor of subject indices.
+            x:                    (B, output_dim) noisy fMRI at time t.
+            t:                    (B,) or scalar, timestep in [0, 1].
+            cond:                 (B, T, total_dim) concatenated context (fallback).
+            pre_encoded_context:  (B, T, hidden_dim) already-fused context (skip re-encoding).
+            subject_ids:          (B,) long tensor of subject indices.
 
         Returns:
             v_pred: (B, output_dim) predicted velocity.
@@ -352,41 +406,34 @@ class DirectVelocityNetV2(nn.Module):
         if t.dim() == 0:
             t = t.expand(x.shape[0])
 
-        # --- Encode context ---
-        if modality_features is not None:
-            context_encoded = self._encode_context(modality_features)
+        # --- Encode context (skip if pre-encoded) ---
+        if pre_encoded_context is not None:
+            context_encoded = pre_encoded_context
         elif cond is not None:
-            # Fallback: split concatenated context into modalities
-            splits = []
-            offset = 0
-            for dim in self.modality_dims:
-                splits.append(cond[:, :, offset:offset + dim])
-                offset += dim
-            context_encoded = self._encode_context(splits)
+            context_encoded = self.encode_context_from_cond(cond)
         else:
             context_encoded = torch.zeros(
-                x.shape[0], 1, self.context_dim, device=x.device, dtype=x.dtype
+                x.shape[0], 1, self.hidden_dim, device=x.device, dtype=x.dtype
             )
 
         # --- Embeddings ---
-        t_emb = self.time_mlp(SinusoidalPosEmb(self.hidden_dim)(t))  # (B, hidden_dim)
+        t_emb = self.time_mlp(SinusoidalPosEmb(self.hidden_dim)(t))
 
         if subject_ids is not None:
             t_emb = t_emb + self.subject_emb(subject_ids)
 
         # --- Forward through velocity blocks ---
-        h = self.input_proj(x)  # (B, hidden_dim)
+        h = self.input_proj(x)
 
         for block in self.blocks:
             h = block(h, t_emb, context_encoded)
 
-        # --- Output with SubjectLayers ---
+        # --- Output ---
         h = self.final_norm(h)
         if subject_ids is not None:
-            return self.subject_output(h, subject_ids)  # (B, output_dim)
+            return self.subject_output(h, subject_ids)
         else:
-            # Average across subjects for unconditional
-            avg_w = self.subject_output.weights.mean(dim=0)  # (D_in, D_out)
+            avg_w = self.subject_output.weights.mean(dim=0)
             out = h @ avg_w
             if self.subject_output.bias is not None:
                 out = out + self.subject_output.bias.mean(dim=0)
@@ -394,17 +441,17 @@ class DirectVelocityNetV2(nn.Module):
 
 
 # =============================================================================
-# BrainFlowDirectV2 — Top-level model
+# BrainFlowDirectV2 — Top-level model with CSFM
 # =============================================================================
 
 class BrainFlowDirectV2(nn.Module):
-    """Direct fMRI flow matching v2 with TRIBE-inspired conditioning.
+    """Direct fMRI flow matching v2 with CSFM-inspired learned source.
 
-    Key improvements over v1:
-      - Per-modality projectors with modality dropout
-      - Temporal transformer encoder for context
-      - SubjectLayers output head
-      - No Global Flattened Context MLP
+    Key features:
+      - Factored Cross-Modal Fusion (efficient multi-modality encoding)
+      - Condition-dependent source: x₀ = μ(ctx) + ε·σ(ctx) instead of zeros
+      - Losses: flow_loss + align_loss(μ, target) + var_kld_loss(σ)
+      - SubjectLayers per-subject output heads
     """
 
     def __init__(
@@ -412,6 +459,7 @@ class BrainFlowDirectV2(nn.Module):
         output_dim: int = 1000,
         velocity_net_params: dict = None,
         n_subjects: int = 4,
+        source_predictor_params: dict = None,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -422,45 +470,81 @@ class BrainFlowDirectV2(nn.Module):
         vn_cfg.setdefault("n_subjects", n_subjects)
         self.velocity_net = DirectVelocityNetV2(**vn_cfg)
 
+        # Source predictor (CSFM)
+        sp_cfg = dict(source_predictor_params or {})
+        self.align_weight = sp_cfg.pop("align_weight", 1.0)
+        self.kld_weight = sp_cfg.pop("kld_weight", 0.1)
+        sp_cfg.setdefault("hidden_dim", vn_cfg.get("hidden_dim", 1024))
+        sp_cfg.setdefault("output_dim", output_dim)
+        sp_cfg.setdefault("n_subjects", n_subjects)
+        self.source_predictor = SourcePredictor(**sp_cfg)
+
         # OT-CFM path
         self.path = AffineProbPath(scheduler=CondOTScheduler())
 
         # Log parameters
-        n_params = sum(p.numel() for p in self.velocity_net.parameters())
-        print(f"[BrainFlowDirectV2] VelocityNet: {n_params:,} params")
+        vn_params = sum(p.numel() for p in self.velocity_net.parameters())
+        sp_params = sum(p.numel() for p in self.source_predictor.parameters())
+        print(f"[BrainFlowDirectV2] VelocityNet: {vn_params:,} params")
+        print(f"[BrainFlowDirectV2] SourcePredictor: {sp_params:,} params")
+        print(f"[BrainFlowDirectV2] Total: {vn_params + sp_params:,} params")
+        print(f"[BrainFlowDirectV2] Loss weights: align={self.align_weight}, kld={self.kld_weight}")
 
     def forward(
         self,
         context: torch.Tensor,
         target: torch.Tensor,
         subject_ids: torch.Tensor = None,
-        modality_features: list[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Compute OT-CFM loss in fMRI space.
+    ) -> dict[str, torch.Tensor]:
+        """Compute CSFM losses: flow + align + var-KLD.
 
         Args:
-            context:            (B, T, total_dim) concatenated context (fallback).
-            target:             (B, output_dim) ground truth fMRI.
-            subject_ids:        (B,) long tensor of subject indices.
-            modality_features:  list of (B, T, mod_dim_i) per-modality tensors.
+            context: (B, T, total_dim) concatenated multimodal context.
+            target:  (B, output_dim) ground truth fMRI.
+            subject_ids: (B,) long tensor of subject indices.
 
         Returns:
-            loss: scalar MSE(v_pred, dx_t).
+            dict with keys: total_loss, flow_loss, align_loss, kld_loss.
         """
+        # 1. Encode context (shared between source predictor and velocity net)
+        context_encoded = self.velocity_net.encode_context_from_cond(context)
+
+        # 2. Predict condition-dependent source
+        x_0, mu, log_var = self.source_predictor(context_encoded, subject_ids)
+
+        # 3. Flow matching with learned source
         x_1 = target
-        x_0 = torch.zeros_like(x_1)
         t = torch.rand(x_1.shape[0], device=x_1.device)
         sample_info = self.path.sample(t=t, x_0=x_0, x_1=x_1)
 
         v_pred = self.velocity_net(
             x=sample_info.x_t,
             t=sample_info.t,
-            cond=context,
-            modality_features=modality_features,
+            pre_encoded_context=context_encoded,
             subject_ids=subject_ids,
         )
 
-        return F.mse_loss(v_pred, sample_info.dx_t)
+        flow_loss = F.mse_loss(v_pred, sample_info.dx_t)
+
+        # 4. Align loss: push source mean close to target → shorter flow
+        align_loss = F.mse_loss(mu, target)
+
+        # 5. Var-KLD loss: regularize variance (only σ terms, no μ²)
+        #    KL(q || N(0,1)) variance part = 0.5 * (σ² - log(σ²) - 1)
+        if log_var is not None:
+            kld_loss = 0.5 * (torch.exp(log_var) - log_var - 1.0).mean()
+        else:
+            kld_loss = torch.tensor(0.0, device=target.device)
+
+        # 6. Total loss
+        total_loss = flow_loss + self.align_weight * align_loss + self.kld_weight * kld_loss
+
+        return {
+            "total_loss": total_loss,
+            "flow_loss": flow_loss,
+            "align_loss": align_loss,
+            "kld_loss": kld_loss,
+        }
 
     @torch.inference_mode()
     def synthesise(
@@ -469,16 +553,17 @@ class BrainFlowDirectV2(nn.Module):
         n_timesteps: int = 50,
         solver_method: str = "midpoint",
         subject_ids: torch.Tensor = None,
-        modality_features: list[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Generate fMRI by solving ODE with context conditioning.
+        """Generate fMRI by solving ODE from learned source.
+
+        Uses SourcePredictor to generate x_init = μ(context) instead of zeros.
+        Then solves ODE with pre-encoded context (computed once).
 
         Args:
-            context:            (B, T, total_dim) concatenated context (fallback).
-            n_timesteps:        Number of ODE solver steps.
-            solver_method:      ODE solver method.
-            subject_ids:        (B,) long tensor of subject indices.
-            modality_features:  list of (B, T, mod_dim_i) per-modality tensors.
+            context:        (B, T, total_dim) concatenated context.
+            n_timesteps:    Number of ODE solver steps.
+            solver_method:  ODE solver method.
+            subject_ids:    (B,) long tensor of subject indices.
 
         Returns:
             fmri_pred: (B, output_dim) predicted fMRI.
@@ -487,8 +572,13 @@ class BrainFlowDirectV2(nn.Module):
         device = context.device
         dtype = context.dtype
 
-        x_init = torch.zeros(B, self.output_dim, device=device, dtype=dtype)
+        # 1. Encode context once (shared)
+        context_encoded = self.velocity_net.encode_context_from_cond(context)
 
+        # 2. Learned source: x_init = μ (deterministic at inference)
+        x_init, _, _ = self.source_predictor(context_encoded, subject_ids)
+
+        # 3. ODE solve from learned source with pre-encoded context
         solver = ODESolver(velocity_model=self.velocity_net)
         T = torch.linspace(0, 1, n_timesteps, device=device, dtype=dtype)
 
@@ -498,8 +588,7 @@ class BrainFlowDirectV2(nn.Module):
             method=solver_method,
             step_size=1.0 / n_timesteps,
             return_intermediates=False,
-            cond=context,
-            modality_features=modality_features,
+            pre_encoded_context=context_encoded,
             subject_ids=subject_ids,
         )
 
