@@ -29,6 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset import load_config, _get_fmri_filepath
 from src.models.brainflow.brain_flow_direct import BrainFlowDirect
+from src.models.brainflow.brain_flow_direct_v2 import BrainFlowDirectV2
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("train_brainflow_direct")
@@ -66,7 +67,12 @@ class DirectFlowDataset(Dataset):
         else:
             self.context_dirs = [Path(PROJECT_ROOT) / cfg["context_latent_dir"]]
             
-        self.context_dim = cfg.get("context_dim", 5760)
+        # Auto-compute context_dim from modality_dims if available
+        self.modality_dims = cfg.get("modality_dims", None)
+        if self.modality_dims:
+            self.context_dim = sum(self.modality_dims)
+        else:
+            self.context_dim = cfg.get("context_dim", 5760)
 
         self.tr = cfg["fmri"]["tr"]
         self.excl_start = cfg["fmri"].get("excluded_samples_start", 0)
@@ -98,8 +104,9 @@ class DirectFlowDataset(Dataset):
                 else:
                     logger.warning("Global stats not found at %s", stats_dir)
 
-        # Preloaded data: keyed by clip identifier
-        self._clips = {}  # clip_id → {"ctx": np.array, "fmri": np.array}
+        # Preloaded data: separated to avoid context duplication across subjects
+        self._ctx_clips = {}   # "task/stim_type/clip" → np.array (float16, shared)
+        self._fmri_clips = {}  # "subject/task/clip" → np.array (float16, per-subject)
         self.samples = self._build_index_and_preload()
 
     def _normalize_clip_name(self, clip_name: str, task: str) -> str:
@@ -149,11 +156,17 @@ class DirectFlowDataset(Dataset):
         raise ValueError(f"No .npy files found in {ctx_dir}")
 
     def _build_index_and_preload(self):
-        """Build sample index and preload all data into RAM."""
+        """Build sample index and preload all data into RAM.
+
+        Memory optimizations:
+          - Context features stored once per clip (shared across subjects)
+          - Both context and fMRI stored as float16 (converted to float32 in __getitem__)
+        """
         samples = []
-        total_bytes = 0
-        n_clips = 0
-        fmri_cache = {}  # (subj, task, name) → np.array — dedup H5 reads
+        ctx_bytes = 0
+        fmri_bytes = 0
+        n_ctx_clips = 0
+        n_fmri_clips = 0
         logger.info("Building %s split index and preloading data...", self.split)
 
         for task, splits in self.splits_cfg.items():
@@ -173,25 +186,9 @@ class DirectFlowDataset(Dataset):
                 for clip_stem in clip_stems:
                     norm_name = self._normalize_clip_name(clip_stem, task)
 
-                    # Iterate over ALL subjects
-                    for subj in self.subjects:
-                        subj_idx = self.subject_to_idx[subj]
-
-                        # Load fMRI (with dedup)
-                        fmri_key = (subj, task, norm_name)
-                        if fmri_key not in fmri_cache:
-                            fmri_data = self._load_fmri_clip(subj, task, norm_name)
-                            if fmri_data is None:
-                                fmri_data = self._load_fmri_clip(subj, task, clip_stem)
-                            fmri_cache[fmri_key] = fmri_data
-                        fmri_data = fmri_cache[fmri_key]
-                        if fmri_data is None:
-                            continue
-
-                        n_trs = fmri_data.shape[0]
-
-                        # Load context (shared across subjects — same stimulus!)
-                        # Zero-pad missing modalities (e.g. silent films have no text)
+                    # --- Load context ONCE per clip (shared across subjects) ---
+                    ctx_key = f"{task}/{stim_type}/{norm_name}"
+                    if ctx_key not in self._ctx_clips:
                         ctx_arrays = []
                         for ctx_dir in self.context_dirs:
                             c_dir = ctx_dir / task / stim_type
@@ -205,31 +202,47 @@ class DirectFlowDataset(Dataset):
                             else:
                                 # Zero-pad: detect dim from any available file in this modality
                                 mod_dim = self._get_modality_dim(ctx_dir)
-                                if ctx_arrays:
-                                    ref_len = ctx_arrays[0].shape[0]
-                                else:
-                                    ref_len = n_trs  # fallback to fMRI length
+                                # Use a default length; will be truncated below
+                                ref_len = ctx_arrays[0].shape[0] if ctx_arrays else 500
                                 ctx_arrays.append(np.zeros((ref_len, mod_dim), dtype=np.float32))
-                        
-                        # Truncate to minimum temporal length (some models drop the last frame)
+
+                        # Truncate to minimum temporal length
                         min_len = min(arr.shape[0] for arr in ctx_arrays)
                         ctx_arrays = [arr[:min_len] for arr in ctx_arrays]
-                        
-                        # Concatenate all modalities
-                        ctx_data = np.concatenate(ctx_arrays, axis=-1)
 
-                        # Store in preloaded dict (keyed by subject too)
-                        clip_id = f"{subj}/{task}/{stim_type}/{norm_name}"
-                        self._clips[clip_id] = {
-                            "ctx": ctx_data,
-                            "fmri": fmri_data,
-                        }
-                        total_bytes += ctx_data.nbytes + fmri_data.nbytes
-                        n_clips += 1
+                        # Concatenate all modalities and store as float16
+                        ctx_data = np.concatenate(ctx_arrays, axis=-1).astype(np.float16)
+                        self._ctx_clips[ctx_key] = ctx_data
+                        ctx_bytes += ctx_data.nbytes
+                        n_ctx_clips += 1
+
+                    # --- Load fMRI per subject ---
+                    for subj in self.subjects:
+                        subj_idx = self.subject_to_idx[subj]
+
+                        fmri_key = f"{subj}/{task}/{norm_name}"
+                        if fmri_key not in self._fmri_clips:
+                            fmri_data = self._load_fmri_clip(subj, task, norm_name)
+                            if fmri_data is None:
+                                fmri_data = self._load_fmri_clip(subj, task, clip_stem)
+                            if fmri_data is None:
+                                self._fmri_clips[fmri_key] = None
+                            else:
+                                fmri_fp16 = fmri_data.astype(np.float16)
+                                self._fmri_clips[fmri_key] = fmri_fp16
+                                fmri_bytes += fmri_fp16.nbytes
+                                n_fmri_clips += 1
+
+                        fmri_data = self._fmri_clips[fmri_key]
+                        if fmri_data is None:
+                            continue
+
+                        n_trs = fmri_data.shape[0]
 
                         for target_tr in range(0, n_trs, self.stride):
                             samples.append({
-                                "clip_id": clip_id,
+                                "ctx_key": ctx_key,
+                                "fmri_key": fmri_key,
                                 "task": task,
                                 "stim_type": stim_type,
                                 "clip_stem": clip_stem,
@@ -240,8 +253,12 @@ class DirectFlowDataset(Dataset):
                                 "n_trs": n_trs,
                             })
 
-        logger.info("Preloaded %d clips (%.1f GB) → %d samples for %s split.",
-                     n_clips, total_bytes / 1e9, len(samples), self.split)
+        total_bytes = ctx_bytes + fmri_bytes
+        logger.info("Preloaded %d ctx clips (%.2f GB, shared) + %d fMRI clips (%.2f GB) "
+                     "= %.2f GB total → %d samples for %s split.",
+                     n_ctx_clips, ctx_bytes / 1e9,
+                     n_fmri_clips, fmri_bytes / 1e9,
+                     total_bytes / 1e9, len(samples), self.split)
         return samples
 
     def __len__(self):
@@ -249,13 +266,13 @@ class DirectFlowDataset(Dataset):
 
     def __getitem__(self, idx):
         info = self.samples[idx]
-        clip_id = info["clip_id"]
+        ctx_key = info["ctx_key"]
+        fmri_key = info["fmri_key"]
         target_tr = info["target_tr"]
         n_trs = info["n_trs"]
 
-        clip = self._clips[clip_id]
-        ctx_data = clip["ctx"]
-        fmri_data = clip["fmri"]
+        ctx_data = self._ctx_clips[ctx_key]    # float16, shared
+        fmri_data = self._fmri_clips[fmri_key]  # float16, per-subject
 
         # Feature window
         actual_movie_tr = target_tr + self.excl_start
@@ -271,17 +288,17 @@ class DirectFlowDataset(Dataset):
         safe_start = max(0, feat_start)
         safe_end = min(ctx_data.shape[0], feat_end)
         if safe_start < safe_end:
-            ctx = ctx_data[safe_start:safe_end]
+            ctx = ctx_data[safe_start:safe_end].astype(np.float32)  # fp16 → fp32
         else:
             ctx = np.zeros((0, ctx_data.shape[-1]), dtype=np.float32)
         if ctx.shape[0] < self.feat_seq_len:
             pad_len = self.feat_seq_len - ctx.shape[0]
             ctx = np.pad(ctx, ((pad_len, 0), (0, 0)), mode="constant")
-        context = torch.from_numpy(ctx.copy())
+        context = torch.from_numpy(ctx)
 
-        # fMRI target (direct array access)
+        # fMRI target (direct array access, fp16 → fp32)
         if target_tr < fmri_data.shape[0]:
-            fmri_target = torch.from_numpy(fmri_data[target_tr].copy())
+            fmri_target = torch.from_numpy(fmri_data[target_tr].astype(np.float32).copy())
         else:
             n_voxels = self.cfg["fmri"].get("n_voxels", 1000)
             fmri_target = torch.zeros(n_voxels, dtype=torch.float32)
@@ -289,7 +306,7 @@ class DirectFlowDataset(Dataset):
         return {
             "context": context,
             "fmri": fmri_target,
-            "clip_key": clip_id,
+            "clip_key": f"{info['subject']}/{ctx_key}",
             "subject_idx": info["subject_idx"],
             "target_tr": target_tr,
             "n_trs": n_trs,
@@ -444,15 +461,29 @@ def train(args):
         cfg["training"]["val_every_n_epochs"] = 1
 
     # 2. Model
-    logger.info("Initializing BrainFlowDirect...")
     bf_cfg = cfg["brainflow"]
     output_dim = bf_cfg.get("output_dim", cfg["fmri"]["n_voxels"])
+    model_version = bf_cfg.get("model_version", "v1")
 
-    model = BrainFlowDirect(
-        output_dim=output_dim,
-        velocity_net_params=bf_cfg.get("velocity_net", {}),
-        n_subjects=len(cfg["subjects"]),
-    ).to(device)
+    if model_version == "v2":
+        logger.info("Initializing BrainFlowDirectV2 (TRIBE-inspired)...")
+        vn_params = dict(bf_cfg.get("velocity_net", {}))
+        # Inject modality_dims from config
+        modality_dims = cfg.get("modality_dims", None)
+        if modality_dims:
+            vn_params["modality_dims"] = modality_dims
+        model = BrainFlowDirectV2(
+            output_dim=output_dim,
+            velocity_net_params=vn_params,
+            n_subjects=len(cfg["subjects"]),
+        ).to(device)
+    else:
+        logger.info("Initializing BrainFlowDirect (v1)...")
+        model = BrainFlowDirect(
+            output_dim=output_dim,
+            velocity_net_params=bf_cfg.get("velocity_net", {}),
+            n_subjects=len(cfg["subjects"]),
+        ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Trainable parameters: %s", f"{n_params:,}")
