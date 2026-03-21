@@ -151,27 +151,115 @@ class CrossAttentionResBlock(nn.Module):
 
 
 # =============================================================================
+# TokenizedFusionBlock — All-to-All Modality-Time Fusion
+# =============================================================================
+
+class TokenizedFusionBlock(nn.Module):
+    """Tokenized All-to-All Modality-Time Fusion Block.
+    
+    Treats each (modality, time) pair as a distinct token.
+    1. Projects all modalities to a large common context_dim (e.g., 2048).
+    2. Adds separate temporal and modality positional embeddings.
+    3. Applies Modality Dropout.
+    4. Runs a Full Attention Transformer over the flattened (T * M) sequence.
+    """
+    def __init__(
+        self, 
+        modality_dims: list[int], 
+        context_dim: int = 2048, 
+        max_seq_len: int = 11, 
+        n_heads: int = 8, 
+        depth: int = 4, 
+        dropout: float = 0.1,
+        modality_dropout: float = 0.3
+    ):
+        super().__init__()
+        self.modality_dims = modality_dims
+        self.n_modalities = len(modality_dims)
+        self.context_dim = context_dim
+        self.max_seq_len = max_seq_len
+        self.modality_dropout = modality_dropout
+
+        # Per-modality projectors to common context_dim
+        self.projectors = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, context_dim),
+                nn.LayerNorm(context_dim),
+                nn.GELU()
+            ) for dim in modality_dims
+        ])
+
+        # Learnable Embeddings coordinates
+        self.time_emb = nn.Parameter(torch.randn(1, max_seq_len, 1, context_dim) * 0.02)
+        self.modality_emb = nn.Parameter(torch.randn(1, 1, self.n_modalities, context_dim) * 0.02)
+
+        # Transformer Encoder for all-to-all cross-modal and cross-time fusion
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=context_dim,
+            nhead=n_heads,
+            dim_feedforward=context_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+
+    def forward(self, modality_features: list[torch.Tensor]) -> torch.Tensor:
+        B, T = modality_features[0].shape[:2]
+        
+        # 1. Project all to common D
+        projected = []
+        for feat, proj in zip(modality_features, self.projectors):
+            projected.append(proj(feat))  # (B, T, context_dim)
+            
+        # 2. Stack building the modality axis -> (B, T, M, context_dim)
+        stacked = torch.stack(projected, dim=2)
+        
+        # 3. Add Positional Coordinates
+        T_safe = min(T, self.max_seq_len)
+        t_emb = self.time_emb[:, :T_safe, :, :]
+        if T > self.max_seq_len:
+            stacked = stacked[:, :self.max_seq_len, :, :]
+        
+        stacked = stacked + t_emb + self.modality_emb
+        
+        # 4. Modality Dropout
+        if self.training and self.modality_dropout > 0:
+            keep_mask = (torch.rand(B, 1, self.n_modalities, 1, device=stacked.device) > self.modality_dropout).float()
+            # Ensure at least one modality survives per sample
+            all_dropped = (keep_mask.sum(dim=2, keepdim=True) == 0).float()
+            keep_mask[:, :, 0:1, :] = torch.max(keep_mask[:, :, 0:1, :], all_dropped)
+            stacked = stacked * keep_mask
+
+        # 5. Flatten to sequence of length T_safe * M tokens
+        flattened = stacked.view(B, T_safe * self.n_modalities, self.context_dim)
+        
+        # 6. Deep Transformer Fusion
+        fused = self.transformer(flattened)
+        return fused
+
+
+# =============================================================================
 # DirectVelocityNetV2 — TRIBE-Inspired VelocityNet
 # =============================================================================
 
 class DirectVelocityNetV2(nn.Module):
-    """Velocity network v2 with per-modality projectors + temporal transformer.
+    """Velocity network v2 with Tokenized Modality-Time Fusion.
 
     Architecture:
-        1. Per-modality projectors: each mod → Linear(mod_dim, hidden//N) + LN + GELU
-        2. Modality Dropout (0.3): randomly zero-out entire modality projections
-        3. Concatenate → (B, T, hidden_dim)
-        4. Temporal Transformer Encoder (4 layers self-attention over T)
-        5. Input: x_t (B, output_dim) → Linear → (B, hidden_dim)
-        6. Time: sinusoidal → MLP → + subject embedding → t_emb
-        7. N blocks of CrossAttentionResBlock(h, t_emb, context_encoded)
-        8. SubjectLayers output head → (B, output_dim)
+        1. TokenizedFusionBlock: Project all mods to context_dim, add coords, Full-Attn.
+        2. Input: x_t (B, output_dim) → Linear → (B, hidden_dim)
+        3. Time: sinusoidal → MLP → + subject embedding → t_emb
+        4. N blocks of CrossAttentionResBlock(h, t_emb, context_encoded)
+        5. SubjectLayers output head → (B, output_dim)
     """
 
     def __init__(
         self,
         output_dim: int = 1000,
         hidden_dim: int = 1024,
+        context_dim: int = 2048,
         modality_dims: list[int] = None,
         n_blocks: int = 8,
         n_heads: int = 8,
@@ -184,39 +272,19 @@ class DirectVelocityNetV2(nn.Module):
         super().__init__()
         self.output_dim = output_dim
         self.hidden_dim = hidden_dim
+        self.context_dim = context_dim
         self.modality_dims = modality_dims or [1408]
         self.n_modalities = len(self.modality_dims)
-        self.modality_dropout = modality_dropout
-        self.max_seq_len = max_seq_len
 
-        # --- Per-modality projectors ---
-        proj_dim = hidden_dim // self.n_modalities
-        self.proj_dims = [proj_dim] * (self.n_modalities - 1) + \
-                         [hidden_dim - proj_dim * (self.n_modalities - 1)]  # last one absorbs remainder
-        self.modality_projectors = nn.ModuleList()
-        for i, mod_dim in enumerate(self.modality_dims):
-            self.modality_projectors.append(nn.Sequential(
-                nn.Linear(mod_dim, self.proj_dims[i]),
-                nn.LayerNorm(self.proj_dims[i]),
-                nn.GELU(),
-            ))
-
-        # --- Temporal Transformer Encoder ---
-        # Self-attention over time axis to refine context
-        self.context_pos_emb = nn.Parameter(torch.randn(1, max_seq_len, hidden_dim) * 0.02)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=n_heads,
-            dim_feedforward=hidden_dim * 4,
+        # --- Tokenized Fusion Block ---
+        self.fusion_block = TokenizedFusionBlock(
+            modality_dims=self.modality_dims,
+            context_dim=context_dim,
+            max_seq_len=max_seq_len,
+            n_heads=n_heads,
+            depth=context_transformer_depth,
             dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,  # Pre-norm (more stable)
-        )
-        self.context_transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=context_transformer_depth,
-            enable_nested_tensor=False,
+            modality_dropout=modality_dropout,
         )
 
         # --- Input projection ---
@@ -237,7 +305,7 @@ class DirectVelocityNetV2(nn.Module):
 
         # --- Velocity blocks: FiLM + CrossAttn ---
         self.blocks = nn.ModuleList([
-            CrossAttentionResBlock(hidden_dim, hidden_dim, hidden_dim, n_heads, dropout)
+            CrossAttentionResBlock(hidden_dim, hidden_dim, self.context_dim, n_heads, dropout)
             for _ in range(n_blocks)
         ])
 
@@ -250,59 +318,16 @@ class DirectVelocityNetV2(nn.Module):
         if self.subject_output.bias is not None:
             nn.init.constant_(self.subject_output.bias, 0)
 
-    def _apply_modality_dropout(self, projected: list[torch.Tensor]) -> list[torch.Tensor]:
-        """Randomly zero-out entire modality projections during training.
-
-        Always keeps at least one modality active (following TRIBE).
-        """
-        if not self.training or self.modality_dropout <= 0:
-            return projected
-
-        n = len(projected)
-        # Decide which modalities to drop
-        drop_mask = [random.random() < self.modality_dropout for _ in range(n)]
-
-        # Ensure at least one modality survives
-        if all(drop_mask):
-            keep_idx = random.randint(0, n - 1)
-            drop_mask[keep_idx] = False
-
-        return [
-            torch.zeros_like(p) if drop else p
-            for p, drop in zip(projected, drop_mask)
-        ]
-
     def _encode_context(self, modality_features: list[torch.Tensor]) -> torch.Tensor:
-        """Project + dropout + concat + transformer encode.
+        """Tokenize and fuse modality features.
 
         Args:
             modality_features: list of (B, T, mod_dim_i) tensors
 
         Returns:
-            context_encoded: (B, T, hidden_dim)
+            context_encoded: (B, T * M, context_dim) fused context sequence
         """
-        # Per-modality projection
-        projected = []
-        for i, (feat, proj) in enumerate(zip(modality_features, self.modality_projectors)):
-            projected.append(proj(feat))  # (B, T, proj_dim_i)
-
-        # Modality dropout
-        projected = self._apply_modality_dropout(projected)
-
-        # Concatenate along feature dim
-        context = torch.cat(projected, dim=-1)  # (B, T, hidden_dim)
-
-        # Add positional embedding
-        T = context.shape[1]
-        if T <= self.max_seq_len:
-            context = context + self.context_pos_emb[:, :T, :]
-        else:
-            context = context[:, :self.max_seq_len, :] + self.context_pos_emb
-
-        # Temporal Transformer
-        context_encoded = self.context_transformer(context)  # (B, T, hidden_dim)
-
-        return context_encoded
+        return self.fusion_block(modality_features)
 
     def forward(
         self,
@@ -340,7 +365,7 @@ class DirectVelocityNetV2(nn.Module):
             context_encoded = self._encode_context(splits)
         else:
             context_encoded = torch.zeros(
-                x.shape[0], 1, self.hidden_dim, device=x.device, dtype=x.dtype
+                x.shape[0], 1, self.context_dim, device=x.device, dtype=x.dtype
             )
 
         # --- Embeddings ---
@@ -423,7 +448,7 @@ class BrainFlowDirectV2(nn.Module):
             loss: scalar MSE(v_pred, dx_t).
         """
         x_1 = target
-        x_0 = torch.randn_like(x_1)
+        x_0 = torch.zeros_like(x_1)
         t = torch.rand(x_1.shape[0], device=x_1.device)
         sample_info = self.path.sample(t=t, x_0=x_0, x_1=x_1)
 
