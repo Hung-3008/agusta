@@ -460,9 +460,11 @@ class BrainFlowDirectV2(nn.Module):
         velocity_net_params: dict = None,
         n_subjects: int = 4,
         source_predictor_params: dict = None,
+        source_mode: str = "csfm",
     ):
         super().__init__()
         self.output_dim = output_dim
+        self.source_mode = source_mode  # "csfm", "gaussian", "zero"
 
         # Velocity network
         vn_cfg = dict(velocity_net_params or {})
@@ -470,25 +472,31 @@ class BrainFlowDirectV2(nn.Module):
         vn_cfg.setdefault("n_subjects", n_subjects)
         self.velocity_net = DirectVelocityNetV2(**vn_cfg)
 
-        # Source predictor (CSFM)
-        sp_cfg = dict(source_predictor_params or {})
-        self.align_weight = sp_cfg.pop("align_weight", 1.0)
-        self.kld_weight = sp_cfg.pop("kld_weight", 0.1)
-        sp_cfg.setdefault("hidden_dim", vn_cfg.get("hidden_dim", 1024))
-        sp_cfg.setdefault("output_dim", output_dim)
-        sp_cfg.setdefault("n_subjects", n_subjects)
-        self.source_predictor = SourcePredictor(**sp_cfg)
+        # Source predictor (only for CSFM mode)
+        self.source_predictor = None
+        self.align_weight = 0.0
+        self.kld_weight = 0.0
+        if source_mode == "csfm":
+            sp_cfg = dict(source_predictor_params or {})
+            self.align_weight = sp_cfg.pop("align_weight", 1.0)
+            self.kld_weight = sp_cfg.pop("kld_weight", 0.1)
+            sp_cfg.setdefault("hidden_dim", vn_cfg.get("hidden_dim", 1024))
+            sp_cfg.setdefault("output_dim", output_dim)
+            sp_cfg.setdefault("n_subjects", n_subjects)
+            self.source_predictor = SourcePredictor(**sp_cfg)
 
         # OT-CFM path
         self.path = AffineProbPath(scheduler=CondOTScheduler())
 
         # Log parameters
         vn_params = sum(p.numel() for p in self.velocity_net.parameters())
-        sp_params = sum(p.numel() for p in self.source_predictor.parameters())
+        sp_params = sum(p.numel() for p in self.source_predictor.parameters()) if self.source_predictor else 0
+        print(f"[BrainFlowDirectV2] source_mode={source_mode}")
         print(f"[BrainFlowDirectV2] VelocityNet: {vn_params:,} params")
-        print(f"[BrainFlowDirectV2] SourcePredictor: {sp_params:,} params")
+        if self.source_predictor:
+            print(f"[BrainFlowDirectV2] SourcePredictor: {sp_params:,} params")
+            print(f"[BrainFlowDirectV2] Loss weights: align={self.align_weight}, kld={self.kld_weight}")
         print(f"[BrainFlowDirectV2] Total: {vn_params + sp_params:,} params")
-        print(f"[BrainFlowDirectV2] Loss weights: align={self.align_weight}, kld={self.kld_weight}")
 
     def forward(
         self,
@@ -509,11 +517,18 @@ class BrainFlowDirectV2(nn.Module):
         # 1. Encode context (shared between source predictor and velocity net)
         context_encoded = self.velocity_net.encode_context_from_cond(context)
 
-        # 2. Predict condition-dependent source
-        x_0, mu, log_var = self.source_predictor(context_encoded, subject_ids)
-
-        # 3. Flow matching with learned source
+        # 2. Determine source x₀ based on mode
         x_1 = target
+        if self.source_mode == "csfm":
+            x_0, mu, log_var = self.source_predictor(context_encoded, subject_ids)
+        elif self.source_mode == "gaussian":
+            x_0 = torch.randn_like(x_1)
+            mu, log_var = None, None
+        else:  # "zero"
+            x_0 = torch.zeros_like(x_1)
+            mu, log_var = None, None
+
+        # 3. Flow matching
         t = torch.rand(x_1.shape[0], device=x_1.device)
         sample_info = self.path.sample(t=t, x_0=x_0, x_1=x_1)
 
@@ -527,7 +542,10 @@ class BrainFlowDirectV2(nn.Module):
         flow_loss = F.mse_loss(v_pred, sample_info.dx_t)
 
         # 4. Align loss: push source mean close to target → shorter flow
-        align_loss = F.mse_loss(mu, target)
+        if mu is not None:
+            align_loss = F.mse_loss(mu, target)
+        else:
+            align_loss = torch.tensor(0.0, device=target.device)
 
         # 5. Var-KLD loss: regularize variance (only σ terms, no μ²)
         #    KL(q || N(0,1)) variance part = 0.5 * (σ² - log(σ²) - 1)
@@ -575,8 +593,13 @@ class BrainFlowDirectV2(nn.Module):
         # 1. Encode context once (shared)
         context_encoded = self.velocity_net.encode_context_from_cond(context)
 
-        # 2. Learned source: x_init = μ (deterministic at inference)
-        x_init, _, _ = self.source_predictor(context_encoded, subject_ids)
+        # 2. Source based on mode
+        if self.source_mode == "csfm":
+            x_init, _, _ = self.source_predictor(context_encoded, subject_ids)
+        elif self.source_mode == "gaussian":
+            x_init = torch.randn(B, self.output_dim, device=device, dtype=dtype)
+        else:  # "zero"
+            x_init = torch.zeros(B, self.output_dim, device=device, dtype=dtype)
 
         # 3. ODE solve from learned source with pre-encoded context
         solver = ODESolver(velocity_model=self.velocity_net)

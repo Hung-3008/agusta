@@ -469,11 +469,13 @@ def train(args):
     if modality_dims:
         vn_params["modality_dims"] = modality_dims
     sp_params = dict(bf_cfg.get("source_predictor", {}))
+    source_mode = bf_cfg.get("source_mode", "csfm")
     model = BrainFlowDirectV2(
         output_dim=output_dim,
         velocity_net_params=vn_params,
         n_subjects=len(cfg["subjects"]),
         source_predictor_params=sp_params,
+        source_mode=source_mode,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
