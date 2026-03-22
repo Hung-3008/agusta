@@ -1,4 +1,4 @@
-"""Evaluate BrainFlowDirect — generate fMRI predictions for Friends S7 submission.
+"""Evaluate BrainFlowDirect — generate fMRI predictions for OOD movies submission.
 
 Uses the same data pipeline as train_brainflow_direct.py:
   - Pre-extracted context latents (multi-modal ensemble)
@@ -6,9 +6,13 @@ Uses the same data pipeline as train_brainflow_direct.py:
   - Global stats denormalization for raw fMRI output
   - Subject embedding conditioning
 
+OOD movies: chaplin, mononoke, passepartout, planetearth, pulpfiction, wot
+Each movie is split into 2 parts (e.g., chaplin1, chaplin2).
+Context features at: features_npy_pooled/{modality}/ood/{movie}/task-{split}_video.npy
+
 Usage:
-    python src/evaluate_brainflow_direct.py --config src/configs/brain_flow_direct.yaml
-    python src/evaluate_brainflow_direct.py --config src/configs/brain_flow_direct.yaml --n_timesteps 50
+    python src/evaluate_brainflow_direct_ood.py --config src/configs/brain_flow_direct_v2_csfm.yaml
+    python src/evaluate_brainflow_direct_ood.py --config src/configs/brain_flow_direct_v2_csfm.yaml --n_timesteps 50
 """
 
 import sys
@@ -28,64 +32,73 @@ from src.models.brainflow.brain_flow_direct_v2 import BrainFlowDirectV2
 from src.data.dataset import load_config
 
 
-def load_fmri_samples(project_root: Path, subject: str) -> dict:
-    """Load target fMRI sample counts for Friends season 7.
-    Returns dict: {episode_key: n_trs}, e.g. {'s07e01a': 460, ...}
+def load_ood_fmri_samples(project_root: Path, subject: str) -> dict:
+    """Load target fMRI sample counts for OOD movies.
+    Returns dict: {movie_split: n_trs}, e.g. {'chaplin1': 432, 'chaplin2': 405, ...}
     """
     samples_file = (
         project_root / "Data" / "algonauts_2025.competitors" / "fmri"
         / subject / "target_sample_number"
-        / f"{subject}_friends-s7_fmri_samples.npy"
+        / f"{subject}_ood_fmri_samples.npy"
     )
     return np.load(samples_file, allow_pickle=True).item()
 
 
-def load_context_for_clip(
+def get_movie_from_split(split_name: str) -> str:
+    """Extract movie name from split key.
+    e.g., 'chaplin1' -> 'chaplin', 'passepartout2' -> 'passepartout'
+    """
+    # Remove trailing digits to get movie name
+    movie = split_name.rstrip('0123456789')
+    return movie
+
+
+def load_ood_context_for_split(
     context_dirs: list,
-    task: str,
-    stim_type: str,
-    clip_name: str,
+    split_name: str,
 ) -> np.ndarray:
-    """Load and concatenate multi-modal context features for one clip.
-    
-    Handles missing modalities by zero-padding (e.g. silent films).
+    """Load and concatenate multi-modal context features for one OOD movie split.
+
+    OOD features are stored as:
+        {modality_dir}/ood/{movie}/task-{split_name}_video.npy
+
+    Handles missing modalities by zero-padding (e.g., qwen2-5_3B has no OOD features).
     Returns: (n_trs, context_dim) float32 array.
     """
+    movie = get_movie_from_split(split_name)
+
     ctx_arrays = []
     modality_dim_cache = {}
-    
+
     for ctx_dir in context_dirs:
-        c_dir = ctx_dir / task / stim_type
-        
-        # Try multiple naming conventions
-        ctx_path = c_dir / f"{clip_name}.npy"
-        if not ctx_path.exists():
-            ctx_path = c_dir / f"{task}_{clip_name}.npy"
-        
+        # OOD path: {modality_dir}/ood/{movie}/task-{split}_video.npy
+        ctx_path = ctx_dir / "ood" / movie / f"task-{split_name}_video.npy"
+
         if ctx_path.exists():
             ctx_arrays.append(np.load(ctx_path).astype(np.float32))
         else:
-            # Zero-pad missing modality
+            # Zero-pad missing modality (e.g., qwen2-5_3B)
             key = str(ctx_dir)
             if key not in modality_dim_cache:
                 for f in ctx_dir.rglob("*.npy"):
                     modality_dim_cache[key] = np.load(f).shape[-1]
                     break
             mod_dim = modality_dim_cache.get(key, 512)
-            ref_len = ctx_arrays[0].shape[0] if ctx_arrays else 100
+            ref_len = ctx_arrays[0].shape[0] if ctx_arrays else 500
             ctx_arrays.append(np.zeros((ref_len, mod_dim), dtype=np.float32))
-    
+            print(f"  Zero-padding modality {ctx_dir.name} for {split_name} (dim={mod_dim})")
+
     # Truncate to minimum temporal length
     min_len = min(arr.shape[0] for arr in ctx_arrays)
     ctx_arrays = [arr[:min_len] for arr in ctx_arrays]
-    
+
     return np.concatenate(ctx_arrays, axis=-1)
 
 
 @torch.inference_mode()
-def evaluate_brainflow_direct():
+def evaluate_brainflow_direct_ood():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="src/configs/brain_flow_direct.yaml")
+    parser.add_argument("--config", type=str, default="src/configs/brain_flow_direct_v2_csfm.yaml")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--n_timesteps", type=int, default=20)
@@ -112,7 +125,7 @@ def evaluate_brainflow_direct():
         context_dirs = [PROJECT_ROOT / d for d in cfg["context_latent_dirs"]]
     else:
         context_dirs = [PROJECT_ROOT / cfg["context_latent_dir"]]
-    
+
     subjects = cfg["subjects"]
     subject_to_idx = {s: i for i, s in enumerate(subjects)}
 
@@ -120,7 +133,6 @@ def evaluate_brainflow_direct():
     feature_context_trs = cfg["sliding_window"].get("feature_context_trs", 10)
     feat_seq_len = feature_context_trs + 1  # 10 past + 1 current
     hrf_delay = cfg["fmri"].get("hrf_delay", 2)
-    excl_start = cfg["fmri"].get("excluded_samples_start", 5)
 
     # Global stats for denormalization
     use_global_stats = cfg["fmri"].get("use_global_stats", False)
@@ -139,7 +151,7 @@ def evaluate_brainflow_direct():
 
     # Output dirs
     out_dir = Path(cfg.get("output_dir", "outputs/brainflow_direct"))
-    output_dir = PROJECT_ROOT / "results" / "brainflow_direct_submission"
+    output_dir = PROJECT_ROOT / "results" / "brainflow_direct_submission_ood"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 1. Build model ───────────────────────────────────────────────────────
@@ -173,11 +185,11 @@ def evaluate_brainflow_direct():
     print(f"Config: hrf_delay={hrf_delay}, context_trs={feature_context_trs}, "
           f"n_timesteps={args.n_timesteps}, solver={args.solver_method}")
 
-    # ── 2. Per-subject inference ─────────────────────────────────────────────
+    # ── 2. Per-subject inference for OOD movies ──────────────────────────────
     subject_result_paths = {}
 
     for subject in subjects:
-        subj_path = output_dir / f"{subject}_predictions.npy"
+        subj_path = output_dir / f"{subject}_ood_predictions.npy"
 
         if args.resume and subj_path.exists():
             print(f"\n[RESUME] Skipping {subject} — found {subj_path}")
@@ -185,29 +197,24 @@ def evaluate_brainflow_direct():
             continue
 
         print(f"\n{'='*60}")
-        print(f"Processing {subject}...")
+        print(f"Processing {subject} (OOD)...")
         print(f"{'='*60}")
 
         subject_idx = subject_to_idx[subject]
         subject_dict = {}
-        target_samples = load_fmri_samples(PROJECT_ROOT, subject)
+        target_samples = load_ood_fmri_samples(PROJECT_ROOT, subject)
 
-        for epi, n_trs in tqdm(target_samples.items(), desc=subject):
-            clip_name = f"friends_{epi}"
+        for split_name, n_trs in tqdm(target_samples.items(), desc=subject):
 
-            # Load multi-modal context
-            ctx_data = load_context_for_clip(
-                context_dirs, "friends", "s7", clip_name,
-            )
+            # Load multi-modal context for this OOD split
+            ctx_data = load_ood_context_for_split(context_dirs, split_name)
 
             if ctx_data is None or ctx_data.shape[0] == 0:
-                print(f"  No context for {clip_name}. Emitting zeros.")
-                subject_dict[epi] = np.zeros((n_trs, 1000), dtype=np.float32)
+                print(f"  No context for {split_name}. Emitting zeros.")
+                subject_dict[split_name] = np.zeros((n_trs, 1000), dtype=np.float32)
                 continue
 
             # ── Build per-TR batches ──
-            # The scoring script maps submission index `target_tr` directly to
-            # feature index `target_tr` (minus HRF delay). Do not add excl_start!
             all_contexts = []
             for target_tr in range(n_trs):
                 feat_current_tr = target_tr - hrf_delay
@@ -240,7 +247,6 @@ def evaluate_brainflow_direct():
                 ctx_batch = torch.from_numpy(all_contexts[bi:be]).to(device)
                 subj_batch = torch.full((B,), subject_idx, dtype=torch.long, device=device)
 
-                # Use float32 for ODE solver — bfloat16 causes overflow/NaN
                 pred = model.synthesise(
                     ctx_batch,
                     n_timesteps=args.n_timesteps,
@@ -262,7 +268,7 @@ def evaluate_brainflow_direct():
 
             # Safety: replace any residual NaN/Inf
             fmri_pred = np.nan_to_num(fmri_pred, nan=0.0, posinf=0.0, neginf=0.0)
-            subject_dict[epi] = fmri_pred.astype(np.float32)
+            subject_dict[split_name] = fmri_pred.astype(np.float32)
             del all_contexts, fmri_preds
 
         # Save subject result
@@ -274,14 +280,14 @@ def evaluate_brainflow_direct():
         gc.collect()
         torch.cuda.empty_cache()
 
-    # ── 3. Assemble final submission ─────────────────────────────────────────
-    print("\nAssembling submission dict from per-subject files...")
+    # ── 3. Assemble final OOD submission ─────────────────────────────────────
+    print("\nAssembling OOD submission dict from per-subject files...")
     submission_dict = {}
     for subject, path in subject_result_paths.items():
         submission_dict[subject] = np.load(path, allow_pickle=True).item()
 
-    submission_path = output_dir / "submission.npy"
-    print(f"Saving submission.npy to {submission_path}...")
+    submission_path = output_dir / "submission_ood.npy"
+    print(f"Saving submission_ood.npy to {submission_path}...")
     np.save(submission_path, submission_dict)
 
     del submission_dict
@@ -290,7 +296,7 @@ def evaluate_brainflow_direct():
     zip_path = submission_path.with_suffix(".zip")
     print(f"Zipping to {zip_path}...")
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
-        zipf.write(submission_path, arcname="submission.npy")
+        zipf.write(submission_path, arcname="submission_ood.npy")
 
     print(f"Done! Zip size: {zip_path.stat().st_size / 1024 / 1024:.1f} MB")
 
@@ -301,4 +307,4 @@ def evaluate_brainflow_direct():
 
 
 if __name__ == "__main__":
-    evaluate_brainflow_direct()
+    evaluate_brainflow_direct_ood()

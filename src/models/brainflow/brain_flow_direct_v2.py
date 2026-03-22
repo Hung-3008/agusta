@@ -593,17 +593,24 @@ class BrainFlowDirectV2(nn.Module):
         n_timesteps: int = 50,
         solver_method: str = "midpoint",
         subject_ids: torch.Tensor = None,
+        n_trials: int = 1,
     ) -> torch.Tensor:
         """Generate fMRI by solving ODE from learned source.
 
         Uses SourcePredictor to generate x_init = μ(context) instead of zeros.
         Then solves ODE with pre-encoded context (computed once).
 
+        When n_trials > 1 (CSFM mode only):
+          - Samples x₀ = μ + ε·σ for each trial (stochastic)
+          - Runs separate ODE solves per trial
+          - Returns the average across all trials
+
         Args:
             context:        (B, T, total_dim) concatenated context.
             n_timesteps:    Number of ODE solver steps.
             solver_method:  ODE solver method.
             subject_ids:    (B,) long tensor of subject indices.
+            n_trials:       Number of stochastic trials to average (default=1).
 
         Returns:
             fmri_pred: (B, output_dim) predicted fMRI.
@@ -612,20 +619,58 @@ class BrainFlowDirectV2(nn.Module):
         device = context.device
         dtype = context.dtype
 
-        # 1. Encode context once (shared)
+        # 1. Encode context once (shared across all trials)
         context_encoded = self.velocity_net.encode_context_from_cond(context)
 
-        # 2. Source based on mode
+        # 2. Setup ODE solver (shared)
+        solver = ODESolver(velocity_model=self.velocity_net)
+        T = torch.linspace(0, 1, n_timesteps, device=device, dtype=dtype)
+
+        # 3. Multi-trial for CSFM mode
+        if n_trials > 1 and self.source_mode == "csfm" and self.source_predictor is not None:
+            # Get mu and log_var from source predictor
+            h = context_encoded.mean(dim=1)
+            h = self.source_predictor.pool_proj(h)
+            if subject_ids is None:
+                subject_ids_sp = torch.zeros(B, dtype=torch.long, device=device)
+            else:
+                subject_ids_sp = subject_ids
+            mu = self.source_predictor.mean_head(h, subject_ids_sp)
+
+            log_var = None
+            if self.source_predictor.use_variational:
+                log_var = self.source_predictor.log_var_head(h)
+                log_var = torch.clamp(log_var, min=-10.0, max=2.0)
+                std = torch.exp(0.5 * log_var)
+
+            # Accumulate predictions across trials
+            fmri_acc = torch.zeros(B, self.output_dim, device=device, dtype=dtype)
+            for trial in range(n_trials):
+                if log_var is not None:
+                    x_init = mu + torch.randn_like(mu) * std
+                else:
+                    x_init = mu
+
+                pred = solver.sample(
+                    time_grid=T,
+                    x_init=x_init,
+                    method=solver_method,
+                    step_size=1.0 / n_timesteps,
+                    return_intermediates=False,
+                    pre_encoded_context=context_encoded,
+                    subject_ids=subject_ids,
+                )
+                fmri_acc += pred
+
+            return fmri_acc / n_trials
+
+        # 4. Single-trial path (original behavior)
         if self.source_mode == "csfm":
             x_init, _, _ = self.source_predictor(context_encoded, subject_ids)
         elif self.source_mode == "gaussian":
             x_init = torch.randn(B, self.output_dim, device=device, dtype=dtype)
         else:  # "zero"
             x_init = torch.zeros(B, self.output_dim, device=device, dtype=dtype)
-
-        # 3. ODE solve from learned source with pre-encoded context
-        solver = ODESolver(velocity_model=self.velocity_net)
-        T = torch.linspace(0, 1, n_timesteps, device=device, dtype=dtype)
 
         fmri_pred = solver.sample(
             time_grid=T,
