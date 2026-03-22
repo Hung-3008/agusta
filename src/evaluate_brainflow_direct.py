@@ -7,8 +7,8 @@ Uses the same data pipeline as train_brainflow_direct.py:
   - Subject embedding conditioning
 
 Usage:
-    python src/evaluate_brainflow_direct.py --config src/configs/brain_flow_direct.yaml
-    python src/evaluate_brainflow_direct.py --config src/configs/brain_flow_direct.yaml --n_timesteps 50
+    python src/evaluate_brainflow_direct.py --config src/configs/brain_flow_direct_v2_gaussian.yaml
+    python src/evaluate_brainflow_direct.py --config src/configs/brain_flow_direct_v2.yaml --n_timesteps 50
 """
 
 import sys
@@ -117,8 +117,13 @@ def evaluate_brainflow_direct():
     # Sliding window config
     feature_context_trs = cfg["sliding_window"].get("feature_context_trs", 10)
     feat_seq_len = feature_context_trs + 1  # 10 past + 1 current
-    hrf_delay = cfg["fmri"].get("hrf_delay", 2)
-    excl_start = cfg["fmri"].get("excluded_samples_start", 5)
+
+    # NOTE: S7 test features are pre-aligned 1:1 with target TRs
+    # (e.g. 460 feature frames for 460 target TRs).
+    # Unlike training features (full movie length needing excl_start + hrf_delay),
+    # test features already account for these offsets → set both to 0.
+    hrf_delay = 0
+    excl_start = 0
 
     # Global stats for denormalization
     use_global_stats = cfg["fmri"].get("use_global_stats", False)
@@ -140,7 +145,7 @@ def evaluate_brainflow_direct():
     output_dir = PROJECT_ROOT / "results" / "brainflow_direct_submission"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── 1. Build model ───────────────────────────────────────────────────────
+    # ── 1. Build model ───────────────────────────────────────────────────────────
     bf_cfg = cfg["brainflow"]
     vn_cfg = bf_cfg.get("velocity_net", {})
 
@@ -148,20 +153,24 @@ def evaluate_brainflow_direct():
     modality_dims = cfg.get("modality_dims", None)
     if modality_dims:
         vn_params["modality_dims"] = modality_dims
+    sp_params = dict(bf_cfg.get("source_predictor", {}))
+    source_mode = bf_cfg.get("source_mode", "csfm")
     model = BrainFlowDirectV2(
         output_dim=bf_cfg["output_dim"],
         velocity_net_params=vn_params,
         n_subjects=len(subjects),
+        source_predictor_params=sp_params,
+        source_mode=source_mode,
     ).to(device)
 
-    ckpt_path = out_dir / "best.pt"
+    ckpt_path = PROJECT_ROOT / out_dir / "best.pt"
     print(f"Loading checkpoint from {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint)
     model.eval()
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model loaded: {n_params:,} params")
+    print(f"Model loaded: {n_params:,} params (source_mode={source_mode})")
     print(f"Config: hrf_delay={hrf_delay}, context_trs={feature_context_trs}, "
           f"n_timesteps={args.n_timesteps}, solver={args.solver_method}")
 
@@ -199,10 +208,13 @@ def evaluate_brainflow_direct():
 
             # ── Build per-TR batches ──
             # The scoring script maps submission index `target_tr` directly to
-            # feature index `target_tr` (minus HRF delay). Do not add excl_start!
+            # the fMRI target index. But the features corresponding to this target
+            # are offset by excl_start in the actual movie TR space!
+            # See training: actual_movie_tr = target_tr + excl_start
             all_contexts = []
             for target_tr in range(n_trs):
-                feat_current_tr = target_tr - hrf_delay
+                actual_movie_tr = target_tr + excl_start
+                feat_current_tr = actual_movie_tr - hrf_delay
 
                 feat_start = feat_current_tr - feature_context_trs
                 feat_end = feat_current_tr + 1

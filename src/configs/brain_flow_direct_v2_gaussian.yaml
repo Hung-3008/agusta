@@ -63,8 +63,8 @@ sliding_window:
 
 # --- DataLoader ---
 dataloader:
-  batch_size: 256
-  val_batch_size: 256
+  batch_size: 512
+  val_batch_size: 512
   num_workers: 4
   pin_memory: true
 

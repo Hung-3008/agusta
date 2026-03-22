@@ -342,6 +342,11 @@ class DirectVelocityNetV2(nn.Module):
             nn.GELU(),
         )
 
+        # --- Temporal positional embedding for context (after fusion) ---
+        self.context_pos_emb = nn.Parameter(
+            torch.randn(1, max_seq_len, hidden_dim) * 0.02
+        )
+
         # --- Time embedding MLP ---
         self.time_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -381,7 +386,12 @@ class DirectVelocityNetV2(nn.Module):
         for dim in self.modality_dims:
             splits.append(cond[:, :, offset:offset + dim])
             offset += dim
-        return self.fusion_block(splits)
+        context = self.fusion_block(splits)
+
+        # Add temporal positional embedding
+        T = context.shape[1]
+        context = context + self.context_pos_emb[:, :T, :]
+        return context
 
     def forward(
         self,
@@ -596,9 +606,9 @@ class BrainFlowDirectV2(nn.Module):
         # 2. Source based on mode
         if self.source_mode == "csfm":
             x_init, _, _ = self.source_predictor(context_encoded, subject_ids)
-        elif self.source_mode == "gaussian":
-            x_init = torch.randn(B, self.output_dim, device=device, dtype=dtype)
-        else:  # "zero"
+        else:
+            # For gaussian/zero modes, always use zeros at inference
+            # (deterministic ODE → optimal PCC)
             x_init = torch.zeros(B, self.output_dim, device=device, dtype=dtype)
 
         # 3. ODE solve from learned source with pre-encoded context
