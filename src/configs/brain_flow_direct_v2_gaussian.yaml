@@ -57,14 +57,14 @@ splits:
 
 # --- Sliding window ---
 sliding_window:
-  feature_context_trs: 10
+  feature_context_trs: 30
   stride: 1
   temporal_jitter: 2
 
 # --- DataLoader ---
 dataloader:
-  batch_size: 512
-  val_batch_size: 512
+  batch_size: 256
+  val_batch_size: 256
   num_workers: 4
   pin_memory: true
 
@@ -83,7 +83,7 @@ brainflow:
     dropout: 0.1
     modality_dropout: 0.3
     cross_modal_n_layers: 2
-    max_seq_len: 11
+    max_seq_len: 31
 
 # =====================================================================
 # Solver args (validation inference)

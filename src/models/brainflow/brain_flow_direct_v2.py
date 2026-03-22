@@ -29,6 +29,8 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
+import torch.nn.functional as F
 
 from flow_matching.path import AffineProbPath
 from flow_matching.path.scheduler import CondOTScheduler
@@ -89,6 +91,7 @@ class CrossAttentionResBlock(nn.Module):
         super().__init__()
 
         self.film = nn.Linear(time_dim, dim * 2)
+        self.film_kv = nn.Linear(time_dim, context_dim * 2)
 
         self.norm1 = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
@@ -114,6 +117,12 @@ class CrossAttentionResBlock(nn.Module):
 
         q = self.norm_q(x).unsqueeze(1)
         kv = self.norm_kv(context)
+        
+        # Time-Adaptive Cross-Attention: Modulate K and V based on ODE timestep
+        scale_shift_kv = self.film_kv(t_emb).unsqueeze(1)  # (B, 1, context_dim*2)
+        scale_kv, shift_kv = scale_shift_kv.chunk(2, dim=-1)
+        kv = kv * (1 + scale_kv) + shift_kv
+
         attn_out, _ = self.cross_attn(q, kv, kv)
         x = x + attn_out.squeeze(1)
 
@@ -156,6 +165,14 @@ class FactoredCrossModalFusion(nn.Module):
             for dim in modality_dims
         ])
 
+        # Dynamic Modality Routing (Mixture of Experts Gate)
+        self.moe_gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 4, 1),
+            nn.Sigmoid(),
+        )
+
         self.modality_emb = nn.Parameter(
             torch.randn(1, 1, self.n_modalities, hidden_dim) * 0.02
         )
@@ -183,7 +200,13 @@ class FactoredCrossModalFusion(nn.Module):
         for feat, proj in zip(modality_features, self.projectors):
             projected.append(proj(feat[:, :T]))
 
-        stacked = torch.stack(projected, dim=2)
+        stacked = torch.stack(projected, dim=2)  # (B, T, M, D)
+
+        # Apply Dynamic Modality Routing (Gate based on temporal average of each modality)
+        pooled_mods = stacked.mean(dim=1, keepdim=True)  # (B, 1, M, D)
+        gate_weights = self.moe_gate(pooled_mods)        # (B, 1, M, 1)
+        stacked = stacked * gate_weights
+
         stacked = stacked + self.modality_emb
 
         if self.training and self.modality_dropout > 0:
@@ -202,8 +225,8 @@ class FactoredCrossModalFusion(nn.Module):
         for layer in self.cross_modal_layers:
             x = layer(x)
 
-        x = x.mean(dim=1)
-        context = x.reshape(B, T, self.hidden_dim)
+        # Removed x = x.mean(dim=1) to preserve modality tokens (Late Fusion)
+        context = x.reshape(B, T, self.n_modalities, self.hidden_dim)
         return self.final_norm(context)
 
 
@@ -386,11 +409,15 @@ class DirectVelocityNetV2(nn.Module):
         for dim in self.modality_dims:
             splits.append(cond[:, :, offset:offset + dim])
             offset += dim
-        context = self.fusion_block(splits)
+        context = self.fusion_block(splits)  # (B, T, M, D)
 
         # Add temporal positional embedding
-        T = context.shape[1]
-        context = context + self.context_pos_emb[:, :T, :]
+        B, T, M, D = context.shape
+        pos_emb = self.context_pos_emb[:, :T, :].unsqueeze(2)  # (1, T, 1, D)
+        context = context + pos_emb
+        
+        # Flatten time and modality tokens: (B, T*M, D)
+        context = context.reshape(B, T * M, D)
         return context
 
     def forward(
@@ -533,6 +560,12 @@ class BrainFlowDirectV2(nn.Module):
             x_0, mu, log_var = self.source_predictor(context_encoded, subject_ids)
         elif self.source_mode == "gaussian":
             x_0 = torch.randn_like(x_1)
+            # Minibatch OT-CFM: Arrange noise to minimize distance to target
+            if self.training and x_0.shape[0] > 1:
+                with torch.no_grad():
+                    cost = torch.cdist(x_0.float(), x_1.float()).cpu().numpy()
+                    _, col_ind = linear_sum_assignment(cost)
+                    x_0 = x_0[col_ind]
             mu, log_var = None, None
         else:  # "zero"
             x_0 = torch.zeros_like(x_1)
