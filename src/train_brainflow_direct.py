@@ -29,6 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset import load_config, _get_fmri_filepath
 from src.models.brainflow.brain_flow_direct_v2 import BrainFlowDirectV2
+from src.models.brainflow.brain_flow_direct_v3 import BrainFlowDirectV3
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("train_brainflow_direct")
@@ -104,8 +105,9 @@ class DirectFlowDataset(Dataset):
                     logger.warning("Global stats not found at %s", stats_dir)
 
         # Preloaded data: separated to avoid context duplication across subjects
-        self._ctx_clips = {}   # "task/stim_type/clip" → np.array (float16, shared)
-        self._fmri_clips = {}  # "subject/task/clip" → np.array (float16, per-subject)
+        # Stored as torch float32 tensors for zero-conversion-cost in __getitem__
+        self._ctx_clips = {}   # "task/stim_type/clip" → torch.Tensor (float32, shared)
+        self._fmri_clips = {}  # "subject/task/clip" → torch.Tensor (float32, per-subject)
         self.samples = self._build_index_and_preload()
 
     def _normalize_clip_name(self, clip_name: str, task: str) -> str:
@@ -209,10 +211,12 @@ class DirectFlowDataset(Dataset):
                         min_len = min(arr.shape[0] for arr in ctx_arrays)
                         ctx_arrays = [arr[:min_len] for arr in ctx_arrays]
 
-                        # Concatenate all modalities and store as float16
-                        ctx_data = np.concatenate(ctx_arrays, axis=-1).astype(np.float16)
+                        # Concatenate all modalities and store as float32 torch tensor
+                        ctx_data = torch.from_numpy(
+                            np.concatenate(ctx_arrays, axis=-1).astype(np.float32)
+                        )
                         self._ctx_clips[ctx_key] = ctx_data
-                        ctx_bytes += ctx_data.nbytes
+                        ctx_bytes += ctx_data.nelement() * 4
                         n_ctx_clips += 1
 
                     # --- Load fMRI per subject ---
@@ -227,9 +231,9 @@ class DirectFlowDataset(Dataset):
                             if fmri_data is None:
                                 self._fmri_clips[fmri_key] = None
                             else:
-                                fmri_fp16 = fmri_data.astype(np.float16)
-                                self._fmri_clips[fmri_key] = fmri_fp16
-                                fmri_bytes += fmri_fp16.nbytes
+                                fmri_t = torch.from_numpy(fmri_data)
+                                self._fmri_clips[fmri_key] = fmri_t
+                                fmri_bytes += fmri_t.nelement() * 4
                                 n_fmri_clips += 1
 
                         fmri_data = self._fmri_clips[fmri_key]
@@ -270,8 +274,8 @@ class DirectFlowDataset(Dataset):
         target_tr = info["target_tr"]
         n_trs = info["n_trs"]
 
-        ctx_data = self._ctx_clips[ctx_key]    # float16, shared
-        fmri_data = self._fmri_clips[fmri_key]  # float16, per-subject
+        ctx_data = self._ctx_clips[ctx_key]    # float32 torch tensor, shared
+        fmri_data = self._fmri_clips[fmri_key]  # float32 torch tensor, per-subject
 
         # Feature window
         actual_movie_tr = target_tr + self.excl_start
@@ -283,21 +287,21 @@ class DirectFlowDataset(Dataset):
         feat_start = feat_current_tr - self.feature_context_trs
         feat_end = feat_current_tr + 1
 
-        # Window context (pure numpy slicing, no file I/O)
+        # Window context (pure tensor slicing, no conversion)
         safe_start = max(0, feat_start)
         safe_end = min(ctx_data.shape[0], feat_end)
         if safe_start < safe_end:
-            ctx = ctx_data[safe_start:safe_end].astype(np.float32)  # fp16 → fp32
+            ctx = ctx_data[safe_start:safe_end]
         else:
-            ctx = np.zeros((0, ctx_data.shape[-1]), dtype=np.float32)
+            ctx = torch.zeros(0, ctx_data.shape[-1])
         if ctx.shape[0] < self.feat_seq_len:
             pad_len = self.feat_seq_len - ctx.shape[0]
-            ctx = np.pad(ctx, ((pad_len, 0), (0, 0)), mode="constant")
-        context = torch.from_numpy(ctx)
+            ctx = torch.nn.functional.pad(ctx, (0, 0, pad_len, 0))
+        context = ctx
 
-        # fMRI target (direct array access, fp16 → fp32)
+        # fMRI target (direct tensor access, no conversion)
         if target_tr < fmri_data.shape[0]:
-            fmri_target = torch.from_numpy(fmri_data[target_tr].astype(np.float32).copy())
+            fmri_target = fmri_data[target_tr].clone()
         else:
             n_voxels = self.cfg["fmri"].get("n_voxels", 1000)
             fmri_target = torch.zeros(n_voxels, dtype=torch.float32)
@@ -423,6 +427,8 @@ def get_dataloaders(cfg):
 
     train_sampler = ClipGroupedBatchSampler(train_set, batch_size, drop_last=True)
 
+    # num_workers=0: data is pre-loaded as torch tensors in RAM,
+    # so multiprocessing only adds forking overhead (14GB+ process)
     train_loader = DataLoader(
         train_set,
         batch_sampler=train_sampler,
@@ -462,21 +468,33 @@ def train(args):
     # 2. Model
     bf_cfg = cfg["brainflow"]
     output_dim = bf_cfg.get("output_dim", cfg["fmri"]["n_voxels"])
+    model_version = cfg.get("model_version", "v2")
 
-    logger.info("Initializing BrainFlowDirectV2...")
     vn_params = dict(bf_cfg.get("velocity_net", {}))
     modality_dims = cfg.get("modality_dims", None)
     if modality_dims:
         vn_params["modality_dims"] = modality_dims
-    sp_params = dict(bf_cfg.get("source_predictor", {}))
-    source_mode = bf_cfg.get("source_mode", "csfm")
-    model = BrainFlowDirectV2(
-        output_dim=output_dim,
-        velocity_net_params=vn_params,
-        n_subjects=len(cfg["subjects"]),
-        source_predictor_params=sp_params,
-        source_mode=source_mode,
-    ).to(device)
+
+    if model_version == "v3":
+        logger.info("Initializing BrainFlowDirectV3 (simplified)...")
+        reg_weight = bf_cfg.get("reg_weight", 0.5)
+        model = BrainFlowDirectV3(
+            output_dim=output_dim,
+            velocity_net_params=vn_params,
+            n_subjects=len(cfg["subjects"]),
+            reg_weight=reg_weight,
+        ).to(device)
+    else:
+        logger.info("Initializing BrainFlowDirectV2...")
+        sp_params = dict(bf_cfg.get("source_predictor", {}))
+        source_mode = bf_cfg.get("source_mode", "csfm")
+        model = BrainFlowDirectV2(
+            output_dim=output_dim,
+            velocity_net_params=vn_params,
+            n_subjects=len(cfg["subjects"]),
+            source_predictor_params=sp_params,
+            source_mode=source_mode,
+        ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Trainable parameters: %s", f"{n_params:,}")
@@ -545,6 +563,7 @@ def train(args):
     solver_cfg = cfg.get("solver_args", {})
     val_n_timesteps = solver_cfg.get("time_points", 50)
     val_solver_method = solver_cfg.get("method", "midpoint")
+    val_cfg_scale = solver_cfg.get("cfg_scale", 0.0)
 
     # 5. Training loop
     for epoch in range(start_epoch, tr_cfg["n_epochs"] + 1):
@@ -586,7 +605,7 @@ def train(args):
                 pbar.set_postfix({
                     "loss": f"{np.mean(train_losses[-50:]):.4f}",
                     "flow": f"{flow_l:.4f}",
-                    "align": f"{align_l:.4f}",
+                    "reg": f"{align_l:.4f}",
                     "kld": f"{kld_l:.4f}",
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                 })
@@ -610,11 +629,15 @@ def train(args):
                     fmri_target = batch["fmri"].to(device)
                     subject_ids = batch["subject_idx"].to(device)
 
-                    gen_fmri = model.synthesise(
-                        context,
+                    synth_kwargs = dict(
                         n_timesteps=val_n_timesteps,
                         solver_method=val_solver_method,
                         subject_ids=subject_ids,
+                    )
+                    if model_version == "v3" and val_cfg_scale > 0:
+                        synth_kwargs["cfg_scale"] = val_cfg_scale
+                    gen_fmri = model.synthesise(
+                        context, **synth_kwargs,
                     )  # (B, V)
 
                     clip_keys = batch["clip_key"]
