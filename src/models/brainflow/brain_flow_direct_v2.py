@@ -336,6 +336,13 @@ class DirectVelocityNetV2(nn.Module):
             modality_dropout=modality_dropout,
         )
 
+        # --- Temporal positional embedding for context ---
+        # Critical: without this, cross-attention treats T timesteps as
+        # a bag (permutation invariant) and loses temporal ordering.
+        self.context_pos_emb = nn.Parameter(
+            torch.randn(1, max_seq_len, hidden_dim) * 0.02
+        )
+
         # --- Input projection ---
         self.input_proj = nn.Sequential(
             nn.Linear(output_dim, hidden_dim),
@@ -374,14 +381,17 @@ class DirectVelocityNetV2(nn.Module):
             cond: (B, T, total_context_dim) pre-concatenated modality features.
 
         Returns:
-            context_encoded: (B, T, hidden_dim) fused context.
+            context_encoded: (B, T, hidden_dim) fused context with temporal pos emb.
         """
         splits = []
         offset = 0
         for dim in self.modality_dims:
             splits.append(cond[:, :, offset:offset + dim])
             offset += dim
-        return self.fusion_block(splits)
+        context = self.fusion_block(splits)
+        T = context.shape[1]
+        context = context + self.context_pos_emb[:, :T, :]
+        return context
 
     def forward(
         self,
@@ -480,10 +490,14 @@ class BrainFlowDirectV2(nn.Module):
             sp_cfg = dict(source_predictor_params or {})
             self.align_weight = sp_cfg.pop("align_weight", 1.0)
             self.kld_weight = sp_cfg.pop("kld_weight", 0.1)
+            self.align_loss_type = sp_cfg.pop("align_loss_type", "normalized_l2")
+            self.source_noise_std = sp_cfg.pop("source_noise_std", 0.0)
             sp_cfg.setdefault("hidden_dim", vn_cfg.get("hidden_dim", 1024))
             sp_cfg.setdefault("output_dim", output_dim)
             sp_cfg.setdefault("n_subjects", n_subjects)
             self.source_predictor = SourcePredictor(**sp_cfg)
+        else:
+            self.source_noise_std = 0.0
 
         # OT-CFM path
         self.path = AffineProbPath(scheduler=CondOTScheduler())
@@ -495,7 +509,7 @@ class BrainFlowDirectV2(nn.Module):
         print(f"[BrainFlowDirectV2] VelocityNet: {vn_params:,} params")
         if self.source_predictor:
             print(f"[BrainFlowDirectV2] SourcePredictor: {sp_params:,} params")
-            print(f"[BrainFlowDirectV2] Loss weights: align={self.align_weight}, kld={self.kld_weight}")
+            print(f"[BrainFlowDirectV2] Loss weights: align={self.align_weight} ({self.align_loss_type}), kld={self.kld_weight}, noise_std={self.source_noise_std}")
         print(f"[BrainFlowDirectV2] Total: {vn_params + sp_params:,} params")
 
     def forward(
@@ -521,6 +535,9 @@ class BrainFlowDirectV2(nn.Module):
         x_1 = target
         if self.source_mode == "csfm":
             x_0, mu, log_var = self.source_predictor(context_encoded, subject_ids)
+            # Add fixed Gaussian noise for regularization (training only)
+            if self.training and self.source_noise_std > 0:
+                x_0 = x_0 + self.source_noise_std * torch.randn_like(x_0)
         elif self.source_mode == "gaussian":
             x_0 = torch.randn_like(x_1)
             mu, log_var = None, None
@@ -543,7 +560,12 @@ class BrainFlowDirectV2(nn.Module):
 
         # 4. Align loss: push source mean close to target → shorter flow
         if mu is not None:
-            align_loss = F.mse_loss(mu, target)
+            if self.align_loss_type == "normalized_l2":
+                mu_norm = F.normalize(mu, dim=-1)
+                target_norm = F.normalize(target, dim=-1)
+                align_loss = F.mse_loss(mu_norm, target_norm)
+            else:
+                align_loss = F.mse_loss(mu, target)
         else:
             align_loss = torch.tensor(0.0, device=target.device)
 

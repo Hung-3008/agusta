@@ -3,9 +3,9 @@
 No encoder needed. Context latents are loaded from pre-extracted .npy files.
 
 Usage:
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct.yaml --fast_dev_run
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct.yaml
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct.yaml --resume
+    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v2_csfm.yaml --fast_dev_run
+    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v2_csfm.yaml
+    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v2_csfm.yaml --resume
 """
 
 import argparse
@@ -426,16 +426,18 @@ def get_dataloaders(cfg):
     train_loader = DataLoader(
         train_set,
         batch_sampler=train_sampler,
-        num_workers=0,
+        num_workers=dl_cfg["num_workers"],
         pin_memory=dl_cfg["pin_memory"],
+        persistent_workers=dl_cfg["num_workers"] > 0,
     )
     val_loader = DataLoader(
         val_set,
         batch_size=dl_cfg["val_batch_size"],
         shuffle=False,
-        num_workers=0,
+        num_workers=dl_cfg.get("val_num_workers", 0),
         pin_memory=dl_cfg["pin_memory"],
         drop_last=False,
+        persistent_workers=dl_cfg.get("val_num_workers", 0) > 0,
     )
     return train_loader, val_loader
 
@@ -450,6 +452,11 @@ def train(args):
 
     torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # PyTorch 2.x speedups
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     # 1. Data
     train_loader, val_loader = get_dataloaders(cfg)
@@ -477,6 +484,11 @@ def train(args):
         source_predictor_params=sp_params,
         source_mode=source_mode,
     ).to(device)
+
+    # Compile model for massive speedup
+    if not args.fast_dev_run and hasattr(torch, "compile"):
+        logger.info("Compiling model with torch.compile()...")
+        model = torch.compile(model)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Trainable parameters: %s", f"{n_params:,}")
@@ -561,8 +573,8 @@ def train(args):
             subject_ids = batch["subject_idx"].to(device)  # (B,)
             
             # Classifier-Free Guidance (CFG) / Condition Dropout
-            # Drop the context 10% of the time to regularize the network
-            if random.random() < 0.1:
+            cfg_p = tr_cfg.get("cfg_dropout_prob", 0.1)
+            if random.random() < cfg_p:
                 context = torch.zeros_like(context)
 
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
