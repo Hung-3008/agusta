@@ -469,21 +469,36 @@ def train(args):
     # 2. Model
     bf_cfg = cfg["brainflow"]
     output_dim = bf_cfg.get("output_dim", cfg["fmri"]["n_voxels"])
+    model_version = cfg.get("model_version", "v2")
 
-    logger.info("Initializing BrainFlowDirectV2...")
     vn_params = dict(bf_cfg.get("velocity_net", {}))
     modality_dims = cfg.get("modality_dims", None)
     if modality_dims:
         vn_params["modality_dims"] = modality_dims
     sp_params = dict(bf_cfg.get("source_predictor", {}))
     source_mode = bf_cfg.get("source_mode", "csfm")
-    model = BrainFlowDirectV2(
-        output_dim=output_dim,
-        velocity_net_params=vn_params,
-        n_subjects=len(cfg["subjects"]),
-        source_predictor_params=sp_params,
-        source_mode=source_mode,
-    ).to(device)
+
+    if model_version == "v3":
+        from src.models.brainflow.brain_flow_direct_v3 import BrainFlowDirectV3
+        logger.info("Initializing BrainFlowDirectV3...")
+        model = BrainFlowDirectV3(
+            output_dim=output_dim,
+            velocity_net_params=vn_params,
+            n_subjects=len(cfg["subjects"]),
+            source_predictor_params=sp_params,
+            source_mode=source_mode,
+            use_minibatch_ot=bf_cfg.get("use_minibatch_ot", False),
+            div_reg_weight=bf_cfg.get("div_reg_weight", 0.0),
+        ).to(device)
+    else:
+        logger.info("Initializing BrainFlowDirectV2...")
+        model = BrainFlowDirectV2(
+            output_dim=output_dim,
+            velocity_net_params=vn_params,
+            n_subjects=len(cfg["subjects"]),
+            source_predictor_params=sp_params,
+            source_mode=source_mode,
+        ).to(device)
 
     # Compile model for massive speedup
     if not args.fast_dev_run and hasattr(torch, "compile"):
@@ -595,13 +610,16 @@ def train(args):
                 flow_l = losses["flow_loss"].item()
                 align_l = losses["align_loss"].item()
                 kld_l = losses["kld_loss"].item()
-                pbar.set_postfix({
+                postfix = {
                     "loss": f"{np.mean(train_losses[-50:]):.4f}",
                     "flow": f"{flow_l:.4f}",
                     "align": f"{align_l:.4f}",
                     "kld": f"{kld_l:.4f}",
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-                })
+                }
+                if "div_loss" in losses:
+                    postfix["div"] = f"{losses['div_loss'].item():.4f}"
+                pbar.set_postfix(postfix)
 
         # Validation
         mean_fmri_corr = 0.0
