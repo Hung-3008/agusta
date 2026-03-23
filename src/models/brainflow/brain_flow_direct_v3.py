@@ -162,169 +162,6 @@ class LinearFusion(nn.Module):
 
 
 # =============================================================================
-# FactoredBottleneckFusion — Per-timestep bottleneck cross-modal attention
-# =============================================================================
-
-class FactoredBottleneckFusion(nn.Module):
-    """Factored Bottleneck Fusion: per-timestep cross-modal attention via bottleneck tokens.
-
-    Combines MBT (Multimodal Bottleneck Transformer) ideas with V2's per-timestep
-    factored approach. Much lighter than full M×M cross-modal attention (~12M vs 48M)
-    but retains cross-modal reasoning capability.
-
-    Architecture per timestep t:
-        1. Project each modality: mod_i(B, d_i) → (B, proj_dim)
-        2. Stack as M tokens: (B, M, proj_dim)
-        3. Bottleneck cross-attention: K tokens attend to M modality tokens
-        4. Self-attention refinement on K bottleneck tokens
-        5. Flatten K tokens → project to hidden_dim
-
-    Overall: (B, T, [mod_dims]) → (B, T, hidden_dim)
-    """
-
-    def __init__(
-        self,
-        modality_dims: list[int],
-        hidden_dim: int = 1024,
-        proj_dim: int = 256,
-        max_seq_len: int = 31,
-        n_bottleneck: int = 4,
-        n_heads: int = 4,
-        n_layers: int = 2,
-        dropout: float = 0.1,
-        modality_dropout: float = 0.3,
-    ):
-        super().__init__()
-        self.n_modalities = len(modality_dims)
-        self.hidden_dim = hidden_dim
-        self.proj_dim = proj_dim
-        self.max_seq_len = max_seq_len
-        self.n_bottleneck = n_bottleneck
-        self.modality_dropout = modality_dropout
-
-        # Per-modality projection: mod_dim → proj_dim
-        self.projectors = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(dim, proj_dim),
-                nn.LayerNorm(proj_dim),
-                nn.GELU(),
-            )
-            for dim in modality_dims
-        ])
-
-        # Learnable modality embeddings (distinguish which modality produced a token)
-        self.modality_emb = nn.Parameter(
-            torch.randn(1, self.n_modalities, proj_dim) * 0.02
-        )
-
-        # Learnable bottleneck tokens
-        self.bottleneck_tokens = nn.Parameter(
-            torch.randn(1, n_bottleneck, proj_dim) * 0.02
-        )
-
-        # Cross-attention: bottleneck (Q) attends to modality tokens (KV)
-        # + Self-attention refinement layers
-        self.layers = nn.ModuleList()
-        for _ in range(n_layers):
-            self.layers.append(nn.ModuleDict({
-                "cross_attn": nn.MultiheadAttention(
-                    proj_dim, n_heads, dropout=dropout, batch_first=True,
-                ),
-                "cross_norm_q": nn.LayerNorm(proj_dim),
-                "cross_norm_kv": nn.LayerNorm(proj_dim),
-                "self_attn": nn.MultiheadAttention(
-                    proj_dim, n_heads, dropout=dropout, batch_first=True,
-                ),
-                "self_norm": nn.LayerNorm(proj_dim),
-                "ffn": nn.Sequential(
-                    nn.Linear(proj_dim, proj_dim * 4),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(proj_dim * 4, proj_dim),
-                    nn.Dropout(dropout),
-                ),
-                "ffn_norm": nn.LayerNorm(proj_dim),
-            }))
-
-        # Project flattened bottleneck → hidden_dim
-        self.output_proj = nn.Sequential(
-            nn.Linear(n_bottleneck * proj_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, modality_features: list[torch.Tensor]) -> torch.Tensor:
-        """
-        Args:
-            modality_features: List of M tensors, each (B, T, mod_dim_i).
-
-        Returns:
-            context: (B, T, hidden_dim) fused context.
-        """
-        B, T_full = modality_features[0].shape[:2]
-        T = min(T_full, self.max_seq_len)
-        M = self.n_modalities
-        device = modality_features[0].device
-
-        # 1. Project each modality and stack
-        projected = []
-        for feat, proj in zip(modality_features, self.projectors):
-            projected.append(proj(feat[:, :T]))  # (B, T, proj_dim)
-
-        # 2. Modality dropout during training
-        if self.training and self.modality_dropout > 0:
-            keep_mask = (
-                torch.rand(B, 1, M, device=device) > self.modality_dropout
-            )
-            # Ensure at least one modality is kept
-            all_dropped = (keep_mask.sum(dim=2, keepdim=True) == 0)
-            keep_mask[:, :, 0:1] = torch.max(keep_mask[:, :, 0:1], all_dropped)
-
-            for i in range(M):
-                projected[i] = projected[i] * keep_mask[:, :, i:i+1]
-
-        # Stack: (B, T, M, proj_dim)
-        stacked = torch.stack(projected, dim=2)
-
-        # Add modality embeddings
-        stacked = stacked + self.modality_emb.unsqueeze(1)  # broadcast over T
-
-        # 3. Per-timestep bottleneck fusion
-        # Reshape to process all timesteps in parallel: (B*T, M, proj_dim)
-        kv = stacked.reshape(B * T, M, self.proj_dim)
-
-        # Expand bottleneck tokens for batch: (B*T, K, proj_dim)
-        bottleneck = self.bottleneck_tokens.expand(B * T, -1, -1)
-
-        # 4. Cross-attention + self-attention layers
-        for layer in self.layers:
-            # Cross-attention: bottleneck attends to modality tokens
-            q = layer["cross_norm_q"](bottleneck)
-            kv_normed = layer["cross_norm_kv"](kv)
-            attn_out, _ = layer["cross_attn"](q, kv_normed, kv_normed)
-            bottleneck = bottleneck + attn_out
-
-            # Self-attention refinement on bottleneck tokens
-            h = layer["self_norm"](bottleneck)
-            self_out, _ = layer["self_attn"](h, h, h)
-            bottleneck = bottleneck + self_out
-
-            # FFN
-            h = layer["ffn_norm"](bottleneck)
-            bottleneck = bottleneck + layer["ffn"](h)
-
-        # 5. Flatten bottleneck tokens and project to hidden_dim
-        # (B*T, K, proj_dim) → (B*T, K*proj_dim) → (B*T, hidden_dim)
-        fused = bottleneck.reshape(B * T, self.n_bottleneck * self.proj_dim)
-        context = self.output_proj(fused)
-
-        # Reshape back to (B, T, hidden_dim)
-        context = context.reshape(B, T, self.hidden_dim)
-        return context
-
-
-# =============================================================================
 # SimpleFiLMBlock — FiLM (time) + FFN + CrossAttn (no Time-Adaptive KV)
 # =============================================================================
 
@@ -376,11 +213,11 @@ class SimpleFiLMBlock(nn.Module):
 # =============================================================================
 
 class DirectVelocityNetV3(nn.Module):
-    """Velocity network v3 with configurable fusion + temporal self-attention.
+    """Velocity network v3 with temporal self-attention context refinement.
 
     Architecture:
-      1. Fusion: LinearFusion or FactoredBottleneckFusion → (B, T, hidden)
-      2. Temporal Self-Attention: TransformerEncoder for temporal reasoning
+      1. LinearFusion: per-modality proj → concat → (B, T, hidden)
+      2. Temporal Self-Attention: 2-layer TransformerEncoder for temporal reasoning
       3. Input: x_t (B, V) → Linear → (B, hidden)
       4. Time: sinusoidal → MLP → + subject embedding → t_emb
       5. N blocks of SimpleFiLMBlock(h, t_emb, context)
@@ -400,37 +237,21 @@ class DirectVelocityNetV3(nn.Module):
         max_seq_len: int = 31,
         n_subjects: int = 4,
         temporal_attn_layers: int = 2,
-        fusion_type: str = "linear",
-        n_bottleneck: int = 4,
-        bottleneck_n_layers: int = 2,
     ):
         super().__init__()
         self.output_dim = output_dim
         self.hidden_dim = hidden_dim
         self.modality_dims = modality_dims or [1408]
 
-        # --- Fusion block (configurable) ---
-        if fusion_type == "bottleneck":
-            self.fusion_block = FactoredBottleneckFusion(
-                modality_dims=self.modality_dims,
-                hidden_dim=hidden_dim,
-                proj_dim=proj_dim,
-                max_seq_len=max_seq_len,
-                n_bottleneck=n_bottleneck,
-                n_heads=min(n_heads, proj_dim // 32),  # ensure head_dim >= 32
-                n_layers=bottleneck_n_layers,
-                dropout=dropout,
-                modality_dropout=modality_dropout,
-            )
-        else:
-            self.fusion_block = LinearFusion(
-                modality_dims=self.modality_dims,
-                hidden_dim=hidden_dim,
-                proj_dim=proj_dim,
-                max_seq_len=max_seq_len,
-                dropout=dropout,
-                modality_dropout=modality_dropout,
-            )
+        # --- Linear Fusion ---
+        self.fusion_block = LinearFusion(
+            modality_dims=self.modality_dims,
+            hidden_dim=hidden_dim,
+            proj_dim=proj_dim,
+            max_seq_len=max_seq_len,
+            dropout=dropout,
+            modality_dropout=modality_dropout,
+        )
 
         # --- Temporal positional embedding ---
         self.context_pos_emb = nn.Parameter(
@@ -474,13 +295,13 @@ class DirectVelocityNetV3(nn.Module):
             for _ in range(n_blocks)
         ])
 
-        # --- Output (shared across subjects — subject info via embedding) ---
+        # --- Output ---
         self.final_norm = nn.LayerNorm(hidden_dim)
-        self.output_proj = nn.Linear(hidden_dim, output_dim)
+        self.output_layer = nn.Linear(hidden_dim, output_dim)
 
         # Zero-init output for stable start
-        nn.init.constant_(self.output_proj.weight, 0)
-        nn.init.constant_(self.output_proj.bias, 0)
+        nn.init.constant_(self.output_layer.weight, 0)
+        nn.init.constant_(self.output_layer.bias, 0)
 
     def encode_context_from_cond(self, cond: torch.Tensor) -> torch.Tensor:
         """Encode concatenated context tensor via linear fusion + temporal attention.
@@ -556,9 +377,9 @@ class DirectVelocityNetV3(nn.Module):
         for block in self.blocks:
             h = block(h, t_emb, context_encoded)
 
-        # --- Output (shared linear — subject info already in t_emb) ---
+        # --- Output ---
         h = self.final_norm(h)
-        return self.output_proj(h)
+        return self.output_layer(h)
 
 
 # =============================================================================

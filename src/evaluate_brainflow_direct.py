@@ -153,15 +153,25 @@ def evaluate_brainflow_direct():
     modality_dims = cfg.get("modality_dims", None)
     if modality_dims:
         vn_params["modality_dims"] = modality_dims
-    sp_params = dict(bf_cfg.get("source_predictor", {}))
-    source_mode = bf_cfg.get("source_mode", "csfm")
-    model = BrainFlowDirectV2(
-        output_dim=bf_cfg["output_dim"],
-        velocity_net_params=vn_params,
-        n_subjects=len(subjects),
-        source_predictor_params=sp_params,
-        source_mode=source_mode,
-    ).to(device)
+    model_version = cfg.get("model_version", "v2")
+    if model_version == "v3":
+        reg_weight = bf_cfg.get("reg_weight", 0.5)
+        model = BrainFlowDirectV3(
+            output_dim=bf_cfg["output_dim"],
+            velocity_net_params=vn_params,
+            n_subjects=len(subjects),
+            reg_weight=reg_weight,
+        ).to(device)
+    else:
+        sp_params = dict(bf_cfg.get("source_predictor", {}))
+        source_mode = bf_cfg.get("source_mode", "csfm")
+        model = BrainFlowDirectV2(
+            output_dim=bf_cfg["output_dim"],
+            velocity_net_params=vn_params,
+            n_subjects=len(subjects),
+            source_predictor_params=sp_params,
+            source_mode=source_mode,
+        ).to(device)
 
     ckpt_path = PROJECT_ROOT / out_dir / "best.pt"
     print(f"Loading checkpoint from {ckpt_path}")
@@ -244,12 +254,19 @@ def evaluate_brainflow_direct():
                 ctx_batch = torch.from_numpy(all_contexts[bi:be]).to(device)
                 subj_batch = torch.full((B,), subject_idx, dtype=torch.long, device=device)
 
-                # Use float32 for ODE solver — bfloat16 causes overflow/NaN
-                pred = model.synthesise(
-                    ctx_batch,
+                synth_kwargs = dict(
                     n_timesteps=args.n_timesteps,
                     solver_method=args.solver_method,
                     subject_ids=subj_batch,
+                )
+                if model_version == "v3":
+                    cfg_scale = cfg.get("solver_args", {}).get("cfg_scale", 0.0)
+                    if cfg_scale > 0:
+                        synth_kwargs["cfg_scale"] = cfg_scale
+
+                # Use float32 for ODE solver — bfloat16 causes overflow/NaN
+                pred = model.synthesise(
+                    ctx_batch, **synth_kwargs
                 )  # (B, 1000)
 
                 fmri_preds.append(pred.float().cpu().numpy())

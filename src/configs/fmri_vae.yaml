@@ -1,8 +1,7 @@
 # =====================================================================
-# fMRI VAE — Single Subject (sub-01), No Subject Conditioning
-# =====================================================================
-# Simplified training: 1 subject, no subject embed, pure fMRI autoencoder.
-# Run: python src/train_fmri_vae.py --config src/configs/fmri_vae_single.yaml
+# fMRI VAE (v5 Temporal TCN) 
+# Trains a multi-subject VAE to compress 1000-D fMRI into 64-D Latents
+# Run: python src/train_fmri_vae.py --config src/configs/fmri_vae.yaml
 # =====================================================================
 
 data_root: Data
@@ -14,45 +13,14 @@ fmri:
   excluded_samples_start: 5
   excluded_samples_end: 5
 
-features:
-  dir: features
-  npy_dir: features_npy_cat
-  npy_only: true
-  sample_freq: 2.0
-  layer_aggregation: cat
-  modalities:
-    video:
-      subdir: video
-      file_pattern: "{movie_type}_{stimulus_type}_features_vjepa2.h5"
-      npy_pattern: "{movie_type}_{stimulus_type}_features_vjepa2"
-      h5_key: video
-      dim: 5632
-    audio:
-      subdir: audio
-      file_pattern: "{movie_type}_{stimulus_type}_features_w2vbert.h5"
-      npy_pattern: "{movie_type}_{stimulus_type}_features_w2vbert"
-      h5_key: audio
-      dim: 4096
-    text:
-      subdir: text
-      file_pattern: "{movie_type}_{stimulus_type}_features_llama3.h5"
-      npy_pattern: "{movie_type}_{stimulus_type}_features_llama3"
-      h5_key: text
-      dim: 12288
-    omni:
-      subdir: omni
-      file_pattern: "{movie_type}_{stimulus_type}_features_qwen_omni.h5"
-      npy_pattern: "{movie_type}_{stimulus_type}_features_qwen_omni"
-      h5_key: omni
-      data_format: tr_tokens_dim
-      dim: 3584
-      keep_tokens: false
-
-# --- Single subject ---
+# --- Multi subject ---
 subjects:
   - sub-01
+  - sub-02
+  - sub-03
+  - sub-05
 
-subject_mode: single
+subject_mode: multi
 
 # --- Splits ---
 splits:
@@ -65,10 +33,6 @@ splits:
 
 val_ratio: 0.1
 
-sliding_window:
-  context_duration: 14.9
-  stride: 1.49
-
 # --- Preprocessing ---
 preprocessing:
   fmri:
@@ -77,7 +41,7 @@ preprocessing:
 # --- DataLoader ---
 dataloader:
   batch_size: 128
-  val_batch_size: 128
+  val_batch_size: 256
   num_workers: 0
   pin_memory: true
 
@@ -89,8 +53,8 @@ vae:
   latent_dim: 64
   seq_len: 100
 
-  # No subject conditioning — treat as pure autoencoder
-  use_subject: false
+  # Multi-subject conditioning
+  use_subject: true
   subject_embed_dim: 64
 
   # TCN v5 hyperparams

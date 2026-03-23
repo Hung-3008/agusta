@@ -99,12 +99,16 @@ def resolve_paths(cfg: dict, project_root: str | Path) -> dict:
     cfg["_project_root"] = str(project_root)
     cfg["_data_root"] = str(project_root / cfg["data_root"])
     cfg["_fmri_dir"] = str(project_root / cfg["data_root"] / cfg["fmri"]["dir"])
-    cfg["_features_dir"] = str(project_root / cfg["data_root"] / cfg["features"]["dir"])
-    # Optional NPY features directory (faster loading than H5)
-    npy_subdir = cfg["features"].get("npy_dir")
-    if npy_subdir:
-        cfg["_features_npy_dir"] = str(project_root / cfg["data_root"] / npy_subdir)
+    if "features" in cfg:
+        cfg["_features_dir"] = str(project_root / cfg["data_root"] / cfg["features"]["dir"])
+        # Optional NPY features directory (faster loading than H5)
+        npy_subdir = cfg["features"].get("npy_dir")
+        if npy_subdir:
+            cfg["_features_npy_dir"] = str(project_root / cfg["data_root"] / npy_subdir)
+        else:
+            cfg["_features_npy_dir"] = None
     else:
+        cfg["_features_dir"] = None
         cfg["_features_npy_dir"] = None
     return cfg
 
