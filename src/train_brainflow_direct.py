@@ -1,11 +1,14 @@
-"""Train BrainFlow Direct — Flow Matching in fMRI Space with Pre-extracted Context.
+"""Train BrainFlow Direct — Flow Matching with Pre-extracted Context.
 
-No encoder needed. Context latents are loaded from pre-extracted .npy files.
+Supports two modes:
+  1. fMRI-space FM (output_dim=1000): target = raw fMRI from H5
+  2. Latent FM (output_dim=64): target = pre-extracted VAE latents from .npy,
+     frozen VAE decoder converts latent predictions → fMRI for PCC evaluation.
 
 Usage:
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct.yaml --fast_dev_run
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct.yaml
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct.yaml --resume
+    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_latent.yaml --fast_dev_run
+    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_latent.yaml
+    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_latent.yaml --resume
 """
 
 import argparse
@@ -87,6 +90,16 @@ class DirectFlowDataset(Dataset):
         # Build subject → index mapping
         self.subject_to_idx = {s: i for i, s in enumerate(self.subjects)}
 
+        # --- Latent target mode ---
+        # When latent_target_dir is set, load pre-extracted VAE latents as targets
+        # instead of raw fMRI. Raw fMRI is still loaded for validation PCC.
+        self.latent_target_dir = None
+        self.latent_dim = cfg.get("latent_dim", None)
+        if "latent_target_dir" in cfg:
+            self.latent_target_dir = Path(PROJECT_ROOT) / cfg["latent_target_dir"]
+            logger.info("Latent target mode: loading from %s (dim=%s)",
+                        self.latent_target_dir, self.latent_dim)
+
         # Load global fMRI normalization stats (per-voxel mean/std from training set)
         self.use_global_stats = cfg["fmri"].get("use_global_stats", False)
         self.fmri_stats = {}  # subject → {"mean": np.array, "std": np.array}
@@ -106,8 +119,9 @@ class DirectFlowDataset(Dataset):
 
         # Preloaded data: separated to avoid context duplication across subjects
         # Stored as torch float32 tensors for zero-conversion-cost in __getitem__
-        self._ctx_clips = {}   # "task/stim_type/clip" → torch.Tensor (float32, shared)
-        self._fmri_clips = {}  # "subject/task/clip" → torch.Tensor (float32, per-subject)
+        self._ctx_clips = {}     # "task/stim_type/clip" → torch.Tensor (float32, shared)
+        self._fmri_clips = {}    # "subject/task/clip" → torch.Tensor (float32, per-subject)
+        self._latent_clips = {}  # "subject/task/clip" → torch.Tensor (float32, per-subject)
         self.samples = self._build_index_and_preload()
 
     def _normalize_clip_name(self, clip_name: str, task: str) -> str:
@@ -240,6 +254,16 @@ class DirectFlowDataset(Dataset):
                         if fmri_data is None:
                             continue
 
+                        # --- Load latent targets if in latent mode ---
+                        if self.latent_target_dir is not None and fmri_key not in self._latent_clips:
+                            latent_path = self._find_latent_file(subj, task, norm_name, clip_stem)
+                            if latent_path is not None:
+                                latent_data = np.load(latent_path).astype(np.float32)
+                                self._latent_clips[fmri_key] = torch.from_numpy(latent_data)
+                            else:
+                                self._latent_clips[fmri_key] = None
+                                logger.warning("Latent file missing for %s", fmri_key)
+
                         n_trs = fmri_data.shape[0]
 
                         for target_tr in range(0, n_trs, self.stride):
@@ -256,13 +280,30 @@ class DirectFlowDataset(Dataset):
                                 "n_trs": n_trs,
                             })
 
-        total_bytes = ctx_bytes + fmri_bytes
-        logger.info("Preloaded %d ctx clips (%.2f GB, shared) + %d fMRI clips (%.2f GB) "
-                     "= %.2f GB total → %d samples for %s split.",
-                     n_ctx_clips, ctx_bytes / 1e9,
+        latent_bytes = sum(t.nelement() * 4 for t in self._latent_clips.values() if t is not None)
+        total_bytes = ctx_bytes + fmri_bytes + latent_bytes
+        mode_str = "LATENT" if self.latent_target_dir else "fMRI"
+        logger.info("[%s mode] Preloaded %d ctx clips (%.2f GB) + %d fMRI clips (%.2f GB) "
+                     "+ %.2f GB latents = %.2f GB total → %d samples for %s split.",
+                     mode_str, n_ctx_clips, ctx_bytes / 1e9,
                      n_fmri_clips, fmri_bytes / 1e9,
+                     latent_bytes / 1e9,
                      total_bytes / 1e9, len(samples), self.split)
         return samples
+
+    def _find_latent_file(self, subject, task, norm_name, clip_stem):
+        """Find the latent .npy file matching an fMRI clip."""
+        latent_dir = self.latent_target_dir / subject / task
+        # Try H5-key-matching names (same as extract_vae_latents.py output)
+        for name in [norm_name, clip_stem, f"{task}_{norm_name}"]:
+            p = latent_dir / f"{name}.npy"
+            if p.exists():
+                return p
+        # Fallback: fuzzy match
+        for p in latent_dir.glob("*.npy"):
+            if norm_name in p.stem or clip_stem in p.stem:
+                return p
+        return None
 
     def __len__(self):
         return len(self.samples)
@@ -299,14 +340,23 @@ class DirectFlowDataset(Dataset):
             ctx = torch.nn.functional.pad(ctx, (0, 0, pad_len, 0))
         context = ctx
 
-        # fMRI target (direct tensor access, no conversion)
+        # fMRI target (always loaded for validation PCC)
         if target_tr < fmri_data.shape[0]:
             fmri_target = fmri_data[target_tr].clone()
         else:
             n_voxels = self.cfg["fmri"].get("n_voxels", 1000)
             fmri_target = torch.zeros(n_voxels, dtype=torch.float32)
 
-        return {
+        # Latent target (for training in latent mode)
+        latent_target = None
+        if self.latent_target_dir is not None:
+            latent_data = self._latent_clips.get(fmri_key)
+            if latent_data is not None and target_tr < latent_data.shape[0]:
+                latent_target = latent_data[target_tr].clone()
+            else:
+                latent_target = torch.zeros(self.latent_dim or 64, dtype=torch.float32)
+
+        result = {
             "context": context,
             "fmri": fmri_target,
             "clip_key": f"{info['subject']}/{ctx_key}",
@@ -314,6 +364,9 @@ class DirectFlowDataset(Dataset):
             "target_tr": target_tr,
             "n_trs": n_trs,
         }
+        if latent_target is not None:
+            result["latent"] = latent_target
+        return result
 
 
 # =============================================================================
@@ -450,12 +503,63 @@ def get_dataloaders(cfg):
 # Training
 # =============================================================================
 
+def load_frozen_vae_decoder(cfg, device):
+    """Load a frozen VAE decoder for latent → fMRI conversion during validation."""
+    from src.models.brainflow.fmri_vae import build_vae
+    from src.data.dataset import load_config as load_vae_config
+
+    vae_config_path = PROJECT_ROOT / cfg["vae_config"]
+    vae_ckpt_path = PROJECT_ROOT / cfg["vae_checkpoint"]
+
+    vae_cfg = load_vae_config(vae_config_path)
+    # Ensure subjects match
+    vae_cfg["subjects"] = cfg["subjects"]
+
+    vae_model = build_vae(vae_cfg).to(device)
+    ckpt = torch.load(vae_ckpt_path, map_location=device, weights_only=False)
+    if "ema_model" in ckpt:
+        vae_model.load_state_dict(ckpt["ema_model"])
+        logger.info("✅ Loaded frozen VAE decoder (EMA weights)")
+    else:
+        vae_model.load_state_dict(ckpt["model"])
+        logger.info("✅ Loaded frozen VAE decoder")
+    del ckpt
+
+    vae_model.eval()
+    for p in vae_model.parameters():
+        p.requires_grad_(False)
+
+    return vae_model
+
+
+def decode_latents_to_fmri(vae_decoder, latent_pred, subject_ids):
+    """Decode latent predictions to fMRI space using frozen VAE decoder.
+
+    Args:
+        vae_decoder: Frozen fMRI_VAE_v5 model.
+        latent_pred: (B, Z) predicted latent vectors.
+        subject_ids: (B,) subject indices.
+
+    Returns:
+        fmri_pred: (B, V) decoded fMRI predictions.
+    """
+    # VAE decoder expects (B, T, Z) — wrap single TR as T=1
+    z = latent_pred.unsqueeze(1)  # (B, 1, Z)
+    fmri = vae_decoder.decode(z, subject_ids)  # (B, 1, V)
+    return fmri.squeeze(1)  # (B, V)
+
+
 def train(args):
     cfg = load_config(args.config)
     cfg = resolve_paths(cfg, PROJECT_ROOT)
 
     torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Check if latent mode is enabled
+    latent_mode = "latent_target_dir" in cfg
+    if latent_mode:
+        logger.info("🧪 LATENT FLOW MATCHING MODE (target_dim=%d)", cfg.get("latent_dim", 64))
 
     # 1. Data
     train_loader, val_loader = get_dataloaders(cfg)
@@ -498,6 +602,11 @@ def train(args):
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Trainable parameters: %s", f"{n_params:,}")
+
+    # 3. Frozen VAE decoder (latent mode only)
+    vae_decoder = None
+    if latent_mode and "vae_checkpoint" in cfg:
+        vae_decoder = load_frozen_vae_decoder(cfg, device)
 
     # 3. Optimizer & Scheduler
     tr_cfg = cfg["training"]
@@ -576,8 +685,13 @@ def train(args):
                 break
 
             context = batch["context"].to(device)     # (B, T, C)
-            fmri_target = batch["fmri"].to(device)     # (B, V)
             subject_ids = batch["subject_idx"].to(device)  # (B,)
+
+            # Choose target based on mode
+            if latent_mode and "latent" in batch:
+                target = batch["latent"].to(device)    # (B, Z=64)
+            else:
+                target = batch["fmri"].to(device)      # (B, V=1000)
             
             # Classifier-Free Guidance (CFG) / Condition Dropout
             # Drop the context 10% of the time to regularize the network
@@ -585,7 +699,7 @@ def train(args):
                 context = torch.zeros_like(context)
 
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
-                losses = model(context, fmri_target, subject_ids=subject_ids)
+                losses = model(context, target, subject_ids=subject_ids)
                 loss = losses["total_loss"]
 
             optimizer.zero_grad(set_to_none=True)
@@ -636,20 +750,29 @@ def train(args):
                     )
                     if model_version == "v3" and val_cfg_scale > 0:
                         synth_kwargs["cfg_scale"] = val_cfg_scale
-                    gen_fmri = model.synthesise(
+                    gen_output = model.synthesise(
                         context, **synth_kwargs,
-                    )  # (B, V)
+                    )  # (B, output_dim) — latent (64) or fMRI (1000)
+
+                    # Decode latents → fMRI if in latent mode
+                    if latent_mode and vae_decoder is not None:
+                        gen_fmri = decode_latents_to_fmri(
+                            vae_decoder, gen_output, subject_ids
+                        )  # (B, 1000)
+                    else:
+                        gen_fmri = gen_output  # (B, 1000)
 
                     clip_keys = batch["clip_key"]
                     target_trs = batch["target_tr"]
                     n_trs_batch = batch["n_trs"]
+                    fmri_target = batch["fmri"].to(device)  # Always raw fMRI for PCC
 
                     B = gen_fmri.shape[0]
+                    fmri_dim = gen_fmri.shape[-1]
                     for b in range(B):
                         ck = clip_keys[b]
                         tr_idx = int(target_trs[b].item())
                         n_t = int(n_trs_batch[b].item())
-                        fmri_dim = gen_fmri.shape[-1]
 
                         if ck not in fmri_pred_acc:
                             fmri_pred_acc[ck] = {"sum": torch.zeros(n_t, fmri_dim), "count": torch.zeros(n_t)}
@@ -678,7 +801,8 @@ def train(args):
             else:
                 mean_fmri_corr = 0.0
 
-            logger.info("Epoch %d | Val fMRI PCC: %.4f", epoch, mean_fmri_corr)
+            logger.info("Epoch %d | Val fMRI PCC: %.4f%s", epoch, mean_fmri_corr,
+                        " (decoded from latent)" if latent_mode else "")
 
             if mean_fmri_corr > best_val_corr:
                 best_val_corr = mean_fmri_corr
