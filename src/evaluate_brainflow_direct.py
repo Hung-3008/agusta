@@ -19,12 +19,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import argparse
 import gc
+import joblib
 import torch
 import numpy as np
 import zipfile
 from tqdm import tqdm
 
 from src.models.brainflow.brain_flow_direct_v2 import BrainFlowDirectV2
+from src.models.brainflow.brain_flow_direct_v3 import BrainFlowDirectV3
 from src.data.dataset import load_config
 
 
@@ -145,6 +147,18 @@ def evaluate_brainflow_direct():
     output_dir = PROJECT_ROOT / "results" / "brainflow_direct_submission"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── 0.5. Load PCA model if PCA mode ────────────────────────────────────────
+    pca_mode = "pca_model_path" in cfg
+    pca_components = None  # (K, V)
+    pca_mean = None        # (V,)
+    if pca_mode:
+        pca_path = PROJECT_ROOT / cfg["pca_model_path"]
+        pca = joblib.load(pca_path)
+        pca_components = torch.from_numpy(pca.components_.astype(np.float32)).to(device)
+        pca_mean = torch.from_numpy(pca.mean_.astype(np.float32)).to(device)
+        print(f"PCA mode: {pca.n_components_} components, explained_var={pca.explained_variance_ratio_.sum():.4f}")
+        del pca
+
     # ── 1. Build model ───────────────────────────────────────────────────────────
     bf_cfg = cfg["brainflow"]
     vn_cfg = bf_cfg.get("velocity_net", {})
@@ -154,6 +168,7 @@ def evaluate_brainflow_direct():
     if modality_dims:
         vn_params["modality_dims"] = modality_dims
     model_version = cfg.get("model_version", "v2")
+    source_mode = bf_cfg.get("source_mode", "csfm")
     if model_version == "v3":
         reg_weight = bf_cfg.get("reg_weight", 0.5)
         model = BrainFlowDirectV3(
@@ -164,7 +179,6 @@ def evaluate_brainflow_direct():
         ).to(device)
     else:
         sp_params = dict(bf_cfg.get("source_predictor", {}))
-        source_mode = bf_cfg.get("source_mode", "csfm")
         model = BrainFlowDirectV2(
             output_dim=bf_cfg["output_dim"],
             velocity_net_params=vn_params,
@@ -267,7 +281,11 @@ def evaluate_brainflow_direct():
                 # Use float32 for ODE solver — bfloat16 causes overflow/NaN
                 pred = model.synthesise(
                     ctx_batch, **synth_kwargs
-                )  # (B, 1000)
+                )  # (B, output_dim) — PCA (100) or fMRI (1000)
+
+                # PCA inverse transform: pred @ components + mean → (B, 1000)
+                if pca_mode and pca_components is not None:
+                    pred = pred @ pca_components + pca_mean
 
                 fmri_preds.append(pred.float().cpu().numpy())
                 del ctx_batch, subj_batch, pred

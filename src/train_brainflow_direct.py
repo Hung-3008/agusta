@@ -1,14 +1,16 @@
 """Train BrainFlow Direct — Flow Matching with Pre-extracted Context.
 
-Supports two modes:
+Supports three modes:
   1. fMRI-space FM (output_dim=1000): target = raw fMRI from H5
   2. Latent FM (output_dim=64): target = pre-extracted VAE latents from .npy,
      frozen VAE decoder converts latent predictions → fMRI for PCC evaluation.
+  3. PCA FM (output_dim=K): target = PCA-projected fMRI (on-the-fly),
+     PCA inverse_transform converts predictions → fMRI for PCC evaluation.
 
 Usage:
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_latent.yaml --fast_dev_run
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_latent.yaml
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_latent.yaml --resume
+    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_pca.yaml --fast_dev_run
+    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_pca.yaml
+    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_pca.yaml --resume
 """
 
 import argparse
@@ -21,6 +23,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import h5py
+import joblib
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -89,6 +92,27 @@ class DirectFlowDataset(Dataset):
 
         # Build subject → index mapping
         self.subject_to_idx = {s: i for i, s in enumerate(self.subjects)}
+
+        # --- PCA target mode ---
+        # When pca_model_path is set, PCA-transform fMRI targets on-the-fly.
+        # PCA components/mean are stored as torch tensors for fast GPU matmul.
+        self.pca_mode = False
+        self.pca_dim = cfg.get("pca_dim", None)
+        self.pca_components = None  # (K, V) tensor
+        self.pca_mean = None        # (V,) tensor
+        if "pca_model_path" in cfg:
+            pca_path = Path(PROJECT_ROOT) / cfg["pca_model_path"]
+            if pca_path.exists():
+                pca = joblib.load(pca_path)
+                self.pca_components = torch.from_numpy(pca.components_.astype(np.float32))  # (K, V)
+                self.pca_mean = torch.from_numpy(pca.mean_.astype(np.float32))  # (V,)
+                self.pca_dim = pca.n_components_
+                self.pca_mode = True
+                logger.info("PCA target mode: %d components, explained_var=%.4f",
+                            self.pca_dim, pca.explained_variance_ratio_.sum())
+                del pca
+            else:
+                logger.warning("PCA model not found at %s — falling back to fMRI mode", pca_path)
 
         # --- Latent target mode ---
         # When latent_target_dir is set, load pre-extracted VAE latents as targets
@@ -347,6 +371,12 @@ class DirectFlowDataset(Dataset):
             n_voxels = self.cfg["fmri"].get("n_voxels", 1000)
             fmri_target = torch.zeros(n_voxels, dtype=torch.float32)
 
+        # PCA target (on-the-fly projection, no pre-extraction needed)
+        pca_target = None
+        if self.pca_mode and self.pca_components is not None:
+            # PCA transform: (fmri - mean) @ components.T → (K,)
+            pca_target = (fmri_target - self.pca_mean) @ self.pca_components.T
+
         # Latent target (for training in latent mode)
         latent_target = None
         if self.latent_target_dir is not None:
@@ -364,6 +394,8 @@ class DirectFlowDataset(Dataset):
             "target_tr": target_tr,
             "n_trs": n_trs,
         }
+        if pca_target is not None:
+            result["pca"] = pca_target
         if latent_target is not None:
             result["latent"] = latent_target
         return result
@@ -556,10 +588,24 @@ def train(args):
     torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Check if latent mode is enabled
-    latent_mode = "latent_target_dir" in cfg
-    if latent_mode:
+    # Check mode: PCA > latent > fMRI
+    pca_mode = "pca_model_path" in cfg
+    latent_mode = "latent_target_dir" in cfg and not pca_mode
+    if pca_mode:
+        logger.info("🧪 PCA FLOW MATCHING MODE (pca_dim=%d)", cfg.get("pca_dim", 100))
+    elif latent_mode:
         logger.info("🧪 LATENT FLOW MATCHING MODE (target_dim=%d)", cfg.get("latent_dim", 64))
+
+    # Load PCA model for validation inverse transform
+    pca_components_gpu = None
+    pca_mean_gpu = None
+    if pca_mode:
+        pca_path = Path(PROJECT_ROOT) / cfg["pca_model_path"]
+        pca = joblib.load(pca_path)
+        pca_components_gpu = torch.from_numpy(pca.components_.astype(np.float32)).to(device)  # (K, V)
+        pca_mean_gpu = torch.from_numpy(pca.mean_.astype(np.float32)).to(device)  # (V,)
+        logger.info("Loaded PCA model for validation: %d components", pca.n_components_)
+        del pca
 
     # 1. Data
     train_loader, val_loader = get_dataloaders(cfg)
@@ -687,8 +733,10 @@ def train(args):
             context = batch["context"].to(device)     # (B, T, C)
             subject_ids = batch["subject_idx"].to(device)  # (B,)
 
-            # Choose target based on mode
-            if latent_mode and "latent" in batch:
+            # Choose target based on mode: PCA > latent > fMRI
+            if pca_mode and "pca" in batch:
+                target = batch["pca"].to(device)       # (B, K=100)
+            elif latent_mode and "latent" in batch:
                 target = batch["latent"].to(device)    # (B, Z=64)
             else:
                 target = batch["fmri"].to(device)      # (B, V=1000)
@@ -752,10 +800,13 @@ def train(args):
                         synth_kwargs["cfg_scale"] = val_cfg_scale
                     gen_output = model.synthesise(
                         context, **synth_kwargs,
-                    )  # (B, output_dim) — latent (64) or fMRI (1000)
+                    )  # (B, output_dim) — PCA (100), latent (64), or fMRI (1000)
 
-                    # Decode latents → fMRI if in latent mode
-                    if latent_mode and vae_decoder is not None:
+                    # Decode to fMRI space for PCC evaluation
+                    if pca_mode and pca_components_gpu is not None:
+                        # PCA inverse transform: pred @ components + mean → (B, 1000)
+                        gen_fmri = gen_output @ pca_components_gpu + pca_mean_gpu
+                    elif latent_mode and vae_decoder is not None:
                         gen_fmri = decode_latents_to_fmri(
                             vae_decoder, gen_output, subject_ids
                         )  # (B, 1000)
@@ -801,8 +852,8 @@ def train(args):
             else:
                 mean_fmri_corr = 0.0
 
-            logger.info("Epoch %d | Val fMRI PCC: %.4f%s", epoch, mean_fmri_corr,
-                        " (decoded from latent)" if latent_mode else "")
+            mode_tag = " (PCA→fMRI)" if pca_mode else (" (latent→fMRI)" if latent_mode else "")
+            logger.info("Epoch %d | Val fMRI PCC: %.4f%s", epoch, mean_fmri_corr, mode_tag)
 
             if mean_fmri_corr > best_val_corr:
                 best_val_corr = mean_fmri_corr
