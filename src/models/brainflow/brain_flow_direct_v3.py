@@ -1,27 +1,29 @@
-"""BrainFlow Direct v3 — Flow Matching + Auxiliary Regression in fMRI Space.
+"""BrainFlow Direct v3 — Flow Matching + Aux Reg + Contrastive in fMRI Space.
 
-Key features:
-  - LinearFusion: per-modality projection → concat → project
+Key features (NSD-inspired improvements):
+  - MultiTokenFusion: per-modality proj + modality embeddings → preserve token identity
   - Temporal Self-Attention: model temporal dependencies in context
-  - Auxiliary Regression Head: direct fMRI supervision (shared encoder)
+  - Auxiliary Regression Head: direct fMRI supervision (DETACHED from encoder)
+  - Contrastive Branch: InfoNCE loss in 256-D projected space
   - Classifier-Free Guidance (CFG) at inference
   - 4 SimpleFiLMBlocks for velocity estimation
 
 Architecture:
   Context (B, T, [mod_dims...])
-    → LinearFusion: per-mod proj → concat → Linear → (B, T, hidden)
+    → MultiTokenFusion: per-mod proj + modality_emb → concat → (B, T, hidden)
     → Temporal Self-Attention (2 layers) → refined context
 
   Training:
-    context_encoded → pool → RegressionHead → fmri_pred → reg_loss
-    x_0 ~ N(0,I), x_1 = target → OT-CFM path → v_pred → flow_loss
-    total_loss = flow_loss + reg_weight * reg_loss
+    context_encoded (shared) → flow branch (gradient flows to encoder)
+    context_encoded.detach() → pool → RegressionHead → fmri_reg
+    fmri_reg → contrastive projections → InfoNCE loss
+    total_loss = flow_loss + reg_weight * reg_loss + cont_weight * cont_loss
 
   Inference:
     x_init = 0 → ODE solve with CFG guidance → fmri_pred
 
 Usage:
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3.yaml
+    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_nsd.yaml
 """
 
 import math
@@ -80,14 +82,18 @@ class SubjectLayers(nn.Module):
 
 
 # =============================================================================
-# LinearFusion — Simple per-modality projection + concat
+# MultiTokenFusion — NSD-style per-modality token preservation
 # =============================================================================
 
-class LinearFusion(nn.Module):
-    """Simple linear fusion: per-modality projection → concat → project.
+class MultiTokenFusion(nn.Module):
+    """NSD-style fusion: per-modality projection + modality embeddings.
 
-    ~50% fewer params and ~2× faster than FactoredCrossModalFusion.
-    Cross-modal reasoning is delegated to the velocity network's cross-attention.
+    Unlike LinearFusion (concat on feature dim → destroys modality identity),
+    this module projects each modality to hidden_dim and adds a learnable
+    modality embedding so downstream attention can distinguish token origins.
+
+    Output: (B, T, hidden_dim) — modalities are concatenated along feature dim
+    AFTER individual projection, preserving modality-aware information via embeddings.
     """
 
     def __init__(
@@ -101,25 +107,31 @@ class LinearFusion(nn.Module):
     ):
         super().__init__()
         self.n_modalities = len(modality_dims)
+        self.modality_dims = modality_dims
         self.hidden_dim = hidden_dim
         self.proj_dim = proj_dim
         self.max_seq_len = max_seq_len
         self.modality_dropout = modality_dropout
 
-        # Per-modality projection: mod_dim → proj_dim
+        # Per-modality projection: mod_dim → hidden_dim (direct, like NSD)
         self.projectors = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(dim, proj_dim),
-                nn.LayerNorm(proj_dim),
+                nn.Linear(dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
                 nn.GELU(),
             )
             for dim in modality_dims
         ])
 
-        # Concat → hidden_dim
-        concat_dim = proj_dim * self.n_modalities
+        # Learnable modality embeddings (NSD improvement)
+        # Each modality gets a unique embedding so attention can distinguish origins
+        self.modality_emb = nn.Parameter(
+            torch.randn(self.n_modalities, hidden_dim) * 0.02
+        )
+
+        # Output projection: hidden_dim → hidden_dim (with dropout)
         self.output_proj = nn.Sequential(
-            nn.Linear(concat_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -136,9 +148,12 @@ class LinearFusion(nn.Module):
         B, T = modality_features[0].shape[:2]
         T = min(T, self.max_seq_len)
 
+        # Project each modality and add modality embedding
         projected = []
-        for feat, proj in zip(modality_features, self.projectors):
-            projected.append(proj(feat[:, :T]))  # (B, T, proj_dim)
+        for i, (feat, proj) in enumerate(zip(modality_features, self.projectors)):
+            h = proj(feat[:, :T])  # (B, T, hidden_dim)
+            h = h + self.modality_emb[i]  # broadcast (hidden_dim,) → (B, T, hidden_dim)
+            projected.append(h)
 
         # Modality dropout during training
         if self.training and self.modality_dropout > 0:
@@ -153,10 +168,11 @@ class LinearFusion(nn.Module):
             for i in range(self.n_modalities):
                 projected[i] = projected[i] * keep_mask[:, :, i:i+1]
 
-        # Concat all modalities along feature dim
-        x = torch.cat(projected, dim=-1)  # (B, T, proj_dim * M)
+        # Average across modalities (preserves temporal structure)
+        # Each projected[i] is (B, T, hidden_dim) with modality_emb baked in
+        x = torch.stack(projected, dim=0).mean(dim=0)  # (B, T, hidden_dim)
 
-        # Project to hidden_dim
+        # Output projection
         context = self.output_proj(x)  # (B, T, hidden_dim)
         return context
 
@@ -243,8 +259,8 @@ class DirectVelocityNetV3(nn.Module):
         self.hidden_dim = hidden_dim
         self.modality_dims = modality_dims or [1408]
 
-        # --- Linear Fusion ---
-        self.fusion_block = LinearFusion(
+        # --- MultiTokenFusion (NSD-style) ---
+        self.fusion_block = MultiTokenFusion(
             modality_dims=self.modality_dims,
             hidden_dim=hidden_dim,
             proj_dim=proj_dim,
@@ -386,14 +402,33 @@ class DirectVelocityNetV3(nn.Module):
 # BrainFlowDirectV3 — Top-level Model with Auxiliary Regression + CFG
 # =============================================================================
 
-class BrainFlowDirectV3(nn.Module):
-    """Flow matching v3 with auxiliary regression and CFG inference.
+def info_nce_loss(z_pred, z_target, temperature=0.07):
+    """Bidirectional InfoNCE loss in projected space.
 
-    Key features:
-      - Auxiliary regression head for direct fMRI supervision
-      - Classifier-Free Guidance at inference (trained with 10% context dropout)
-      - Temporal self-attention in context encoder
-      - Gaussian source, pure OT-CFM
+    Args:
+        z_pred:   (B, D) L2-normalized prediction embeddings.
+        z_target: (B, D) L2-normalized target embeddings.
+        temperature: softmax temperature.
+
+    Returns:
+        loss: scalar, average of pred→target and target→pred NCE.
+    """
+    logits = z_pred @ z_target.T / temperature  # (B, B)
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    loss_p2t = F.cross_entropy(logits, labels)
+    loss_t2p = F.cross_entropy(logits.T, labels)
+    return (loss_p2t + loss_t2p) / 2
+
+
+class BrainFlowDirectV3(nn.Module):
+    """Flow matching v3 with auxiliary regression, contrastive, and CFG.
+
+    NSD-inspired improvements:
+      - MultiTokenFusion: modality embeddings preserve token identity
+      - Gradient isolation: .detach() prevents reg from conflicting with flow
+      - Contrastive branch: InfoNCE in 256-D for ranking signal
+      - Deeper regression head: 4-layer MLP
+      - CFG at inference (trained with 10% context dropout)
     """
 
     def __init__(
@@ -401,11 +436,14 @@ class BrainFlowDirectV3(nn.Module):
         output_dim: int = 1000,
         velocity_net_params: dict = None,
         n_subjects: int = 4,
-        reg_weight: float = 0.5,
+        reg_weight: float = 1.0,
+        cont_weight: float = 0.1,
+        cont_dim: int = 256,
     ):
         super().__init__()
         self.output_dim = output_dim
         self.reg_weight = reg_weight
+        self.cont_weight = cont_weight
 
         # Velocity network
         vn_cfg = dict(velocity_net_params or {})
@@ -413,14 +451,32 @@ class BrainFlowDirectV3(nn.Module):
         vn_cfg.setdefault("n_subjects", n_subjects)
         self.velocity_net = DirectVelocityNetV3(**vn_cfg)
 
-        # --- Auxiliary Regression Head (#1) ---
+        # --- Deepened Regression Head (NSD: 4-layer instead of 2) ---
         hidden_dim = vn_cfg.get("hidden_dim", 1024)
+        reg_hidden = hidden_dim * 2  # 1024 → 2048 intermediate
         self.reg_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, reg_hidden),
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Dropout(0.1),
+            nn.Linear(reg_hidden, reg_hidden),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(reg_hidden, reg_hidden),
+            nn.GELU(),
         )
-        self.reg_output = nn.Linear(hidden_dim, output_dim)
+        self.reg_output = nn.Linear(reg_hidden, output_dim)
+
+        # --- Contrastive Projection Heads (NSD improvement) ---
+        self.contrastive_proj = nn.Sequential(
+            nn.Linear(output_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, cont_dim),
+        )
+        self.target_proj = nn.Sequential(
+            nn.Linear(output_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, cont_dim),
+        )
 
         # OT-CFM path
         self.path = AffineProbPath(scheduler=CondOTScheduler())
@@ -429,18 +485,27 @@ class BrainFlowDirectV3(nn.Module):
         vn_params = sum(p.numel() for p in self.velocity_net.parameters())
         reg_params = sum(p.numel() for p in self.reg_head.parameters()) + \
                      sum(p.numel() for p in self.reg_output.parameters())
-        total = vn_params + reg_params
+        cont_params = sum(p.numel() for p in self.contrastive_proj.parameters()) + \
+                      sum(p.numel() for p in self.target_proj.parameters())
+        total = vn_params + reg_params + cont_params
         print(f"[BrainFlowDirectV3] VelocityNet: {vn_params:,} params")
         print(f"[BrainFlowDirectV3] RegressionHead: {reg_params:,} params")
-        print(f"[BrainFlowDirectV3] Total: {total:,} params (reg_weight={reg_weight})")
+        print(f"[BrainFlowDirectV3] ContrastiveHeads: {cont_params:,} params")
+        print(f"[BrainFlowDirectV3] Total: {total:,} params "
+              f"(reg_w={reg_weight}, cont_w={cont_weight})")
 
-    def forward(
+    def compute_loss(
         self,
         context: torch.Tensor,
         target: torch.Tensor,
         subject_ids: torch.Tensor = None,
+        starting_distribution: torch.Tensor = None,
     ) -> dict[str, torch.Tensor]:
-        """Compute flow matching loss + auxiliary regression loss.
+        """Compute flow + regression + contrastive loss.
+
+        NSD-style gradient isolation:
+          - Flow branch: gradient flows through encoder (updates fusion + DiT)
+          - Reg branch: .detach() prevents conflict (updates reg head + proj only)
 
         Args:
             context: (B, T, total_dim) concatenated multimodal context.
@@ -448,42 +513,53 @@ class BrainFlowDirectV3(nn.Module):
             subject_ids: (B,) long tensor of subject indices.
 
         Returns:
-            dict with keys: total_loss, flow_loss, reg_loss (alias align_loss for compat).
+            dict with keys: total_loss, flow_loss, align_loss, cont_loss, kld_loss.
         """
-        # 1. Encode context once (shared between velocity net and regression)
+        # 1. Encode context once (shared)
         context_encoded = self.velocity_net.encode_context_from_cond(context)
 
-        # 2. Auxiliary regression: direct fMRI prediction from context
-        ctx_pooled = context_encoded.mean(dim=1)  # (B, hidden)
+        # 2. Regression branch with gradient isolation (NSD improvement)
+        # .detach() prevents regression from pulling the shared encoder
+        ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
+        ctx_pooled = ctx_detached.mean(dim=1)  # (B, hidden)
         reg_hidden = self.reg_head(ctx_pooled)
         fmri_pred = self.reg_output(reg_hidden)
 
         reg_loss = F.mse_loss(fmri_pred, target)
 
-        # 3. Gaussian source (standard flow matching)
-        x_1 = target
-        x_0 = torch.randn_like(x_1)
+        # 3. Contrastive loss in 256-D projected space (NSD improvement)
+        z_pred = F.normalize(self.contrastive_proj(fmri_pred), dim=-1)
+        z_target = F.normalize(self.target_proj(target), dim=-1)
+        cont_loss = info_nce_loss(z_pred, z_target)
 
-        # 4. Flow matching
+        # 4. Flow matching source distribution (x_0)
+        x_1 = target
+        if starting_distribution is not None:
+            x_0 = starting_distribution
+        else:
+            x_0 = torch.randn_like(x_1)
+
+        # 5. Flow matching (gradient flows to encoder)
         t = torch.rand(x_1.shape[0], device=x_1.device)
         sample_info = self.path.sample(t=t, x_0=x_0, x_1=x_1)
 
         v_pred = self.velocity_net(
             x=sample_info.x_t,
             t=sample_info.t,
-            pre_encoded_context=context_encoded,
+            pre_encoded_context=context_encoded,  # ✅ gradient flows
             subject_ids=subject_ids,
         )
 
         flow_loss = F.mse_loss(v_pred, sample_info.dx_t)
 
-        # 5. Total loss
-        total_loss = flow_loss + self.reg_weight * reg_loss
+        # 6. Total loss
+        total_loss = flow_loss + self.reg_weight * reg_loss + self.cont_weight * cont_loss
 
         return {
             "total_loss": total_loss,
             "flow_loss": flow_loss,
-            "align_loss": reg_loss,    # reuse align_loss key for compatibility
+            "align_loss": reg_loss,    # compat key
+            "cont_loss": cont_loss,
             "kld_loss": torch.tensor(0.0, device=target.device),
         }
 

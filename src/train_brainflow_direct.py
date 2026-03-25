@@ -622,17 +622,30 @@ def train(args):
 
     vn_params = dict(bf_cfg.get("velocity_net", {}))
     modality_dims = cfg.get("modality_dims", None)
-    if modality_dims:
+    
+    if "base_model" in cfg and modality_dims:
+        base_cfg_path = cfg["base_model"].get("config")
+        base_model_cfg = load_config(base_cfg_path)
+        base_modality_count = len(base_model_cfg.get("modalities", []))
+        # New model only uses the remaining modalities
+        vn_params["modality_dims"] = modality_dims[base_modality_count:]
+        logger.info("Residual Flow mode: target model uses %d modalities %s", 
+                    len(vn_params["modality_dims"]), vn_params["modality_dims"])
+    elif modality_dims:
         vn_params["modality_dims"] = modality_dims
 
     if model_version == "v3":
-        logger.info("Initializing BrainFlowDirectV3 (simplified)...")
-        reg_weight = bf_cfg.get("reg_weight", 0.5)
+        logger.info("Initializing BrainFlowDirectV3 (NSD-inspired)...")
+        reg_weight = bf_cfg.get("reg_weight", 1.0)
+        cont_weight = bf_cfg.get("cont_weight", 0.1)
+        cont_dim = bf_cfg.get("cont_dim", 256)
         model = BrainFlowDirectV3(
             output_dim=output_dim,
             velocity_net_params=vn_params,
             n_subjects=len(cfg["subjects"]),
             reg_weight=reg_weight,
+            cont_weight=cont_weight,
+            cont_dim=cont_dim,
         ).to(device)
     else:
         logger.info("Initializing BrainFlowDirectV2...")
@@ -653,6 +666,40 @@ def train(args):
     vae_decoder = None
     if latent_mode and "vae_checkpoint" in cfg:
         vae_decoder = load_frozen_vae_decoder(cfg, device)
+
+    # 3.5 Frozen Base Model for Residual Flow Matching
+    base_model = None
+    if "base_model" in cfg:
+        base_cfg_path = cfg["base_model"].get("config")
+        base_ckpt_path = cfg["base_model"].get("checkpoint")
+        if base_cfg_path and base_ckpt_path:
+            logger.info("loading frozen base model for Residual Flow Matching...")
+            base_model_cfg = load_config(base_cfg_path)
+            
+            # Reconstruct the appropriate model architecture (assuming V3 style)
+            bm_output_dim = base_model_cfg["brainflow"].get("output_dim", 1000)
+            bm_vn_params = dict(base_model_cfg["brainflow"]["velocity_net"])
+            if "modalities" in base_model_cfg:
+                bm_vn_params["modality_dims"] = [m["dim"] for m in base_model_cfg["modalities"]]
+            else:
+                bm_vn_params["modality_dims"] = base_model_cfg.get("modality_dims", [1408])
+            bm_reg_weight = base_model_cfg["brainflow"].get("reg_weight", 0.5)
+
+            base_model = BrainFlowDirectV3(
+                output_dim=bm_output_dim,
+                velocity_net_params=bm_vn_params,
+                n_subjects=len(cfg["subjects"]),
+                reg_weight=bm_reg_weight,
+            ).to(device)
+
+            base_ckpt = torch.load(base_ckpt_path, map_location=device, weights_only=False)
+            bm_state = base_ckpt["model"] if "model" in base_ckpt else base_ckpt
+            base_model.load_state_dict(bm_state)
+            base_model.eval()
+            for p in base_model.parameters():
+                p.requires_grad_(False)
+            logger.info("✅ Loaded frozen base model from %s", base_ckpt_path)
+            del base_ckpt
 
     # 3. Optimizer & Scheduler
     tr_cfg = cfg["training"]
@@ -692,6 +739,33 @@ def train(args):
     start_epoch = 1
     best_val_corr = -1.0
     global_step = 0
+
+    if args.warmstart:
+        ws_path = Path(args.warmstart)
+        if ws_path.exists():
+            ckpt = torch.load(ws_path, map_location=device, weights_only=False)
+            state = ckpt["model"] if "model" in ckpt else ckpt
+            # Filter out keys with shape mismatches (e.g., after adding modalities)
+            model_state = model.state_dict()
+            filtered_state = {}
+            skipped = []
+            for k, v in state.items():
+                if k in model_state and model_state[k].shape == v.shape:
+                    filtered_state[k] = v
+                elif k in model_state:
+                    skipped.append(f"{k}: ckpt={list(v.shape)} vs model={list(model_state[k].shape)}")
+            missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+            if skipped:
+                logger.info("Warmstart — skipped %d size-mismatched keys:", len(skipped))
+                for s in skipped:
+                    logger.info("  %s", s)
+            if missing:
+                logger.info("Warmstart — missing keys (%d): %s", len(missing), missing[:10])
+            logger.info("Warmstarted from %s (epoch %s), loaded %d/%d keys",
+                         ws_path, ckpt.get("epoch", "?"), len(filtered_state), len(state))
+            del ckpt
+        else:
+            logger.warning("--warmstart path %s not found. Starting from scratch.", ws_path)
 
     if args.resume:
         resume_path = out_dir / "last.pt"
@@ -746,8 +820,28 @@ def train(args):
             if random.random() < 0.1:
                 context = torch.zeros_like(context)
 
+            # Residual Flow Matching: get starting distribution from base_model
+            starting_distribution = None
+            if base_model is not None:
+                with torch.no_grad():
+                    # Base model uses first N modalities (e.g. 8)
+                    base_context_len = sum(base_model.fusion_block.modality_dims)
+                    base_context = context[..., :base_context_len]
+                    bm_encoded = base_model.velocity_net.encode_context_from_cond(base_context) 
+                    bm_pooled = bm_encoded.mean(dim=1)
+                    starting_distribution = base_model.reg_output(base_model.reg_head(bm_pooled))
+                    
+                    # Target model uses only the LAST modality (e.g. 9th)
+                    # We slice off the base modalities so only the new one remains
+                    context = context[..., base_context_len:]
+
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
-                losses = model(context, target, subject_ids=subject_ids)
+                losses = model.compute_loss(
+                    context, 
+                    target, 
+                    subject_ids=subject_ids, 
+                    starting_distribution=starting_distribution
+                )
                 loss = losses["total_loss"]
 
             optimizer.zero_grad(set_to_none=True)
@@ -764,11 +858,12 @@ def train(args):
                 flow_l = losses["flow_loss"].item()
                 align_l = losses["align_loss"].item()
                 kld_l = losses["kld_loss"].item()
+                cont_l = losses.get("cont_loss", torch.tensor(0.0)).item()
                 pbar.set_postfix({
                     "loss": f"{np.mean(train_losses[-50:]):.4f}",
                     "flow": f"{flow_l:.4f}",
                     "reg": f"{align_l:.4f}",
-                    "kld": f"{kld_l:.4f}",
+                    "cont": f"{cont_l:.4f}",
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                 })
 
@@ -798,6 +893,20 @@ def train(args):
                     )
                     if model_version == "v3" and val_cfg_scale > 0:
                         synth_kwargs["cfg_scale"] = val_cfg_scale
+                        
+                    # Residual Flow Matching for inference
+                    if base_model is not None:
+                        # Extract the base model's prediction as the starting point x_0
+                        base_context_len = sum(base_model.fusion_block.modality_dims)
+                        base_context = context[..., :base_context_len]
+                        
+                        bm_encoded = base_model.velocity_net.encode_context_from_cond(base_context) 
+                        bm_pooled = bm_encoded.mean(dim=1)
+                        synth_kwargs["starting_distribution"] = base_model.reg_output(base_model.reg_head(bm_pooled))
+                        
+                        # Target model only uses the last modality
+                        context = context[..., base_context_len:]
+
                     gen_output = model.synthesise(
                         context, **synth_kwargs,
                     )  # (B, output_dim) — PCA (100), latent (64), or fMRI (1000)
@@ -890,5 +999,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="src/configs/brain_flow_direct.yaml")
     parser.add_argument("--fast_dev_run", action="store_true", help="Run 2 batches to test pipeline")
     parser.add_argument("--resume", action="store_true", help="Resume training from last.pt")
+    parser.add_argument("--warmstart", type=str, default=None,
+                        help="Path to checkpoint for warm-starting (strict=False, ignores mismatched layers)")
     args = parser.parse_args()
     train(args)
