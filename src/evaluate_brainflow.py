@@ -7,8 +7,8 @@ Uses the same data pipeline as train_brainflow_direct.py:
   - Subject embedding conditioning
 
 Usage:
-    python src/evaluate_brainflow_direct.py --config src/configs/brain_flow_direct_v2_gaussian.yaml
-    python src/evaluate_brainflow_direct.py --config src/configs/brain_flow_direct_v2.yaml --n_timesteps 50
+    python src/evaluate_brainflow_direct.py --config src/configs/brainflow_gaussian.yaml
+    python src/evaluate_brainflow_direct.py --config src/configs/brainflow_v2.yaml --n_timesteps 50
 """
 
 import sys
@@ -25,8 +25,7 @@ import numpy as np
 import zipfile
 from tqdm import tqdm
 
-from src.models.brainflow.brain_flow_direct_v2 import BrainFlowDirectV2
-from src.models.brainflow.brain_flow_direct_v3 import BrainFlowDirectV3
+from src.models.brainflow.brainflow import BrainFlow
 from src.data.dataset import load_config
 
 
@@ -87,7 +86,7 @@ def load_context_for_clip(
 @torch.inference_mode()
 def evaluate_brainflow_direct():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="src/configs/brain_flow_direct.yaml")
+    parser.add_argument("--config", type=str, default="src/configs/brainflow.yaml")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--n_timesteps", type=int, default=20)
@@ -171,7 +170,7 @@ def evaluate_brainflow_direct():
     source_mode = bf_cfg.get("source_mode", "csfm")
     if model_version == "v3":
         reg_weight = bf_cfg.get("reg_weight", 0.5)
-        model = BrainFlowDirectV3(
+        model = BrainFlow(
             output_dim=bf_cfg["output_dim"],
             velocity_net_params=vn_params,
             n_subjects=len(subjects),
@@ -179,7 +178,7 @@ def evaluate_brainflow_direct():
         ).to(device)
     else:
         sp_params = dict(bf_cfg.get("source_predictor", {}))
-        model = BrainFlowDirectV2(
+        model = BrainFlow_V2(
             output_dim=bf_cfg["output_dim"],
             velocity_net_params=vn_params,
             n_subjects=len(subjects),

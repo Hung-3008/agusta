@@ -1,10 +1,8 @@
 # =====================================================================
-# BrainFlow Direct v3 — Factored Bottleneck Fusion variant
+# BrainFlow Direct v3 + VLM2Vec — 9 modalities
 # =====================================================================
-# FactoredBottleneckFusion (per-timestep bottleneck cross-modal attention)
-# → Temporal Self-Attention → Aux Regression Head
-# 4 SimpleFiLMBlocks, Gaussian source, OT-CFM
-# CFG inference support (trained with 10% context dropout)
+# Warmstart from v3 checkpoint, adding VLM2Vec-7B (3584-D) as 9th modality.
+# Architecture adapts: concat_dim 256*9=2304 → hidden_dim=1024
 # =====================================================================
 
 data_root: Data
@@ -18,7 +16,7 @@ fmri:
   hrf_delay: 2
   use_global_stats: true
 
-# --- Pre-extracted encoder context latents (8 modalities) ---
+# --- Pre-extracted encoder context latents (9 modalities) ---
 context_latent_dirs:
   - Data/features_npy_pooled/vjepa2_avg_feat       # Visual (V-JEPA 2)
   - Data/features_npy_pooled/whisper                # Audio (Whisper)
@@ -28,6 +26,7 @@ context_latent_dirs:
   - Data/features_npy_pooled/qwen-2-5-omni-7b       # Multimodal (Qwen-Omni)
   - Data/features_npy_pooled/internvl3_8b_8bit      # Vision-Language (InternVL3-8B)
   - Data/features_npy_pooled/InternVL3_14B          # Vision-Language (InternVL3-14B)
+  - Data/features_npy_pooled/vlm2vec_7b             # NEW: VLM2Vec (Qwen2-VL-7B)
 
 modality_dims:
   - 1408   # vjepa2_avg_feat
@@ -38,6 +37,7 @@ modality_dims:
   - 3584   # qwen-2-5-omni-7b
   - 3584   # internvl3_8b_8bit
   - 5120   # InternVL3_14B
+  - 3584   # vlm2vec_7b (NEW)
 
 # --- Multi-subject training ---
 subjects:
@@ -59,7 +59,7 @@ splits:
 
 # --- Sliding window ---
 sliding_window:
-  feature_context_trs: 30     # Expanded from 10 → 30
+  feature_context_trs: 30
   stride: 1
   temporal_jitter: 2
 
@@ -71,13 +71,13 @@ dataloader:
   pin_memory: true
 
 # =====================================================================
-# Model config — V3 with Factored Bottleneck Fusion
+# Model config — V3 with 9 modalities
 # =====================================================================
-model_version: v3
+model_version: v1
 
 brainflow:
   output_dim: 1000
-  reg_weight: 0.5              # Auxiliary regression loss weight
+  reg_weight: 0.5
 
   velocity_net:
     output_dim: 1000
@@ -87,21 +87,16 @@ brainflow:
     n_heads: 8
     dropout: 0.1
     modality_dropout: 0.3
-    max_seq_len: 31            # 30 past + 1 current
-    temporal_attn_layers: 2    # Temporal self-attention
-
-    # --- Factored Bottleneck Fusion ---
-    fusion_type: bottleneck    # "linear" or "bottleneck"
-    n_bottleneck: 4            # Number of bottleneck tokens per timestep
-    bottleneck_n_layers: 2     # Cross-attn + self-attn layers
+    max_seq_len: 31
+    temporal_attn_layers: 2
 
 # =====================================================================
-# Solver args (validation inference)
+# Solver args
 # =====================================================================
 solver_args:
-  method: midpoint             # More accurate than euler
-  time_points: 50              # More steps for better accuracy
-  cfg_scale: 0.0               # CFG at inference (0 = disabled)
+  method: midpoint
+  time_points: 50
+  cfg_scale: 0.0
 
 # =====================================================================
 # Training
@@ -115,8 +110,8 @@ training:
   grad_clip: 1.0
   use_amp: true
   log_every_n_steps: 20
-  val_every_n_epochs: 5
+  val_every_n_epochs: 1
   ema_decay: 0.999
 
 # --- Output ---
-output_dir: outputs/brainflow_direct_v3_fbf
+output_dir: outputs/brainflow_direct_v3_vlm2vec

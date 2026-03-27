@@ -23,7 +23,7 @@ Architecture:
     x_init = 0 → ODE solve with CFG guidance → fmri_pred
 
 Usage:
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_nsd.yaml
+    python src/train_brainflow_direct.py --config src/configs/brainflow_nsd.yaml
 """
 
 import math
@@ -225,10 +225,10 @@ class SimpleFiLMBlock(nn.Module):
 
 
 # =============================================================================
-# DirectVelocityNetV3 — Velocity Network with Temporal Self-Attention
+# VelocityNet — Velocity Network with Temporal Self-Attention
 # =============================================================================
 
-class DirectVelocityNetV3(nn.Module):
+class VelocityNet(nn.Module):
     """Velocity network v3 with temporal self-attention context refinement.
 
     Architecture:
@@ -399,7 +399,7 @@ class DirectVelocityNetV3(nn.Module):
 
 
 # =============================================================================
-# BrainFlowDirectV3 — Top-level Model with Auxiliary Regression + CFG
+# BrainFlow — Top-level Model with Auxiliary Regression + CFG
 # =============================================================================
 
 def info_nce_loss(z_pred, z_target, temperature=0.07):
@@ -420,7 +420,7 @@ def info_nce_loss(z_pred, z_target, temperature=0.07):
     return (loss_p2t + loss_t2p) / 2
 
 
-class BrainFlowDirectV3(nn.Module):
+class BrainFlow(nn.Module):
     """Flow matching v3 with auxiliary regression, contrastive, and CFG.
 
     NSD-inspired improvements:
@@ -449,7 +449,7 @@ class BrainFlowDirectV3(nn.Module):
         vn_cfg = dict(velocity_net_params or {})
         vn_cfg.setdefault("output_dim", output_dim)
         vn_cfg.setdefault("n_subjects", n_subjects)
-        self.velocity_net = DirectVelocityNetV3(**vn_cfg)
+        self.velocity_net = VelocityNet(**vn_cfg)
 
         # --- Deepened Regression Head (NSD: 4-layer instead of 2) ---
         hidden_dim = vn_cfg.get("hidden_dim", 1024)
@@ -488,10 +488,10 @@ class BrainFlowDirectV3(nn.Module):
         cont_params = sum(p.numel() for p in self.contrastive_proj.parameters()) + \
                       sum(p.numel() for p in self.target_proj.parameters())
         total = vn_params + reg_params + cont_params
-        print(f"[BrainFlowDirectV3] VelocityNet: {vn_params:,} params")
-        print(f"[BrainFlowDirectV3] RegressionHead: {reg_params:,} params")
-        print(f"[BrainFlowDirectV3] ContrastiveHeads: {cont_params:,} params")
-        print(f"[BrainFlowDirectV3] Total: {total:,} params "
+        print(f"[BrainFlow] VelocityNet: {vn_params:,} params")
+        print(f"[BrainFlow] RegressionHead: {reg_params:,} params")
+        print(f"[BrainFlow] ContrastiveHeads: {cont_params:,} params")
+        print(f"[BrainFlow] Total: {total:,} params "
               f"(reg_w={reg_weight}, cont_w={cont_weight})")
 
     def compute_loss(

@@ -1,8 +1,9 @@
 # =====================================================================
-# BrainFlow Direct v3 + VLM2Vec — 9 modalities
+# BrainFlow Direct v3 — Flow Matching + Aux Regression + CFG
 # =====================================================================
-# Warmstart from v3 checkpoint, adding VLM2Vec-7B (3584-D) as 9th modality.
-# Architecture adapts: concat_dim 256*9=2304 → hidden_dim=1024
+# LinearFusion → Temporal Self-Attention → Aux Regression Head
+# 4 SimpleFiLMBlocks, Gaussian source, OT-CFM
+# CFG inference support (trained with 10% context dropout)
 # =====================================================================
 
 data_root: Data
@@ -16,7 +17,7 @@ fmri:
   hrf_delay: 2
   use_global_stats: true
 
-# --- Pre-extracted encoder context latents (9 modalities) ---
+# --- Pre-extracted encoder context latents (8 modalities) ---
 context_latent_dirs:
   - Data/features_npy_pooled/vjepa2_avg_feat       # Visual (V-JEPA 2)
   - Data/features_npy_pooled/whisper                # Audio (Whisper)
@@ -26,7 +27,7 @@ context_latent_dirs:
   - Data/features_npy_pooled/qwen-2-5-omni-7b       # Multimodal (Qwen-Omni)
   - Data/features_npy_pooled/internvl3_8b_8bit      # Vision-Language (InternVL3-8B)
   - Data/features_npy_pooled/InternVL3_14B          # Vision-Language (InternVL3-14B)
-  - Data/features_npy_pooled/vlm2vec_7b             # NEW: VLM2Vec (Qwen2-VL-7B)
+  - Data/features_npy_pooled/vlm2vec_7b             # NEW: VLM2Vec-7B
 
 modality_dims:
   - 1408   # vjepa2_avg_feat
@@ -37,7 +38,7 @@ modality_dims:
   - 3584   # qwen-2-5-omni-7b
   - 3584   # internvl3_8b_8bit
   - 5120   # InternVL3_14B
-  - 3584   # vlm2vec_7b (NEW)
+  - 3584   # vlm2vec_7b
 
 # --- Multi-subject training ---
 subjects:
@@ -59,7 +60,7 @@ splits:
 
 # --- Sliding window ---
 sliding_window:
-  feature_context_trs: 30
+  feature_context_trs: 30     # Expanded from 10 → 30 (#4)
   stride: 1
   temporal_jitter: 2
 
@@ -71,13 +72,17 @@ dataloader:
   pin_memory: true
 
 # =====================================================================
-# Model config — V3 with 9 modalities
+# Model config — V3 with improvements
 # =====================================================================
-model_version: v3
+model_version: v1
 
 brainflow:
   output_dim: 1000
-  reg_weight: 0.5
+  reg_weight: 0.5              # Auxiliary regression loss weight (#1)
+  
+  base_model:
+    config: "src/configs/brainflow.yaml"
+    checkpoint: "outputs/brainflow_direct_v3/best.pt"
 
   velocity_net:
     output_dim: 1000
@@ -87,16 +92,16 @@ brainflow:
     n_heads: 8
     dropout: 0.1
     modality_dropout: 0.3
-    max_seq_len: 31
-    temporal_attn_layers: 2
+    max_seq_len: 31            # 30 past + 1 current (#4)
+    temporal_attn_layers: 2    # Temporal self-attention (#5)
 
 # =====================================================================
-# Solver args
+# Solver args (validation inference)
 # =====================================================================
 solver_args:
-  method: midpoint
-  time_points: 50
-  cfg_scale: 0.0
+  method: midpoint             # More accurate than euler
+  time_points: 50              # More steps for better accuracy (#3)
+  cfg_scale: 0.0               # CFG at inference (0 = disabled) (#3)
 
 # =====================================================================
 # Training
@@ -114,4 +119,4 @@ training:
   ema_decay: 0.999
 
 # --- Output ---
-output_dir: outputs/brainflow_direct_v3_vlm2vec
+output_dir: outputs/brainflow_direct_v3_residual

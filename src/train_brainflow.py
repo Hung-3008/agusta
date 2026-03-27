@@ -8,9 +8,9 @@ Supports three modes:
      PCA inverse_transform converts predictions → fMRI for PCC evaluation.
 
 Usage:
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_pca.yaml --fast_dev_run
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_pca.yaml
-    python src/train_brainflow_direct.py --config src/configs/brain_flow_direct_v3_pca.yaml --resume
+    python src/train_brainflow_direct.py --config src/configs/brainflow_pca.yaml --fast_dev_run
+    python src/train_brainflow_direct.py --config src/configs/brainflow_pca.yaml
+    python src/train_brainflow_direct.py --config src/configs/brainflow_pca.yaml --resume
 """
 
 import argparse
@@ -34,8 +34,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset import load_config, _get_fmri_filepath
-from src.models.brainflow.brain_flow_direct_v2 import BrainFlowDirectV2
-from src.models.brainflow.brain_flow_direct_v3 import BrainFlowDirectV3
+from src.models.brainflow.brainflow import BrainFlow
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("train_brainflow_direct")
@@ -92,37 +91,6 @@ class DirectFlowDataset(Dataset):
 
         # Build subject → index mapping
         self.subject_to_idx = {s: i for i, s in enumerate(self.subjects)}
-
-        # --- PCA target mode ---
-        # When pca_model_path is set, PCA-transform fMRI targets on-the-fly.
-        # PCA components/mean are stored as torch tensors for fast GPU matmul.
-        self.pca_mode = False
-        self.pca_dim = cfg.get("pca_dim", None)
-        self.pca_components = None  # (K, V) tensor
-        self.pca_mean = None        # (V,) tensor
-        if "pca_model_path" in cfg:
-            pca_path = Path(PROJECT_ROOT) / cfg["pca_model_path"]
-            if pca_path.exists():
-                pca = joblib.load(pca_path)
-                self.pca_components = torch.from_numpy(pca.components_.astype(np.float32))  # (K, V)
-                self.pca_mean = torch.from_numpy(pca.mean_.astype(np.float32))  # (V,)
-                self.pca_dim = pca.n_components_
-                self.pca_mode = True
-                logger.info("PCA target mode: %d components, explained_var=%.4f",
-                            self.pca_dim, pca.explained_variance_ratio_.sum())
-                del pca
-            else:
-                logger.warning("PCA model not found at %s — falling back to fMRI mode", pca_path)
-
-        # --- Latent target mode ---
-        # When latent_target_dir is set, load pre-extracted VAE latents as targets
-        # instead of raw fMRI. Raw fMRI is still loaded for validation PCC.
-        self.latent_target_dir = None
-        self.latent_dim = cfg.get("latent_dim", None)
-        if "latent_target_dir" in cfg:
-            self.latent_target_dir = Path(PROJECT_ROOT) / cfg["latent_target_dir"]
-            logger.info("Latent target mode: loading from %s (dim=%s)",
-                        self.latent_target_dir, self.latent_dim)
 
         # Load global fMRI normalization stats (per-voxel mean/std from training set)
         self.use_global_stats = cfg["fmri"].get("use_global_stats", False)
@@ -278,16 +246,6 @@ class DirectFlowDataset(Dataset):
                         if fmri_data is None:
                             continue
 
-                        # --- Load latent targets if in latent mode ---
-                        if self.latent_target_dir is not None and fmri_key not in self._latent_clips:
-                            latent_path = self._find_latent_file(subj, task, norm_name, clip_stem)
-                            if latent_path is not None:
-                                latent_data = np.load(latent_path).astype(np.float32)
-                                self._latent_clips[fmri_key] = torch.from_numpy(latent_data)
-                            else:
-                                self._latent_clips[fmri_key] = None
-                                logger.warning("Latent file missing for %s", fmri_key)
-
                         n_trs = fmri_data.shape[0]
 
                         for target_tr in range(0, n_trs, self.stride):
@@ -303,15 +261,11 @@ class DirectFlowDataset(Dataset):
                                 "target_tr": target_tr,
                                 "n_trs": n_trs,
                             })
-
-        latent_bytes = sum(t.nelement() * 4 for t in self._latent_clips.values() if t is not None)
-        total_bytes = ctx_bytes + fmri_bytes + latent_bytes
-        mode_str = "LATENT" if self.latent_target_dir else "fMRI"
-        logger.info("[%s mode] Preloaded %d ctx clips (%.2f GB) + %d fMRI clips (%.2f GB) "
-                     "+ %.2f GB latents = %.2f GB total → %d samples for %s split.",
-                     mode_str, n_ctx_clips, ctx_bytes / 1e9,
+        total_bytes = ctx_bytes + fmri_bytes
+        logger.info("Preloaded %d ctx clips (%.2f GB) + %d fMRI clips (%.2f GB) "
+                     " = %.2f GB total → %d samples for %s split.",
+                     n_ctx_clips, ctx_bytes / 1e9,
                      n_fmri_clips, fmri_bytes / 1e9,
-                     latent_bytes / 1e9,
                      total_bytes / 1e9, len(samples), self.split)
         return samples
 
@@ -371,21 +325,6 @@ class DirectFlowDataset(Dataset):
             n_voxels = self.cfg["fmri"].get("n_voxels", 1000)
             fmri_target = torch.zeros(n_voxels, dtype=torch.float32)
 
-        # PCA target (on-the-fly projection, no pre-extraction needed)
-        pca_target = None
-        if self.pca_mode and self.pca_components is not None:
-            # PCA transform: (fmri - mean) @ components.T → (K,)
-            pca_target = (fmri_target - self.pca_mean) @ self.pca_components.T
-
-        # Latent target (for training in latent mode)
-        latent_target = None
-        if self.latent_target_dir is not None:
-            latent_data = self._latent_clips.get(fmri_key)
-            if latent_data is not None and target_tr < latent_data.shape[0]:
-                latent_target = latent_data[target_tr].clone()
-            else:
-                latent_target = torch.zeros(self.latent_dim or 64, dtype=torch.float32)
-
         result = {
             "context": context,
             "fmri": fmri_target,
@@ -394,10 +333,6 @@ class DirectFlowDataset(Dataset):
             "target_tr": target_tr,
             "n_trs": n_trs,
         }
-        if pca_target is not None:
-            result["pca"] = pca_target
-        if latent_target is not None:
-            result["latent"] = latent_target
         return result
 
 
@@ -535,50 +470,8 @@ def get_dataloaders(cfg):
 # Training
 # =============================================================================
 
-def load_frozen_vae_decoder(cfg, device):
-    """Load a frozen VAE decoder for latent → fMRI conversion during validation."""
-    from src.models.brainflow.fmri_vae import build_vae
-    from src.data.dataset import load_config as load_vae_config
-
-    vae_config_path = PROJECT_ROOT / cfg["vae_config"]
-    vae_ckpt_path = PROJECT_ROOT / cfg["vae_checkpoint"]
-
-    vae_cfg = load_vae_config(vae_config_path)
-    # Ensure subjects match
-    vae_cfg["subjects"] = cfg["subjects"]
-
-    vae_model = build_vae(vae_cfg).to(device)
-    ckpt = torch.load(vae_ckpt_path, map_location=device, weights_only=False)
-    if "ema_model" in ckpt:
-        vae_model.load_state_dict(ckpt["ema_model"])
-        logger.info("✅ Loaded frozen VAE decoder (EMA weights)")
-    else:
-        vae_model.load_state_dict(ckpt["model"])
-        logger.info("✅ Loaded frozen VAE decoder")
-    del ckpt
-
-    vae_model.eval()
-    for p in vae_model.parameters():
-        p.requires_grad_(False)
-
-    return vae_model
 
 
-def decode_latents_to_fmri(vae_decoder, latent_pred, subject_ids):
-    """Decode latent predictions to fMRI space using frozen VAE decoder.
-
-    Args:
-        vae_decoder: Frozen fMRI_VAE_v5 model.
-        latent_pred: (B, Z) predicted latent vectors.
-        subject_ids: (B,) subject indices.
-
-    Returns:
-        fmri_pred: (B, V) decoded fMRI predictions.
-    """
-    # VAE decoder expects (B, T, Z) — wrap single TR as T=1
-    z = latent_pred.unsqueeze(1)  # (B, 1, Z)
-    fmri = vae_decoder.decode(z, subject_ids)  # (B, 1, V)
-    return fmri.squeeze(1)  # (B, V)
 
 
 def train(args):
@@ -587,25 +480,6 @@ def train(args):
 
     torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Check mode: PCA > latent > fMRI
-    pca_mode = "pca_model_path" in cfg
-    latent_mode = "latent_target_dir" in cfg and not pca_mode
-    if pca_mode:
-        logger.info("🧪 PCA FLOW MATCHING MODE (pca_dim=%d)", cfg.get("pca_dim", 100))
-    elif latent_mode:
-        logger.info("🧪 LATENT FLOW MATCHING MODE (target_dim=%d)", cfg.get("latent_dim", 64))
-
-    # Load PCA model for validation inverse transform
-    pca_components_gpu = None
-    pca_mean_gpu = None
-    if pca_mode:
-        pca_path = Path(PROJECT_ROOT) / cfg["pca_model_path"]
-        pca = joblib.load(pca_path)
-        pca_components_gpu = torch.from_numpy(pca.components_.astype(np.float32)).to(device)  # (K, V)
-        pca_mean_gpu = torch.from_numpy(pca.mean_.astype(np.float32)).to(device)  # (V,)
-        logger.info("Loaded PCA model for validation: %d components", pca.n_components_)
-        del pca
 
     # 1. Data
     train_loader, val_loader = get_dataloaders(cfg)
@@ -635,11 +509,11 @@ def train(args):
         vn_params["modality_dims"] = modality_dims
 
     if model_version == "v3":
-        logger.info("Initializing BrainFlowDirectV3 (NSD-inspired)...")
+        logger.info("Initializing BrainFlow (NSD-inspired)...")
         reg_weight = bf_cfg.get("reg_weight", 1.0)
         cont_weight = bf_cfg.get("cont_weight", 0.1)
         cont_dim = bf_cfg.get("cont_dim", 256)
-        model = BrainFlowDirectV3(
+        model = BrainFlow(
             output_dim=output_dim,
             velocity_net_params=vn_params,
             n_subjects=len(cfg["subjects"]),
@@ -648,10 +522,10 @@ def train(args):
             cont_dim=cont_dim,
         ).to(device)
     else:
-        logger.info("Initializing BrainFlowDirectV2...")
+        logger.info("Initializing BrainFlow_V2...")
         sp_params = dict(bf_cfg.get("source_predictor", {}))
         source_mode = bf_cfg.get("source_mode", "csfm")
-        model = BrainFlowDirectV2(
+        model = BrainFlow_V2(
             output_dim=output_dim,
             velocity_net_params=vn_params,
             n_subjects=len(cfg["subjects"]),
@@ -661,11 +535,6 @@ def train(args):
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Trainable parameters: %s", f"{n_params:,}")
-
-    # 3. Frozen VAE decoder (latent mode only)
-    vae_decoder = None
-    if latent_mode and "vae_checkpoint" in cfg:
-        vae_decoder = load_frozen_vae_decoder(cfg, device)
 
     # 3.5 Frozen Base Model for Residual Flow Matching
     base_model = None
@@ -685,7 +554,7 @@ def train(args):
                 bm_vn_params["modality_dims"] = base_model_cfg.get("modality_dims", [1408])
             bm_reg_weight = base_model_cfg["brainflow"].get("reg_weight", 0.5)
 
-            base_model = BrainFlowDirectV3(
+            base_model = BrainFlow(
                 output_dim=bm_output_dim,
                 velocity_net_params=bm_vn_params,
                 n_subjects=len(cfg["subjects"]),
@@ -806,14 +675,7 @@ def train(args):
 
             context = batch["context"].to(device)     # (B, T, C)
             subject_ids = batch["subject_idx"].to(device)  # (B,)
-
-            # Choose target based on mode: PCA > latent > fMRI
-            if pca_mode and "pca" in batch:
-                target = batch["pca"].to(device)       # (B, K=100)
-            elif latent_mode and "latent" in batch:
-                target = batch["latent"].to(device)    # (B, Z=64)
-            else:
-                target = batch["fmri"].to(device)      # (B, V=1000)
+            target = batch["fmri"].to(device)      # (B, V=1000)
             
             # Classifier-Free Guidance (CFG) / Condition Dropout
             # Drop the context 10% of the time to regularize the network
@@ -910,17 +772,7 @@ def train(args):
                     gen_output = model.synthesise(
                         context, **synth_kwargs,
                     )  # (B, output_dim) — PCA (100), latent (64), or fMRI (1000)
-
-                    # Decode to fMRI space for PCC evaluation
-                    if pca_mode and pca_components_gpu is not None:
-                        # PCA inverse transform: pred @ components + mean → (B, 1000)
-                        gen_fmri = gen_output @ pca_components_gpu + pca_mean_gpu
-                    elif latent_mode and vae_decoder is not None:
-                        gen_fmri = decode_latents_to_fmri(
-                            vae_decoder, gen_output, subject_ids
-                        )  # (B, 1000)
-                    else:
-                        gen_fmri = gen_output  # (B, 1000)
+                    gen_fmri = gen_output
 
                     clip_keys = batch["clip_key"]
                     target_trs = batch["target_tr"]
@@ -960,8 +812,7 @@ def train(args):
                 mean_fmri_corr = float(pcc.mean().item())
             else:
                 mean_fmri_corr = 0.0
-
-            mode_tag = " (PCA→fMRI)" if pca_mode else (" (latent→fMRI)" if latent_mode else "")
+            mode_tag = ""
             logger.info("Epoch %d | Val fMRI PCC: %.4f%s", epoch, mean_fmri_corr, mode_tag)
 
             if mean_fmri_corr > best_val_corr:
@@ -996,7 +847,7 @@ if __name__ == "__main__":
         pass
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="src/configs/brain_flow_direct.yaml")
+    parser.add_argument("--config", type=str, default="src/configs/brainflow.yaml")
     parser.add_argument("--fast_dev_run", action="store_true", help="Run 2 batches to test pipeline")
     parser.add_argument("--resume", action="store_true", help="Resume training from last.pt")
     parser.add_argument("--warmstart", type=str, default=None,
