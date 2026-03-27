@@ -1,9 +1,9 @@
 # =====================================================================
-# BrainFlow Direct v3 — Flow Matching + Aux Regression + CFG
+# BrainFlow CSFM — Condition-dependent Source Flow Matching
 # =====================================================================
-# LinearFusion → Temporal Self-Attention → Aux Regression Head
-# 4 SimpleFiLMBlocks, Gaussian source, OT-CFM
-# CFG inference support (trained with 10% context dropout)
+# SourceVE generates learned x₀ from multimodal context
+# VelocityNet predicts flow velocity (DiT backbone)
+# Loss: diffusion + KLD + align (CSFM paper)
 # =====================================================================
 
 data_root: Data
@@ -27,6 +27,7 @@ context_latent_dirs:
   - Data/features_npy_pooled/qwen-2-5-omni-7b       # Multimodal (Qwen-Omni)
   - Data/features_npy_pooled/internvl3_8b_8bit      # Vision-Language (InternVL3-8B)
   - Data/features_npy_pooled/InternVL3_14B          # Vision-Language (InternVL3-14B)
+  - Data/features_npy_pooled/vlm2vec_7b              # Vision-Language (VLM2Vec-7B)
 
 modality_dims:
   - 1408   # vjepa2_avg_feat
@@ -37,6 +38,7 @@ modality_dims:
   - 3584   # qwen-2-5-omni-7b
   - 3584   # internvl3_8b_8bit
   - 5120   # InternVL3_14B
+  - 3584   # vlm2vec_7b
 
 # --- Multi-subject training ---
 subjects:
@@ -44,8 +46,6 @@ subjects:
   - sub-02
   - sub-03
   - sub-05
-
-subject_mode: multi
 
 # --- Splits ---
 splits:
@@ -58,7 +58,7 @@ splits:
 
 # --- Sliding window ---
 sliding_window:
-  feature_context_trs: 30     # Expanded from 10 → 30 (#4)
+  feature_context_trs: 30
   stride: 1
   temporal_jitter: 2
 
@@ -70,32 +70,55 @@ dataloader:
   pin_memory: true
 
 # =====================================================================
-# Model config — V3 with improvements
+# Model — BrainFlowCSFM
 # =====================================================================
-model_version: v1
 
 brainflow:
   output_dim: 1000
-  reg_weight: 0.5              # Auxiliary regression loss weight (#1)
 
+  # Velocity network (DiT backbone)
   velocity_net:
     output_dim: 1000
     hidden_dim: 1024
-    proj_dim: 256
     n_blocks: 4
     n_heads: 8
     dropout: 0.1
     modality_dropout: 0.3
-    max_seq_len: 31            # 30 past + 1 current (#4)
-    temporal_attn_layers: 2    # Temporal self-attention (#5)
+    max_seq_len: 31
+    temporal_attn_layers: 2
+
+  # Source Variational Encoder (CSFM core)
+  source_ve:
+    hidden_dim: 1024
+    depth: 4
+    num_heads: 8
+    num_queries: 16
+    dropout: 0.1
+    use_variational: true
+    init_logvar: 1.0
+    fixed_std: 1.0
+
+  # CSFM loss weights
+  kld_weight: 5.0
+  kld_target_std: 1.0
+  align_weight: 1.0
+  detach_ut: false
 
 # =====================================================================
-# Solver args (validation inference)
+# CSFM Transport
+# =====================================================================
+transport:
+  path_type: Linear
+  prediction: velocity
+  time_dist_type: uniform
+  time_dist_shift: 1.0
+
+# =====================================================================
+# Solver (validation inference)
 # =====================================================================
 solver_args:
-  method: midpoint             # More accurate than euler
-  time_points: 50              # More steps for better accuracy (#3)
-  cfg_scale: 0.0               # CFG at inference (0 = disabled) (#3)
+  method: euler
+  time_points: 50
 
 # =====================================================================
 # Training
@@ -113,4 +136,4 @@ training:
   ema_decay: 0.999
 
 # --- Output ---
-output_dir: outputs/brainflow_direct_v3
+output_dir: outputs/brainflow_csfm

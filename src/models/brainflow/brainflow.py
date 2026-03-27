@@ -1,46 +1,40 @@
-"""BrainFlow Direct v3 — Flow Matching + Aux Reg + Contrastive in fMRI Space.
+"""BrainFlow CSFM — Condition-dependent Source Flow Matching for fMRI.
 
-Key features (NSD-inspired improvements):
-  - MultiTokenFusion: per-modality proj + modality embeddings → preserve token identity
-  - Temporal Self-Attention: model temporal dependencies in context
-  - Auxiliary Regression Head: direct fMRI supervision (DETACHED from encoder)
-  - Contrastive Branch: InfoNCE loss in 256-D projected space
-  - Classifier-Free Guidance (CFG) at inference
-  - 4 SimpleFiLMBlocks for velocity estimation
+Adapted from CSFM (https://arxiv.org/abs/2602.05951).
+
+Key idea: Instead of random Gaussian noise as source x₀, learn a
+condition-dependent source distribution via a variational encoder (SourceVE).
 
 Architecture:
   Context (B, T, [mod_dims...])
-    → MultiTokenFusion: per-mod proj + modality_emb → concat → (B, T, hidden)
-    → Temporal Self-Attention (2 layers) → refined context
+    → MultiTokenFusion: per-mod proj + modality_emb → (B, T, hidden)
+    → Temporal Self-Attention → context_encoded
+
+  SourceVE(context_encoded)
+    → Cross-attention with learnable queries → μ, log_var → x₀
 
   Training:
-    context_encoded (shared) → flow branch (gradient flows to encoder)
-    context_encoded.detach() → pool → RegressionHead → fmri_reg
-    fmri_reg → contrastive projections → InfoNCE loss
-    total_loss = flow_loss + reg_weight * reg_loss + cont_weight * cont_loss
+    t ~ shifted_uniform,  xt = (1-t)*x₁ + t*x₀,  ut = x₀ - x₁
+    v_pred = VelocityNet(xt, t, context_encoded)
+    loss = MSE(v_pred, ut) + kld_weight * KLD + align_weight * align
 
   Inference:
-    x_init = 0 → ODE solve with CFG guidance → fmri_pred
-
-Usage:
-    python src/train_brainflow_direct.py --config src/configs/brainflow_nsd.yaml
+    x₀ = SourceVE(context) → ODE solve → x₁ (fMRI)
 """
 
 import math
-import random
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from flow_matching.path import AffineProbPath
-from flow_matching.path.scheduler import CondOTScheduler
-from flow_matching.solver import ODESolver
+from .transport import create_transport, Sampler
 
 
 # =============================================================================
 # Building Blocks
 # =============================================================================
+
 
 class SinusoidalPosEmb(nn.Module):
     """Sinusoidal positional embedding for diffusion timestep."""
@@ -67,40 +61,33 @@ class SubjectLayers(nn.Module):
         super().__init__()
         self.weights = nn.Parameter(torch.empty(n_subjects, in_channels, out_channels))
         self.bias = nn.Parameter(torch.empty(n_subjects, out_channels)) if bias else None
-
-        self.weights.data.normal_(0, 1.0 / in_channels ** 0.5)
+        self.weights.data.normal_(0, 1.0 / in_channels**0.5)
         if self.bias is not None:
-            self.bias.data.normal_(0, 1.0 / in_channels ** 0.5)
+            self.bias.data.normal_(0, 1.0 / in_channels**0.5)
 
     def forward(self, x: torch.Tensor, subject_ids: torch.Tensor) -> torch.Tensor:
         w = self.weights[subject_ids]
         out = torch.einsum("bd,bdo->bo", x, w)
         if self.bias is not None:
-            b = self.bias[subject_ids]
-            out = out + b
+            out = out + self.bias[subject_ids]
         return out
 
 
 # =============================================================================
-# MultiTokenFusion — NSD-style per-modality token preservation
+# MultiTokenFusion — per-modality projection + modality embeddings
 # =============================================================================
 
+
 class MultiTokenFusion(nn.Module):
-    """NSD-style fusion: per-modality projection + modality embeddings.
+    """Per-modality projection + modality embeddings, then average across mods.
 
-    Unlike LinearFusion (concat on feature dim → destroys modality identity),
-    this module projects each modality to hidden_dim and adds a learnable
-    modality embedding so downstream attention can distinguish token origins.
-
-    Output: (B, T, hidden_dim) — modalities are concatenated along feature dim
-    AFTER individual projection, preserving modality-aware information via embeddings.
+    Output: (B, T, hidden_dim)
     """
 
     def __init__(
         self,
         modality_dims: list[int],
         hidden_dim: int = 1024,
-        proj_dim: int = 256,
         max_seq_len: int = 11,
         dropout: float = 0.1,
         modality_dropout: float = 0.3,
@@ -109,11 +96,9 @@ class MultiTokenFusion(nn.Module):
         self.n_modalities = len(modality_dims)
         self.modality_dims = modality_dims
         self.hidden_dim = hidden_dim
-        self.proj_dim = proj_dim
         self.max_seq_len = max_seq_len
         self.modality_dropout = modality_dropout
 
-        # Per-modality projection: mod_dim → hidden_dim (direct, like NSD)
         self.projectors = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(dim, hidden_dim),
@@ -123,13 +108,10 @@ class MultiTokenFusion(nn.Module):
             for dim in modality_dims
         ])
 
-        # Learnable modality embeddings (NSD improvement)
-        # Each modality gets a unique embedding so attention can distinguish origins
         self.modality_emb = nn.Parameter(
             torch.randn(self.n_modalities, hidden_dim) * 0.02
         )
 
-        # Output projection: hidden_dim → hidden_dim (with dropout)
         self.output_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -138,59 +120,40 @@ class MultiTokenFusion(nn.Module):
         )
 
     def forward(self, modality_features: list[torch.Tensor]) -> torch.Tensor:
-        """
-        Args:
-            modality_features: List of M tensors, each (B, T, mod_dim_i).
-
-        Returns:
-            context: (B, T, hidden_dim) fused context.
-        """
         B, T = modality_features[0].shape[:2]
         T = min(T, self.max_seq_len)
 
-        # Project each modality and add modality embedding
         projected = []
         for i, (feat, proj) in enumerate(zip(modality_features, self.projectors)):
-            h = proj(feat[:, :T])  # (B, T, hidden_dim)
-            h = h + self.modality_emb[i]  # broadcast (hidden_dim,) → (B, T, hidden_dim)
+            h = proj(feat[:, :T])
+            h = h + self.modality_emb[i]
             projected.append(h)
 
-        # Modality dropout during training
         if self.training and self.modality_dropout > 0:
             keep_mask = (
                 torch.rand(B, 1, self.n_modalities, device=projected[0].device)
                 > self.modality_dropout
             )
-            # Ensure at least one modality is kept
-            all_dropped = (keep_mask.sum(dim=2, keepdim=True) == 0)
+            all_dropped = keep_mask.sum(dim=2, keepdim=True) == 0
             keep_mask[:, :, 0:1] = torch.max(keep_mask[:, :, 0:1], all_dropped)
-
             for i in range(self.n_modalities):
-                projected[i] = projected[i] * keep_mask[:, :, i:i+1]
+                projected[i] = projected[i] * keep_mask[:, :, i : i + 1]
 
-        # Average across modalities (preserves temporal structure)
-        # Each projected[i] is (B, T, hidden_dim) with modality_emb baked in
-        x = torch.stack(projected, dim=0).mean(dim=0)  # (B, T, hidden_dim)
-
-        # Output projection
-        context = self.output_proj(x)  # (B, T, hidden_dim)
-        return context
+        x = torch.stack(projected, dim=0).mean(dim=0)
+        return self.output_proj(x)
 
 
 # =============================================================================
-# SimpleFiLMBlock — FiLM (time) + FFN + CrossAttn (no Time-Adaptive KV)
+# SimpleFiLMBlock — FiLM (time) + FFN + CrossAttn
 # =============================================================================
+
 
 class SimpleFiLMBlock(nn.Module):
-    """Simplified residual block: FiLM + FFN + cross-attention."""
+    """Residual block: FiLM conditioning + FFN + cross-attention."""
 
     def __init__(self, dim: int, time_dim: int, context_dim: int, n_heads: int = 8, dropout: float = 0.1):
         super().__init__()
-
-        # FiLM: time → scale/shift for hidden state
         self.film = nn.Linear(time_dim, dim * 2)
-
-        # FFN
         self.norm1 = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * 4),
@@ -199,8 +162,6 @@ class SimpleFiLMBlock(nn.Module):
             nn.Linear(dim * 4, dim),
             nn.Dropout(dropout),
         )
-
-        # Cross-attention (Q=hidden, KV=context)
         self.norm_q = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(context_dim)
         self.cross_attn = nn.MultiheadAttention(
@@ -209,35 +170,27 @@ class SimpleFiLMBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        # FiLM conditioning
         scale_shift = self.film(t_emb)
         scale, shift = scale_shift.chunk(2, dim=-1)
         h = self.norm1(x) * (1 + scale) + shift
         x = x + self.ffn(h)
 
-        # Cross-attention (standard, no time-adaptive KV)
         q = self.norm_q(x).unsqueeze(1)
         kv = self.norm_kv(context)
         attn_out, _ = self.cross_attn(q, kv, kv)
         x = x + attn_out.squeeze(1)
-
         return x
 
 
 # =============================================================================
-# VelocityNet — Velocity Network with Temporal Self-Attention
+# VelocityNet — context encoder + velocity estimation
 # =============================================================================
 
-class VelocityNet(nn.Module):
-    """Velocity network v3 with temporal self-attention context refinement.
 
-    Architecture:
-      1. LinearFusion: per-modality proj → concat → (B, T, hidden)
-      2. Temporal Self-Attention: 2-layer TransformerEncoder for temporal reasoning
-      3. Input: x_t (B, V) → Linear → (B, hidden)
-      4. Time: sinusoidal → MLP → + subject embedding → t_emb
-      5. N blocks of SimpleFiLMBlock(h, t_emb, context)
-      6. SubjectLayers output head → (B, V)
+class VelocityNet(nn.Module):
+    """Velocity network: MultiTokenFusion → Temporal Self-Attention → FiLM blocks.
+
+    This serves as the "DiT" backbone in the CSFM framework.
     """
 
     def __init__(
@@ -245,7 +198,6 @@ class VelocityNet(nn.Module):
         output_dim: int = 1000,
         hidden_dim: int = 1024,
         modality_dims: list[int] = None,
-        proj_dim: int = 256,
         n_blocks: int = 4,
         n_heads: int = 8,
         dropout: float = 0.1,
@@ -259,22 +211,19 @@ class VelocityNet(nn.Module):
         self.hidden_dim = hidden_dim
         self.modality_dims = modality_dims or [1408]
 
-        # --- MultiTokenFusion (NSD-style) ---
+        # --- Fusion ---
         self.fusion_block = MultiTokenFusion(
             modality_dims=self.modality_dims,
             hidden_dim=hidden_dim,
-            proj_dim=proj_dim,
             max_seq_len=max_seq_len,
             dropout=dropout,
             modality_dropout=modality_dropout,
         )
 
-        # --- Temporal positional embedding ---
+        # --- Temporal position + self-attention ---
         self.context_pos_emb = nn.Parameter(
             torch.randn(1, max_seq_len, hidden_dim) * 0.02
         )
-
-        # --- Temporal Self-Attention (#5: model temporal dependencies) ---
         self.temporal_attn = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=hidden_dim,
@@ -289,20 +238,20 @@ class VelocityNet(nn.Module):
         )
         self.temporal_norm = nn.LayerNorm(hidden_dim)
 
-        # --- Input projection ---
+        # --- Input projection (xt → hidden) ---
         self.input_proj = nn.Sequential(
             nn.Linear(output_dim, hidden_dim),
             nn.GELU(),
         )
 
-        # --- Time embedding MLP ---
+        # --- Time embedding ---
         self.time_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # --- Subject Embedding ---
+        # --- Subject embedding ---
         self.subject_emb = nn.Embedding(n_subjects, hidden_dim)
 
         # --- Velocity blocks ---
@@ -311,41 +260,32 @@ class VelocityNet(nn.Module):
             for _ in range(n_blocks)
         ])
 
-        # --- Output ---
+        # --- Output (zero-init for stable start) ---
         self.final_norm = nn.LayerNorm(hidden_dim)
         self.output_layer = nn.Linear(hidden_dim, output_dim)
-
-        # Zero-init output for stable start
         nn.init.constant_(self.output_layer.weight, 0)
         nn.init.constant_(self.output_layer.bias, 0)
 
-    def encode_context_from_cond(self, cond: torch.Tensor) -> torch.Tensor:
-        """Encode concatenated context tensor via linear fusion + temporal attention.
+    def encode_context(self, cond: torch.Tensor) -> torch.Tensor:
+        """Encode concatenated context → fused temporal representation.
 
         Args:
-            cond: (B, T, total_context_dim) pre-concatenated modality features.
+            cond: (B, T, total_context_dim) pre-concatenated modalities.
 
         Returns:
-            context_encoded: (B, T, hidden_dim) fused + temporally refined context.
+            (B, T, hidden_dim) refined context.
         """
-        # Split into per-modality tensors
         splits = []
         offset = 0
         for dim in self.modality_dims:
-            splits.append(cond[:, :, offset:offset + dim])
+            splits.append(cond[:, :, offset : offset + dim])
             offset += dim
 
-        # Linear fusion: (B, T, hidden_dim)
         context = self.fusion_block(splits)
-
-        # Add temporal positional embedding
         T = context.shape[1]
         context = context + self.context_pos_emb[:, :T, :]
-
-        # Temporal self-attention: model sequential patterns
         context = self.temporal_attn(context)
         context = self.temporal_norm(context)
-
         return context
 
     def forward(
@@ -357,13 +297,14 @@ class VelocityNet(nn.Module):
         subject_ids: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
-        """
+        """Predict velocity v(xt, t, context).
+
         Args:
-            x:                    (B, output_dim) noisy fMRI at time t.
-            t:                    (B,) or scalar, timestep in [0, 1].
-            cond:                 (B, T, total_dim) concatenated context.
-            pre_encoded_context:  (B, T, hidden_dim) already-fused context.
-            subject_ids:          (B,) long tensor of subject indices.
+            x:                   (B, output_dim) noisy state xt.
+            t:                   (B,) timestep in [0, 1].
+            cond:                (B, T, total_dim) raw context (optional).
+            pre_encoded_context: (B, T, hidden_dim) pre-encoded context.
+            subject_ids:         (B,) long tensor of subject indices.
 
         Returns:
             v_pred: (B, output_dim) predicted velocity.
@@ -371,64 +312,212 @@ class VelocityNet(nn.Module):
         if t.dim() == 0:
             t = t.expand(x.shape[0])
 
-        # --- Encode context (skip if pre-encoded) ---
+        # Context
         if pre_encoded_context is not None:
             context_encoded = pre_encoded_context
         elif cond is not None:
-            context_encoded = self.encode_context_from_cond(cond)
+            context_encoded = self.encode_context(cond)
         else:
             context_encoded = torch.zeros(
                 x.shape[0], 1, self.hidden_dim, device=x.device, dtype=x.dtype
             )
 
-        # --- Embeddings ---
+        # Embeddings
         t_emb = self.time_mlp(SinusoidalPosEmb(self.hidden_dim)(t))
-
         if subject_ids is not None:
             t_emb = t_emb + self.subject_emb(subject_ids)
 
-        # --- Forward through velocity blocks ---
+        # Forward
         h = self.input_proj(x)
-
         for block in self.blocks:
             h = block(h, t_emb, context_encoded)
 
-        # --- Output ---
         h = self.final_norm(h)
         return self.output_layer(h)
 
 
 # =============================================================================
-# BrainFlow — Top-level Model with Auxiliary Regression + CFG
+# SourceVE — Variational Encoder for learned source distribution
 # =============================================================================
 
-def info_nce_loss(z_pred, z_target, temperature=0.07):
-    """Bidirectional InfoNCE loss in projected space.
 
-    Args:
-        z_pred:   (B, D) L2-normalized prediction embeddings.
-        z_target: (B, D) L2-normalized target embeddings.
-        temperature: softmax temperature.
+class SourceVE(nn.Module):
+    """Variational encoder that maps encoded context → learned source x₀.
 
-    Returns:
-        loss: scalar, average of pred→target and target→pred NCE.
+    Architecture: learnable queries → cross-attention with context → self-attn → mean/logvar heads.
+    Uses 16 query tokens → flatten → linear → output_dim.
+
+    This replaces the random Gaussian source in standard flow matching.
     """
-    logits = z_pred @ z_target.T / temperature  # (B, B)
-    labels = torch.arange(logits.shape[0], device=logits.device)
-    loss_p2t = F.cross_entropy(logits, labels)
-    loss_t2p = F.cross_entropy(logits.T, labels)
-    return (loss_p2t + loss_t2p) / 2
+
+    def __init__(
+        self,
+        context_dim: int = 1024,
+        output_dim: int = 1000,
+        hidden_dim: int = 1024,
+        depth: int = 4,
+        num_heads: int = 8,
+        num_queries: int = 16,
+        dropout: float = 0.1,
+        use_variational: bool = True,
+        init_logvar: float = 1.0,
+        fixed_std: float = None,
+    ):
+        super().__init__()
+        self.num_queries = num_queries
+        self.hidden_dim = hidden_dim
+        self.use_variational = use_variational
+        self.fixed_std = fixed_std
+
+        # Learnable query tokens
+        self.query_tokens = nn.Parameter(torch.randn(1, num_queries, hidden_dim) * 0.02)
+        self.query_pos_emb = nn.Parameter(torch.randn(1, num_queries, hidden_dim) * 0.02)
+
+        # Input projection (context_dim → hidden_dim if different)
+        self.input_proj = nn.Linear(context_dim, hidden_dim) if context_dim != hidden_dim else nn.Identity()
+
+        # Perceiver layers: cross-attn + self-attn + FFN
+        self.layers = nn.ModuleList()
+        for _ in range(depth):
+            self.layers.append(nn.ModuleDict({
+                "norm_q": nn.LayerNorm(hidden_dim),
+                "norm_kv": nn.LayerNorm(hidden_dim),
+                "cross_attn": nn.MultiheadAttention(
+                    hidden_dim, num_heads, dropout=dropout, batch_first=True,
+                ),
+                "norm_sa": nn.LayerNorm(hidden_dim),
+                "self_attn": nn.MultiheadAttention(
+                    hidden_dim, num_heads, dropout=dropout, batch_first=True,
+                ),
+                "norm_ffn": nn.LayerNorm(hidden_dim),
+                "ffn": nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim * 4),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim * 4, hidden_dim),
+                    nn.Dropout(dropout),
+                ),
+            }))
+
+        # Output heads: queries → flatten → mean/logvar → output_dim
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.mean_head = nn.Linear(num_queries * hidden_dim, output_dim)
+
+        if use_variational and fixed_std is None:
+            self.log_var_head = nn.Linear(num_queries * hidden_dim, output_dim)
+        else:
+            self.log_var_head = None
+
+        self._init_weights(init_logvar)
+
+    def _init_weights(self, init_logvar):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        if self.log_var_head is not None:
+            nn.init.normal_(self.log_var_head.weight, std=1e-4)
+            nn.init.constant_(self.log_var_head.bias, init_logvar)
+
+    def forward(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Map encoded context → source distribution parameters.
+
+        Args:
+            context: (B, T, context_dim) encoded context from VelocityNet.
+
+        Returns:
+            x0:      (B, output_dim) sampled source (reparameterized).
+            mu:      (B, output_dim) mean.
+            log_var: (B, output_dim) or None if not variational.
+        """
+        B = context.shape[0]
+
+        # Project context to hidden_dim
+        kv = self.input_proj(context)
+
+        # Initialize queries
+        queries = self.query_tokens.expand(B, -1, -1) + self.query_pos_emb
+
+        # Perceiver layers
+        for layer in self.layers:
+            # Cross-attention
+            q_norm = layer["norm_q"](queries)
+            kv_norm = layer["norm_kv"](kv)
+            attn_out, _ = layer["cross_attn"](q_norm, kv_norm, kv_norm)
+            queries = queries + attn_out
+
+            # Self-attention
+            sa_out, _ = layer["self_attn"](layer["norm_sa"](queries), layer["norm_sa"](queries), layer["norm_sa"](queries))
+            queries = queries + sa_out
+
+            # FFN
+            queries = queries + layer["ffn"](layer["norm_ffn"](queries))
+
+        # Output: flatten all query tokens → mean/logvar
+        queries = self.norm(queries)
+        flat = queries.reshape(B, -1)  # (B, num_queries * hidden_dim)
+
+        mu = self.mean_head(flat)  # (B, output_dim)
+
+        if self.use_variational:
+            if self.fixed_std is not None:
+                log_var = torch.full_like(mu, math.log(self.fixed_std**2))
+            else:
+                log_var = self.log_var_head(flat)
+        else:
+            log_var = None
+
+        # Reparameterize
+        if log_var is not None and self.training:
+            std = torch.exp(0.5 * log_var)
+            x0 = mu + torch.randn_like(mu) * std
+        else:
+            x0 = mu
+
+        return x0, mu, log_var
 
 
-class BrainFlow(nn.Module):
-    """Flow matching v3 with auxiliary regression, contrastive, and CFG.
+# =============================================================================
+# KLD and Align losses (from CSFM)
+# =============================================================================
 
-    NSD-inspired improvements:
-      - MultiTokenFusion: modality embeddings preserve token identity
-      - Gradient isolation: .detach() prevents reg from conflicting with flow
-      - Contrastive branch: InfoNCE in 256-D for ranking signal
-      - Deeper regression head: 4-layer MLP
-      - CFG at inference (trained with 10% context dropout)
+
+def var_kld_loss(mu: torch.Tensor, log_var: torch.Tensor, target_std: float = 1.0) -> torch.Tensor:
+    """Variance-only KLD loss (CSFM default): regularize var without penalizing mu.
+
+    KLD = -0.5 * mean(1 + log_var - var), scaled to target_std.
+    """
+    var = log_var.exp()
+    if target_std != 1.0:
+        sigma2_star = target_std**2
+        var = var / sigma2_star
+        log_var = log_var - math.log(sigma2_star)
+    return -0.5 * torch.mean(1 + log_var - var)
+
+
+def normalized_l2_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Normalized L2 loss (CSFM align loss): MSE between L2-normalized vectors."""
+    pred = F.normalize(pred, p=2, dim=-1)
+    target = F.normalize(target, p=2, dim=-1)
+    return F.mse_loss(pred, target)
+
+
+# =============================================================================
+# BrainFlowCSFM — Top-level model
+# =============================================================================
+
+
+class BrainFlowCSFM(nn.Module):
+    """CSFM-style Flow Matching for fMRI generation.
+
+    Components:
+      1. VelocityNet: context encoder + velocity estimator (our "DiT")
+      2. SourceVE: variational encoder producing learned source x₀
+      3. Transport: CSFM path sampling + timestep scheduling
+
+    Loss = diffusion_loss + kld_weight * kld_loss + align_weight * align_loss
     """
 
     def __init__(
@@ -436,131 +525,107 @@ class BrainFlow(nn.Module):
         output_dim: int = 1000,
         velocity_net_params: dict = None,
         n_subjects: int = 4,
-        reg_weight: float = 1.0,
-        cont_weight: float = 0.1,
-        cont_dim: int = 256,
+        source_ve_params: dict = None,
+        kld_weight: float = 5.0,
+        kld_target_std: float = 1.0,
+        align_weight: float = 1.0,
+        detach_ut: bool = False,
+        transport_params: dict = None,
     ):
         super().__init__()
         self.output_dim = output_dim
-        self.reg_weight = reg_weight
-        self.cont_weight = cont_weight
+        self.kld_weight = kld_weight
+        self.kld_target_std = kld_target_std
+        self.align_weight = align_weight
+        self.detach_ut = detach_ut
 
-        # Velocity network
+        # --- Velocity Network ---
         vn_cfg = dict(velocity_net_params or {})
         vn_cfg.setdefault("output_dim", output_dim)
         vn_cfg.setdefault("n_subjects", n_subjects)
         self.velocity_net = VelocityNet(**vn_cfg)
 
-        # --- Deepened Regression Head (NSD: 4-layer instead of 2) ---
-        hidden_dim = vn_cfg.get("hidden_dim", 1024)
-        reg_hidden = hidden_dim * 2  # 1024 → 2048 intermediate
-        self.reg_head = nn.Sequential(
-            nn.Linear(hidden_dim, reg_hidden),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(reg_hidden, reg_hidden),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(reg_hidden, reg_hidden),
-            nn.GELU(),
-        )
-        self.reg_output = nn.Linear(reg_hidden, output_dim)
+        # --- Source Variational Encoder ---
+        sve_cfg = dict(source_ve_params or {})
+        sve_cfg.setdefault("context_dim", vn_cfg.get("hidden_dim", 1024))
+        sve_cfg.setdefault("output_dim", output_dim)
+        sve_cfg.setdefault("hidden_dim", vn_cfg.get("hidden_dim", 1024))
+        self.source_ve = SourceVE(**sve_cfg)
 
-        # --- Contrastive Projection Heads (NSD improvement) ---
-        self.contrastive_proj = nn.Sequential(
-            nn.Linear(output_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, cont_dim),
-        )
-        self.target_proj = nn.Sequential(
-            nn.Linear(output_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, cont_dim),
-        )
+        # --- CSFM Transport ---
+        tp_cfg = dict(transport_params or {})
+        tp_cfg.setdefault("path_type", "Linear")
+        tp_cfg.setdefault("prediction", "velocity")
+        tp_cfg.setdefault("time_dist_type", "uniform")
+        tp_cfg.setdefault("time_dist_shift", 1.0)
+        self.transport = create_transport(**tp_cfg)
 
-        # OT-CFM path
-        self.path = AffineProbPath(scheduler=CondOTScheduler())
-
-        # Log parameters
+        # Log parameter counts
         vn_params = sum(p.numel() for p in self.velocity_net.parameters())
-        reg_params = sum(p.numel() for p in self.reg_head.parameters()) + \
-                     sum(p.numel() for p in self.reg_output.parameters())
-        cont_params = sum(p.numel() for p in self.contrastive_proj.parameters()) + \
-                      sum(p.numel() for p in self.target_proj.parameters())
-        total = vn_params + reg_params + cont_params
-        print(f"[BrainFlow] VelocityNet: {vn_params:,} params")
-        print(f"[BrainFlow] RegressionHead: {reg_params:,} params")
-        print(f"[BrainFlow] ContrastiveHeads: {cont_params:,} params")
-        print(f"[BrainFlow] Total: {total:,} params "
-              f"(reg_w={reg_weight}, cont_w={cont_weight})")
+        sve_params = sum(p.numel() for p in self.source_ve.parameters())
+        total = vn_params + sve_params
+        print(f"[BrainFlowCSFM] VelocityNet: {vn_params:,} params")
+        print(f"[BrainFlowCSFM] SourceVE: {sve_params:,} params")
+        print(f"[BrainFlowCSFM] Total: {total:,} params")
+        print(f"[BrainFlowCSFM] Loss weights: kld={kld_weight}, align={align_weight}, detach_ut={detach_ut}")
 
     def compute_loss(
         self,
         context: torch.Tensor,
         target: torch.Tensor,
         subject_ids: torch.Tensor = None,
-        starting_distribution: torch.Tensor = None,
     ) -> dict[str, torch.Tensor]:
-        """Compute flow + regression + contrastive loss.
-
-        NSD-style gradient isolation:
-          - Flow branch: gradient flows through encoder (updates fusion + DiT)
-          - Reg branch: .detach() prevents conflict (updates reg head + proj only)
+        """Compute CSFM training loss.
 
         Args:
-            context: (B, T, total_dim) concatenated multimodal context.
-            target:  (B, output_dim) ground truth fMRI.
-            subject_ids: (B,) long tensor of subject indices.
+            context: (B, T, total_dim) concatenated multimodal features.
+            target:  (B, output_dim) ground-truth fMRI (x₁).
+            subject_ids: (B,) subject indices.
 
         Returns:
-            dict with keys: total_loss, flow_loss, align_loss, cont_loss, kld_loss.
+            dict with: total_loss, flow_loss, kld_loss, align_loss.
         """
-        # 1. Encode context once (shared)
-        context_encoded = self.velocity_net.encode_context_from_cond(context)
+        x1 = target
 
-        # 2. Regression branch with gradient isolation (NSD improvement)
-        # .detach() prevents regression from pulling the shared encoder
-        ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
-        ctx_pooled = ctx_detached.mean(dim=1)  # (B, hidden)
-        reg_hidden = self.reg_head(ctx_pooled)
-        fmri_pred = self.reg_output(reg_hidden)
+        # 1. Encode context (shared between velocity net and source VE)
+        context_encoded = self.velocity_net.encode_context(context)
 
-        reg_loss = F.mse_loss(fmri_pred, target)
+        # 2. Generate learned source x₀ via SourceVE
+        x0, mu, log_var = self.source_ve(context_encoded)
 
-        # 3. Contrastive loss in 256-D projected space (NSD improvement)
-        z_pred = F.normalize(self.contrastive_proj(fmri_pred), dim=-1)
-        z_target = F.normalize(self.target_proj(target), dim=-1)
-        cont_loss = info_nce_loss(z_pred, z_target)
+        # 3. Sample timestep and interpolate
+        t = self.transport.sample_timestep(x1)
+        t, xt, ut = self.transport.path_sampler.plan(t, x0, x1)
 
-        # 4. Flow matching source distribution (x_0)
-        x_1 = target
-        if starting_distribution is not None:
-            x_0 = starting_distribution
-        else:
-            x_0 = torch.randn_like(x_1)
-
-        # 5. Flow matching (gradient flows to encoder)
-        t = torch.rand(x_1.shape[0], device=x_1.device)
-        sample_info = self.path.sample(t=t, x_0=x_0, x_1=x_1)
-
+        # 4. Predict velocity
         v_pred = self.velocity_net(
-            x=sample_info.x_t,
-            t=sample_info.t,
-            pre_encoded_context=context_encoded,  # ✅ gradient flows
+            x=xt,
+            t=t,
+            pre_encoded_context=context_encoded,
             subject_ids=subject_ids,
         )
 
-        flow_loss = F.mse_loss(v_pred, sample_info.dx_t)
+        # 5. Diffusion loss (optionally detach ut from source encoder)
+        ut_target = ut.detach() if self.detach_ut else ut
+        flow_loss = F.mse_loss(v_pred, ut_target)
 
-        # 6. Total loss
-        total_loss = flow_loss + self.reg_weight * reg_loss + self.cont_weight * cont_loss
+        # 6. KLD loss (regularize source variance)
+        if log_var is not None:
+            kld_loss = var_kld_loss(mu, log_var, target_std=self.kld_target_std)
+        else:
+            kld_loss = torch.tensor(0.0, device=target.device)
+
+        # 7. Align loss (source mean should approximate target)
+        align_loss = normalized_l2_loss(mu, x1)
+
+        # 8. Total
+        total_loss = flow_loss + self.kld_weight * kld_loss + self.align_weight * align_loss
 
         return {
             "total_loss": total_loss,
             "flow_loss": flow_loss,
-            "align_loss": reg_loss,    # compat key
-            "cont_loss": cont_loss,
-            "kld_loss": torch.tensor(0.0, device=target.device),
+            "kld_loss": kld_loss,
+            "align_loss": align_loss,
         }
 
     @torch.inference_mode()
@@ -568,76 +633,43 @@ class BrainFlow(nn.Module):
         self,
         context: torch.Tensor,
         n_timesteps: int = 50,
-        solver_method: str = "midpoint",
+        solver_method: str = "euler",
         subject_ids: torch.Tensor = None,
-        cfg_scale: float = 0.0,
     ) -> torch.Tensor:
-        """Generate fMRI by solving ODE from zeros, optionally with CFG.
-
-        Classifier-Free Guidance (when cfg_scale > 0):
-          v_guided = v_uncond + cfg_scale * (v_cond - v_uncond)
+        """Generate fMRI by solving ODE from learned source.
 
         Args:
-            context:        (B, T, total_dim) concatenated context.
-            n_timesteps:    Number of ODE solver steps.
-            solver_method:  ODE solver method.
-            subject_ids:    (B,) long tensor of subject indices.
-            cfg_scale:      CFG guidance scale (0 = no guidance).
+            context:       (B, T, total_dim) concatenated context.
+            n_timesteps:   ODE solver steps.
+            solver_method: "euler", "midpoint", or "dopri5".
+            subject_ids:   (B,) subject indices.
 
         Returns:
             fmri_pred: (B, output_dim) predicted fMRI.
         """
-        B = context.shape[0]
-        device = context.device
-        dtype = context.dtype
+        # 1. Encode context
+        context_encoded = self.velocity_net.encode_context(context)
 
-        # 1. Encode context once
-        context_encoded = self.velocity_net.encode_context_from_cond(context)
+        # 2. Generate source x₀ from SourceVE (use mean, no sampling)
+        x0, _, _ = self.source_ve(context_encoded)
 
-        # 2. Start from zeros (deterministic → optimal PCC)
-        x_init = torch.zeros(B, self.output_dim, device=device, dtype=dtype)
+        # 3. Create ODE sampler
+        sampler = Sampler(self.transport)
+        sample_fn = sampler.sample_ode(
+            sampling_method=solver_method,
+            num_steps=n_timesteps,
+        )
 
-        if cfg_scale > 0:
-            # CFG: also compute unconditional context (zeros)
-            uncond_context = torch.zeros_like(context)
-            uncond_encoded = self.velocity_net.encode_context_from_cond(uncond_context)
-
-            # Manual ODE solve with CFG
-            T_grid = torch.linspace(0, 1, n_timesteps, device=device, dtype=dtype)
-            dt = 1.0 / (n_timesteps - 1)
-            x = x_init
-
-            for i in range(n_timesteps - 1):
-                t_val = T_grid[i]
-                t_batch = t_val.expand(B)
-
-                v_cond = self.velocity_net(
-                    x=x, t=t_batch,
-                    pre_encoded_context=context_encoded,
-                    subject_ids=subject_ids,
-                )
-                v_uncond = self.velocity_net(
-                    x=x, t=t_batch,
-                    pre_encoded_context=uncond_encoded,
-                    subject_ids=subject_ids,
-                )
-                v_guided = v_uncond + cfg_scale * (v_cond - v_uncond)
-                x = x + dt * v_guided
-
-            return x
-        else:
-            # Standard ODE solve (no CFG)
-            solver = ODESolver(velocity_model=self.velocity_net)
-            T = torch.linspace(0, 1, n_timesteps, device=device, dtype=dtype)
-
-            fmri_pred = solver.sample(
-                time_grid=T,
-                x_init=x_init,
-                method=solver_method,
-                step_size=1.0 / n_timesteps,
-                return_intermediates=False,
+        # 4. Wrap velocity net for ODE solver interface
+        def model_fn(x, t, **kwargs):
+            return self.velocity_net(
+                x=x, t=t,
                 pre_encoded_context=context_encoded,
                 subject_ids=subject_ids,
             )
 
-            return fmri_pred
+        # 5. Solve ODE: x₀ → x₁
+        trajectory = sample_fn(x0, model_fn)
+
+        # Return final state (last timestep)
+        return trajectory[-1]
