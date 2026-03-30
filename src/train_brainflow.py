@@ -11,12 +11,14 @@ import logging
 import math as pymath
 import random
 import shutil
+import warnings
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 import h5py
 import numpy as np
+import pywt
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
@@ -37,6 +39,64 @@ def resolve_paths(cfg: dict, project_root: Path) -> dict:
     cfg["_data_root"] = str(project_root / cfg["data_root"])
     cfg["_fmri_dir"] = str(project_root / cfg["data_root"] / cfg["fmri"]["dir"])
     return cfg
+
+
+# =============================================================================
+# Wavelet Denoising — BayesShrink + SWT (vectorized across voxels)
+# =============================================================================
+
+def vectorized_bayes_denoise_swt(
+    data: np.ndarray,
+    wavelet: str = "db4",
+    level: int = 4,
+) -> np.ndarray:
+    """Denoise a 2-D fMRI clip (T, V) using SWT + BayesShrink soft thresholding.
+
+    Applies the Stationary Wavelet Transform along the temporal axis (axis=0),
+    computes per-voxel BayesShrink thresholds for each detail sub-band, and
+    reconstructs the denoised signal via inverse SWT.
+
+    Args:
+        data:    (T, V) float32 array — time × voxels.
+        wavelet: Wavelet family name (e.g. 'db4', 'db8').
+        level:   Number of decomposition levels.
+
+    Returns:
+        Denoised array with same shape (T, V).
+    """
+    T_orig = data.shape[0]
+
+    # Pad temporal axis to satisfy 2^level divisibility for pywt.swt
+    pad_len = (pymath.ceil(T_orig / (2 ** level)) * (2 ** level)) - T_orig
+    if pad_len > 0:
+        data = np.pad(data, ((0, pad_len), (0, 0)), mode="symmetric")
+
+    # SWT decomposition along time axis
+    coeffs = pywt.swt(data, wavelet, level=level, trim_approx=False, axis=0)
+
+    # BayesShrink soft thresholding on detail coefficients
+    denoised_coeffs = []
+    for cA, cD in coeffs:
+        abs_d = np.abs(cD)
+        # MAD noise estimator per voxel
+        sigma = np.median(abs_d, axis=0) / 0.6745
+        sigma2 = sigma ** 2
+        sigma2_y = np.mean(cD ** 2, axis=0)
+        sigma_s = np.sqrt(np.maximum(sigma2_y - sigma2, 0.0))
+
+        lam = np.zeros_like(sigma)
+        mask = sigma_s > 1e-10
+        lam[mask] = sigma2[mask] / sigma_s[mask]
+        if np.any(~mask):
+            lam[~mask] = np.max(abs_d[:, ~mask], axis=0)
+
+        # Soft thresholding
+        denoised_cD = np.sign(cD) * np.maximum(abs_d - lam[None, :], 0.0)
+        denoised_coeffs.append((cA, denoised_cD))
+
+    # Inverse SWT
+    rec = pywt.iswt(denoised_coeffs, wavelet, axis=0)
+    return rec[:T_orig, :].astype(np.float32)
 
 
 # =============================================================================
@@ -76,6 +136,9 @@ class DirectFlowDataset(Dataset):
         self.temporal_jitter = cfg["sliding_window"].get("temporal_jitter", 0) if split == "train" else 0
 
         self.subject_to_idx = {s: i for i, s in enumerate(self.subjects)}
+
+        # Wavelet denoising config
+        self.use_wavelet_denoise = cfg["fmri"].get("wavelet_denoise", False)
 
         # Global fMRI normalization stats
         self.use_global_stats = cfg["fmri"].get("use_global_stats", False)
@@ -121,6 +184,18 @@ class DirectFlowDataset(Dataset):
 
         data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # Wavelet denoising (training only)
+        if self.use_wavelet_denoise and self.split == "train" and data.shape[0] >= 8:
+            w_name = self.cfg["fmri"].get("wavelet_name", "db4")
+            w_level = self.cfg["fmri"].get("wavelet_level", 4)
+            # Clamp level to max possible for this clip length
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                max_lvl = pywt.swt_max_level(data.shape[0])
+            w_level = min(w_level, max_lvl) if max_lvl > 0 else 0
+            if w_level > 0:
+                data = vectorized_bayes_denoise_swt(data, wavelet=w_name, level=w_level)
+
         if self.use_global_stats and subject in self.fmri_stats:
             stats = self.fmri_stats[subject]
             data = (data - stats["mean"][None, :]) / stats["std"][None, :]
@@ -134,7 +209,11 @@ class DirectFlowDataset(Dataset):
         if key in self._modality_dim_cache:
             return self._modality_dim_cache[key]
         for f in ctx_dir.rglob("*.npy"):
-            dim = np.load(f).shape[-1]
+            arr = np.load(f)
+            if arr.ndim == 3:
+                dim = arr.shape[1] * arr.shape[2]
+            else:
+                dim = arr.shape[-1]
             self._modality_dim_cache[key] = dim
             return dim
         raise ValueError(f"No .npy files found in {ctx_dir}")
@@ -174,7 +253,11 @@ class DirectFlowDataset(Dataset):
                             if not ctx_path.exists():
                                 ctx_path = c_dir / f"{task}_{norm_name}.npy"
                             if ctx_path.exists():
-                                ctx_arrays.append(np.load(ctx_path).astype(np.float32))
+                                arr = np.load(ctx_path).astype(np.float32)
+                                if arr.ndim == 3:
+                                    # Normalize temporal pooled features, e.g., (T, 4, 1536) -> (T, 6144)
+                                    arr = arr.reshape(arr.shape[0], -1)
+                                ctx_arrays.append(arr)
                             else:
                                 mod_dim = self._get_modality_dim(ctx_dir)
                                 ref_len = ctx_arrays[0].shape[0] if ctx_arrays else 500
@@ -205,6 +288,9 @@ class DirectFlowDataset(Dataset):
                                 self._fmri_clips[fmri_key] = fmri_t
                                 fmri_bytes += fmri_t.nelement() * 4
                                 n_fmri_clips += 1
+                                denoise_tag = " [wavelet]" if (self.use_wavelet_denoise and self.split == "train") else ""
+                                logger.info("  [%s] fMRI %d: %s T=%d%s",
+                                            self.split, n_fmri_clips, fmri_key, fmri_t.shape[0], denoise_tag)
 
                         fmri_data = self._fmri_clips[fmri_key]
                         if fmri_data is None:
@@ -439,9 +525,8 @@ def train(args):
         velocity_net_params=vn_params,
         n_subjects=len(cfg["subjects"]),
         source_ve_params=sve_params,
-        kld_weight=bf_cfg.get("kld_weight", 5.0),
+        kld_weight=bf_cfg.get("kld_weight", 3.0),
         kld_target_std=bf_cfg.get("kld_target_std", 1.0),
-        align_weight=bf_cfg.get("align_weight", 1.0),
         detach_ut=bf_cfg.get("detach_ut", False),
         transport_params=transport_params,
     ).to(device)
@@ -522,7 +607,7 @@ def train(args):
     history_file = out_dir / "history.csv"
     if start_epoch == 1:
         with open(history_file, "w") as f:
-            f.write("epoch,train_loss,flow_loss,kld_loss,align_loss,val_fmri_pcc,lr\n")
+            f.write("epoch,train_loss,flow_loss,kld_loss,val_fmri_pcc,lr\n")
 
     # Solver config
     solver_cfg = cfg.get("solver_args", {})
@@ -564,7 +649,6 @@ def train(args):
                     "loss": f"{recent['total_loss']:.4f}",
                     "flow": f"{recent['flow_loss']:.4f}",
                     "kld": f"{recent['kld_loss']:.4f}",
-                    "align": f"{recent['align_loss']:.4f}",
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                 })
 
@@ -643,7 +727,7 @@ def train(args):
             with open(history_file, "a") as f:
                 f.write(f"{epoch},{mean_train['total_loss']:.6f},"
                         f"{mean_train['flow_loss']:.6f},{mean_train['kld_loss']:.6f},"
-                        f"{mean_train['align_loss']:.6f},{mean_fmri_corr:.6f},{current_lr:.2e}\n")
+                        f"{mean_fmri_corr:.6f},{current_lr:.2e}\n")
 
             ema.restore(model)
 

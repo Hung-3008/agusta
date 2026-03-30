@@ -447,7 +447,7 @@ def load_feature_clip_npy(
         if not npy_path.exists():
             return None
 
-    data = np.load(npy_path)  # (dim, n_trs) or (n_tokens, dim, n_trs)
+    data = np.load(npy_path)  # (dim, n_trs) or (n_tokens, dim, n_trs) or (n_trs, 4, dim)
 
     if keep_tokens:
         # Expect (n_tokens, dim, n_trs) from --keep_omni_tokens conversion
@@ -456,6 +456,21 @@ def load_feature_clip_npy(
         else:
             # Old mean-pooled format (dim, n_trs) — cannot use for keep_tokens
             return None
+
+    # Handle temporal multiplexed features or (T, dim) format
+    # The old NPY format was (dim, n_trs). New format is (n_trs, bins, dim) or (n_trs, dim)
+    if data.ndim == 3:
+        # (n_trs, bins, dim) -> (n_trs, bins * dim) -> (bins * dim, n_trs)
+        T = data.shape[0]
+        data = data.reshape(T, -1).T
+    elif data.ndim == 2:
+        # We assume if the shape is exactly what's defined in the new extraction, it might be (T, dim)
+        # But we shouldn't break old (dim, T). Usually T > dim for large files, but to be simple:
+        # Just check if it matches old or new based on `dim` from `modality_cfg` if possible.
+        expected_dim = modality_cfg.get("dim")
+        if expected_dim is not None and data.shape[1] == expected_dim:
+            # It's (T, dim) -> transpose to (dim, T)
+            data = data.T
 
     return data[np.newaxis]   # (1, dim, n_trs)
 

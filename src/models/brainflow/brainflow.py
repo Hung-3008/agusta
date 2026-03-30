@@ -136,8 +136,11 @@ class MultiTokenFusion(nn.Module):
             )
             all_dropped = keep_mask.sum(dim=2, keepdim=True) == 0
             keep_mask[:, :, 0:1] = torch.max(keep_mask[:, :, 0:1], all_dropped)
+            
+            # Scale to preserve expected magnitude between train and eval!
+            scale = 1.0 / (1.0 - self.modality_dropout)
             for i in range(self.n_modalities):
-                projected[i] = projected[i] * keep_mask[:, :, i : i + 1]
+                projected[i] = projected[i] * keep_mask[:, :, i : i + 1] * scale
 
         x = torch.stack(projected, dim=0).mean(dim=0)
         return self.output_proj(x)
@@ -399,12 +402,12 @@ class SourceVE(nn.Module):
                 ),
             }))
 
-        # Output heads: queries → flatten → mean/logvar → output_dim
+        # Output heads: queries → mean pool → mean/logvar → output_dim
         self.norm = nn.LayerNorm(hidden_dim)
-        self.mean_head = nn.Linear(num_queries * hidden_dim, output_dim)
+        self.mean_head = nn.Linear(hidden_dim, output_dim)
 
         if use_variational and fixed_std is None:
-            self.log_var_head = nn.Linear(num_queries * hidden_dim, output_dim)
+            self.log_var_head = nn.Linear(hidden_dim, output_dim)
         else:
             self.log_var_head = None
 
@@ -455,17 +458,17 @@ class SourceVE(nn.Module):
             # FFN
             queries = queries + layer["ffn"](layer["norm_ffn"](queries))
 
-        # Output: flatten all query tokens → mean/logvar
+        # Output: mean pool all query tokens → mean/logvar
         queries = self.norm(queries)
-        flat = queries.reshape(B, -1)  # (B, num_queries * hidden_dim)
+        pooled = queries.mean(dim=1)  # (B, hidden_dim)
 
-        mu = self.mean_head(flat)  # (B, output_dim)
+        mu = self.mean_head(pooled)  # (B, output_dim)
 
         if self.use_variational:
             if self.fixed_std is not None:
                 log_var = torch.full_like(mu, math.log(self.fixed_std**2))
             else:
-                log_var = self.log_var_head(flat)
+                log_var = self.log_var_head(pooled)
         else:
             log_var = None
 
@@ -497,11 +500,7 @@ def var_kld_loss(mu: torch.Tensor, log_var: torch.Tensor, target_std: float = 1.
     return -0.5 * torch.mean(1 + log_var - var)
 
 
-def normalized_l2_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Normalized L2 loss (CSFM align loss): MSE between L2-normalized vectors."""
-    pred = F.normalize(pred, p=2, dim=-1)
-    target = F.normalize(target, p=2, dim=-1)
-    return F.mse_loss(pred, target)
+
 
 
 # =============================================================================
@@ -526,9 +525,8 @@ class BrainFlowCSFM(nn.Module):
         velocity_net_params: dict = None,
         n_subjects: int = 4,
         source_ve_params: dict = None,
-        kld_weight: float = 5.0,
+        kld_weight: float = 3.0,
         kld_target_std: float = 1.0,
-        align_weight: float = 1.0,
         detach_ut: bool = False,
         transport_params: dict = None,
     ):
@@ -536,7 +534,6 @@ class BrainFlowCSFM(nn.Module):
         self.output_dim = output_dim
         self.kld_weight = kld_weight
         self.kld_target_std = kld_target_std
-        self.align_weight = align_weight
         self.detach_ut = detach_ut
 
         # --- Velocity Network ---
@@ -567,7 +564,7 @@ class BrainFlowCSFM(nn.Module):
         print(f"[BrainFlowCSFM] VelocityNet: {vn_params:,} params")
         print(f"[BrainFlowCSFM] SourceVE: {sve_params:,} params")
         print(f"[BrainFlowCSFM] Total: {total:,} params")
-        print(f"[BrainFlowCSFM] Loss weights: kld={kld_weight}, align={align_weight}, detach_ut={detach_ut}")
+        print(f"[BrainFlowCSFM] Loss weights: kld={kld_weight}, detach_ut={detach_ut}")
 
     def compute_loss(
         self,
@@ -583,7 +580,7 @@ class BrainFlowCSFM(nn.Module):
             subject_ids: (B,) subject indices.
 
         Returns:
-            dict with: total_loss, flow_loss, kld_loss, align_loss.
+            dict with: total_loss, flow_loss, kld_loss, align_loss, reg_loss.
         """
         x1 = target
 
@@ -615,17 +612,13 @@ class BrainFlowCSFM(nn.Module):
         else:
             kld_loss = torch.tensor(0.0, device=target.device)
 
-        # 7. Align loss (source mean should approximate target)
-        align_loss = normalized_l2_loss(mu, x1)
-
-        # 8. Total
-        total_loss = flow_loss + self.kld_weight * kld_loss + self.align_weight * align_loss
+        # 7. Total
+        total_loss = flow_loss + self.kld_weight * kld_loss
 
         return {
             "total_loss": total_loss,
             "flow_loss": flow_loss,
             "kld_loss": kld_loss,
-            "align_loss": align_loss,
         }
 
     @torch.inference_mode()
