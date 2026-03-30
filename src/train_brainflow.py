@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import logging
 import math as pymath
 import random
@@ -184,23 +185,56 @@ class DirectFlowDataset(Dataset):
 
         data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Wavelet denoising (training only)
-        if self.use_wavelet_denoise and self.split == "train" and data.shape[0] >= 8:
-            w_name = self.cfg["fmri"].get("wavelet_name", "db4")
-            w_level = self.cfg["fmri"].get("wavelet_level", 4)
-            # Clamp level to max possible for this clip length
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                max_lvl = pywt.swt_max_level(data.shape[0])
-            w_level = min(w_level, max_lvl) if max_lvl > 0 else 0
-            if w_level > 0:
-                data = vectorized_bayes_denoise_swt(data, wavelet=w_name, level=w_level)
-
         if self.use_global_stats and subject in self.fmri_stats:
             stats = self.fmri_stats[subject]
             data = (data - stats["mean"][None, :]) / stats["std"][None, :]
 
         return data
+
+    def _batch_load_fmri(self, subject, task, clip_names):
+        """Load all clips from a single HDF5 file at once (batch read)."""
+        fmri_path = _get_fmri_filepath(str(self.fmri_dir), subject, task)
+        results = {}
+
+        with h5py.File(fmri_path, "r") as f:
+            all_keys = list(f.keys())
+            for clip_name in clip_names:
+                fmri_key = clip_name
+                if task == "friends" and clip_name.startswith("friends_"):
+                    fmri_key = clip_name[len("friends_"):]
+                elif task == "movie10" and clip_name.startswith("movie10_"):
+                    fmri_key = clip_name[len("movie10_"):]
+
+                matched = [k for k in all_keys if fmri_key in k]
+                if not matched:
+                    results[clip_name] = None
+                    continue
+                raw = f[matched[0]]
+                end = len(raw) - self.excl_end if self.excl_end > 0 else len(raw)
+                data = raw[self.excl_start:end].astype(np.float32)
+                data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+
+                if self.use_global_stats and subject in self.fmri_stats:
+                    stats = self.fmri_stats[subject]
+                    data = (data - stats["mean"][None, :]) / stats["std"][None, :]
+
+                results[clip_name] = data
+
+        return results
+
+    def _denoise_clip(self, key, data):
+        """Wavelet denoise a single clip (for parallel execution)."""
+        if data is None or data.shape[0] < 8:
+            return key, data
+        w_name = self.cfg["fmri"].get("wavelet_name", "db4")
+        w_level = self.cfg["fmri"].get("wavelet_level", 4)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            max_lvl = pywt.swt_max_level(data.shape[0])
+        w_level = min(w_level, max_lvl) if max_lvl > 0 else 0
+        if w_level > 0:
+            data = vectorized_bayes_denoise_swt(data, wavelet=w_name, level=w_level)
+        return key, data
 
     _modality_dim_cache = {}
 
@@ -219,98 +253,170 @@ class DirectFlowDataset(Dataset):
         raise ValueError(f"No .npy files found in {ctx_dir}")
 
     def _build_index_and_preload(self):
+        import os
         samples = []
         ctx_bytes = 0
         fmri_bytes = 0
         n_ctx_clips = 0
         n_fmri_clips = 0
-        logger.info("Building %s split index and preloading data...", self.split)
+        n_workers = min(os.cpu_count() or 4, 8)
+        logger.info("Building %s split index and preloading data (workers=%d)...",
+                     self.split, n_workers)
 
+        # --- Phase 1: Collect all (subject, task, clip_names) groups ---
+        clip_registry = {}  # (task, stim_type) -> list of (clip_stem, norm_name)
         for task, splits in self.splits_cfg.items():
             stim_types = splits.get(self.split, [])
             if not stim_types:
                 continue
-
             for stim_type in stim_types:
                 ref_ctx_dir = self.context_dirs[0] / task / stim_type
                 if not ref_ctx_dir.exists():
                     logger.warning("Context dir missing: %s", ref_ctx_dir)
                     continue
-
                 clip_stems = sorted(p.stem for p in ref_ctx_dir.glob("*.npy"))
+                entries = []
+                for cs in clip_stems:
+                    entries.append((cs, self._normalize_clip_name(cs, task)))
+                clip_registry[(task, stim_type)] = entries
 
-                for clip_stem in clip_stems:
-                    norm_name = self._normalize_clip_name(clip_stem, task)
+        # --- Phase 2: Load context features (parallel I/O per clip) ---
+        logger.info("  Loading context features (%d modalities)...", len(self.context_dirs))
+        for (task, stim_type), entries in clip_registry.items():
+            for clip_stem, norm_name in entries:
+                ctx_key = f"{task}/{stim_type}/{norm_name}"
+                if ctx_key in self._ctx_clips:
+                    continue
+                ctx_arrays = []
+                for ctx_dir in self.context_dirs:
+                    c_dir = ctx_dir / task / stim_type
+                    ctx_path = c_dir / f"{clip_stem}.npy"
+                    if not ctx_path.exists():
+                        ctx_path = c_dir / f"{norm_name}.npy"
+                    if not ctx_path.exists():
+                        ctx_path = c_dir / f"{task}_{norm_name}.npy"
+                    if ctx_path.exists():
+                        arr = np.load(ctx_path).astype(np.float32)
+                        if arr.ndim == 3:
+                            arr = arr.reshape(arr.shape[0], -1)
+                        ctx_arrays.append(arr)
+                    else:
+                        mod_dim = self._get_modality_dim(ctx_dir)
+                        ref_len = ctx_arrays[0].shape[0] if ctx_arrays else 500
+                        ctx_arrays.append(np.zeros((ref_len, mod_dim), dtype=np.float32))
 
-                    ctx_key = f"{task}/{stim_type}/{norm_name}"
-                    if ctx_key not in self._ctx_clips:
-                        ctx_arrays = []
-                        for ctx_dir in self.context_dirs:
-                            c_dir = ctx_dir / task / stim_type
-                            ctx_path = c_dir / f"{clip_stem}.npy"
-                            if not ctx_path.exists():
-                                ctx_path = c_dir / f"{norm_name}.npy"
-                            if not ctx_path.exists():
-                                ctx_path = c_dir / f"{task}_{norm_name}.npy"
-                            if ctx_path.exists():
-                                arr = np.load(ctx_path).astype(np.float32)
-                                if arr.ndim == 3:
-                                    # Normalize temporal pooled features, e.g., (T, 4, 1536) -> (T, 6144)
-                                    arr = arr.reshape(arr.shape[0], -1)
-                                ctx_arrays.append(arr)
-                            else:
-                                mod_dim = self._get_modality_dim(ctx_dir)
-                                ref_len = ctx_arrays[0].shape[0] if ctx_arrays else 500
-                                ctx_arrays.append(np.zeros((ref_len, mod_dim), dtype=np.float32))
+                min_len = min(arr.shape[0] for arr in ctx_arrays)
+                ctx_arrays = [arr[:min_len] for arr in ctx_arrays]
 
-                        min_len = min(arr.shape[0] for arr in ctx_arrays)
-                        ctx_arrays = [arr[:min_len] for arr in ctx_arrays]
+                ctx_data = torch.from_numpy(
+                    np.concatenate(ctx_arrays, axis=-1).astype(np.float32)
+                )
+                self._ctx_clips[ctx_key] = ctx_data
+                ctx_bytes += ctx_data.nelement() * 4
+                n_ctx_clips += 1
+        logger.info("  Loaded %d context clips (%.2f GB)", n_ctx_clips, ctx_bytes / 1e9)
 
-                        ctx_data = torch.from_numpy(
-                            np.concatenate(ctx_arrays, axis=-1).astype(np.float32)
-                        )
-                        self._ctx_clips[ctx_key] = ctx_data
-                        ctx_bytes += ctx_data.nelement() * 4
-                        n_ctx_clips += 1
+        # --- Phase 3: Batch HDF5 reads (one open per subject × task) ---
+        logger.info("  Loading fMRI data (batch HDF5 reads)...")
+        fmri_to_denoise = {}  # key -> np.ndarray (before denoising)
 
-                    for subj in self.subjects:
-                        subj_idx = self.subject_to_idx[subj]
+        for (task, stim_type), entries in clip_registry.items():
+            # Collect all clip names for this task
+            all_clip_names = []
+            clip_name_map = {}  # clip_name -> norm_name
+            for clip_stem, norm_name in entries:
+                all_clip_names.append(norm_name)
+                clip_name_map[norm_name] = (clip_stem, norm_name)
 
-                        fmri_key = f"{subj}/{task}/{norm_name}"
-                        if fmri_key not in self._fmri_clips:
-                            fmri_data = self._load_fmri_clip(subj, task, norm_name)
-                            if fmri_data is None:
-                                fmri_data = self._load_fmri_clip(subj, task, clip_stem)
-                            if fmri_data is None:
-                                self._fmri_clips[fmri_key] = None
-                            else:
-                                fmri_t = torch.from_numpy(fmri_data)
-                                self._fmri_clips[fmri_key] = fmri_t
-                                fmri_bytes += fmri_t.nelement() * 4
-                                n_fmri_clips += 1
-                                denoise_tag = " [wavelet]" if (self.use_wavelet_denoise and self.split == "train") else ""
-                                logger.info("  [%s] fMRI %d: %s T=%d%s",
-                                            self.split, n_fmri_clips, fmri_key, fmri_t.shape[0], denoise_tag)
+            for subj in self.subjects:
+                subj_idx = self.subject_to_idx[subj]
 
-                        fmri_data = self._fmri_clips[fmri_key]
-                        if fmri_data is None:
-                            continue
+                # Batch read all clips from this subject's HDF5 file
+                batch_results = self._batch_load_fmri(subj, task, all_clip_names)
 
-                        n_trs = fmri_data.shape[0]
+                # Also try clip_stem names for any that returned None
+                retry_names = []
+                for norm_name in all_clip_names:
+                    if batch_results.get(norm_name) is None:
+                        clip_stem = clip_name_map[norm_name][0]
+                        if clip_stem != norm_name:
+                            retry_names.append(clip_stem)
 
-                        for target_tr in range(0, n_trs, self.stride):
-                            samples.append({
-                                "ctx_key": ctx_key,
-                                "fmri_key": fmri_key,
-                                "task": task,
-                                "stim_type": stim_type,
-                                "clip_stem": clip_stem,
-                                "norm_name": norm_name,
-                                "subject": subj,
-                                "subject_idx": subj_idx,
-                                "target_tr": target_tr,
-                                "n_trs": n_trs,
-                            })
+                if retry_names:
+                    retry_results = self._batch_load_fmri(subj, task, retry_names)
+                    for clip_stem_name, data in retry_results.items():
+                        if data is not None:
+                            # Find corresponding norm_name
+                            for nn, (cs, _) in clip_name_map.items():
+                                if cs == clip_stem_name:
+                                    batch_results[nn] = data
+                                    break
+
+                for norm_name in all_clip_names:
+                    fmri_key = f"{subj}/{task}/{norm_name}"
+                    if fmri_key in self._fmri_clips:
+                        continue
+
+                    data = batch_results.get(norm_name)
+                    if data is None:
+                        self._fmri_clips[fmri_key] = None
+                    else:
+                        if self.use_wavelet_denoise and self.split == "train":
+                            fmri_to_denoise[fmri_key] = data
+                        else:
+                            fmri_t = torch.from_numpy(data)
+                            self._fmri_clips[fmri_key] = fmri_t
+                            fmri_bytes += fmri_t.nelement() * 4
+                            n_fmri_clips += 1
+
+        # --- Phase 4: Parallel wavelet denoising ---
+        if fmri_to_denoise:
+            logger.info("  Wavelet denoising %d clips (%d workers)...",
+                        len(fmri_to_denoise), n_workers)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = {
+                    pool.submit(self._denoise_clip, key, data): key
+                    for key, data in fmri_to_denoise.items()
+                }
+                done = 0
+                for future in concurrent.futures.as_completed(futures):
+                    key, denoised = future.result()
+                    fmri_t = torch.from_numpy(denoised)
+                    self._fmri_clips[key] = fmri_t
+                    fmri_bytes += fmri_t.nelement() * 4
+                    n_fmri_clips += 1
+                    done += 1
+                    if done % 100 == 0:
+                        logger.info("    Denoised %d / %d clips", done, len(fmri_to_denoise))
+            logger.info("  Denoising complete (%d clips)", n_fmri_clips)
+        else:
+            logger.info("  Loaded %d fMRI clips (no denoising)", n_fmri_clips)
+
+        # --- Phase 5: Build sample index ---
+        for (task, stim_type), entries in clip_registry.items():
+            for clip_stem, norm_name in entries:
+                ctx_key = f"{task}/{stim_type}/{norm_name}"
+                for subj in self.subjects:
+                    subj_idx = self.subject_to_idx[subj]
+                    fmri_key = f"{subj}/{task}/{norm_name}"
+                    fmri_data = self._fmri_clips.get(fmri_key)
+                    if fmri_data is None:
+                        continue
+                    n_trs = fmri_data.shape[0]
+                    for target_tr in range(0, n_trs, self.stride):
+                        samples.append({
+                            "ctx_key": ctx_key,
+                            "fmri_key": fmri_key,
+                            "task": task,
+                            "stim_type": stim_type,
+                            "clip_stem": clip_stem,
+                            "norm_name": norm_name,
+                            "subject": subj,
+                            "subject_idx": subj_idx,
+                            "target_tr": target_tr,
+                            "n_trs": n_trs,
+                        })
+
         total_bytes = ctx_bytes + fmri_bytes
         logger.info("Preloaded %d ctx + %d fMRI = %.2f GB → %d samples (%s)",
                      n_ctx_clips, n_fmri_clips, total_bytes / 1e9, len(samples), self.split)
