@@ -393,7 +393,7 @@ def get_dataloaders(cfg):
 # Residual Flow Matching helper
 # =============================================================================
 
-def _get_base_prediction(base_model, context):
+def _get_base_prediction(base_model, context, subject_ids: torch.Tensor):
     """Run frozen base model regression head -> (starting_dist, residual_context)."""
     base_dim = sum(base_model.velocity_net.fusion_block.modality_dims)
     base_context = context[..., :base_dim]
@@ -401,7 +401,11 @@ def _get_base_prediction(base_model, context):
 
     encoded = base_model.velocity_net.encode_context_from_cond(base_context)
     pooled = encoded.mean(dim=1)
-    starting_dist = base_model.reg_output(base_model.reg_head(pooled))
+    latent = base_model.reg_output(base_model.reg_head(pooled))
+    if base_model.velocity_net.use_subject_head:
+        starting_dist = base_model.velocity_net.subject_layers(latent, subject_ids)
+    else:
+        starting_dist = latent
 
     return starting_dist, residual_context
 
@@ -576,7 +580,9 @@ def train(args):
             starting_distribution = None
             if base_model is not None:
                 with torch.no_grad():
-                    starting_distribution, context = _get_base_prediction(base_model, context)
+                    starting_distribution, context = _get_base_prediction(
+                        base_model, context, subject_ids,
+                    )
 
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
                 losses = model.compute_loss(
@@ -635,7 +641,9 @@ def train(args):
                         synth_kwargs["cfg_scale"] = val_cfg_scale
 
                     if base_model is not None:
-                        starting_dist, context = _get_base_prediction(base_model, context)
+                        starting_dist, context = _get_base_prediction(
+                            base_model, context, subject_ids,
+                        )
                         synth_kwargs["starting_distribution"] = starting_dist
 
                     gen_fmri = model.synthesise(context, **synth_kwargs)

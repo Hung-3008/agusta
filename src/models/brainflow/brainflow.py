@@ -1,29 +1,21 @@
 """BrainFlow Direct v3 — Flow Matching + Aux Reg + Contrastive in fMRI Space.
 
-Key features (NSD-inspired improvements):
-  - MultiTokenFusion: per-modality proj + modality embeddings → preserve token identity
-  - Temporal Self-Attention: model temporal dependencies in context
-  - Auxiliary Regression Head: direct fMRI supervision (DETACHED from encoder)
-  - Contrastive Branch: InfoNCE loss in 256-D projected space
-  - Classifier-Free Guidance (CFG) at inference
-  - 4 SimpleFiLMBlocks for velocity estimation
+Key features:
+  - MultiTokenFusion: per-modality proj + modality embeddings; ``fusion_mode=concat``
+    (TRIBE-style) concatenates per-modality projections then maps to ``hidden_dim``.
+    ``fusion_mode=mean`` preserves the legacy average fusion.
+  - Temporal Self-Attention over fused context tokens
+  - Optional shared latent + SubjectLayers: velocity/regression end in ``latent_dim``,
+    then per-subject linear maps to voxels (``use_subject_head=True``, default).
+  - Auxiliary regression (encoder detached) + InfoNCE + CFG at inference
 
-Architecture:
-  Context (B, T, [mod_dims...])
-    → MultiTokenFusion: per-mod proj + modality_emb → concat → (B, T, hidden)
-    → Temporal Self-Attention (2 layers) → refined context
-
-  Training:
-    context_encoded (shared) → flow branch (gradient flows to encoder)
-    context_encoded.detach() → pool → RegressionHead → fmri_reg
-    fmri_reg → contrastive projections → InfoNCE loss
-    total_loss = flow_loss + reg_weight * reg_loss + cont_weight * cont_loss
-
-  Inference:
-    x_init = 0 → ODE solve with CFG guidance → fmri_pred
+Architecture (default, Proposal A):
+  Context → MultiTokenFusion (concat) → (B,T,H) → temporal Transformer
+  Velocity trunk → latent_head (B,H)→(B,L) → SubjectLayers → (B,V)
+  Reg: pool(detach) → reg_head → reg_output → (B,L) → same SubjectLayers → fmri_pred
 
 Usage:
-    python src/train_brainflow_direct.py --config src/configs/brainflow_nsd.yaml
+    python src/train_brainflow.py --config src/configs/brainflow.yaml
 """
 
 import math
@@ -176,14 +168,14 @@ class SubjectLayers(nn.Module):
 # =============================================================================
 
 class MultiTokenFusion(nn.Module):
-    """NSD-style fusion: per-modality projection + modality embeddings.
+    """Per-modality projection + embeddings, then mean or concat (TRIBE-style) fusion.
 
-    Unlike LinearFusion (concat on feature dim → destroys modality identity),
-    this module projects each modality to hidden_dim and adds a learnable
-    modality embedding so downstream attention can distinguish token origins.
+    ``fusion_mode="mean"``: project each modality to ``hidden_dim``, mean pool,
+    ``output_proj`` (legacy).
 
-    Output: (B, T, hidden_dim) — modalities are concatenated along feature dim
-    AFTER individual projection, preserving modality-aware information via embeddings.
+    ``fusion_mode="concat"``: project each to ``fusion_proj_dim``, add modality_emb
+    in that space, concatenate on the feature axis → ``(B,T,M*P)``, then
+    ``fusion_to_hidden`` → ``(B,T,hidden_dim)``.
     """
 
     def __init__(
@@ -194,6 +186,8 @@ class MultiTokenFusion(nn.Module):
         max_seq_len: int = 11,
         dropout: float = 0.1,
         modality_dropout: float = 0.3,
+        fusion_mode: str = "concat",
+        fusion_proj_dim: int = 384,
     ):
         super().__init__()
         self.n_modalities = len(modality_dims)
@@ -202,30 +196,52 @@ class MultiTokenFusion(nn.Module):
         self.proj_dim = proj_dim
         self.max_seq_len = max_seq_len
         self.modality_dropout = modality_dropout
+        self.fusion_mode = fusion_mode
+        self.fusion_proj_dim = fusion_proj_dim
 
-        # Per-modality projection: mod_dim → hidden_dim (direct, like NSD)
-        self.projectors = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(dim, hidden_dim),
+        if fusion_mode not in ("mean", "concat"):
+            raise ValueError(f"fusion_mode must be 'mean' or 'concat', got {fusion_mode!r}")
+
+        if fusion_mode == "mean":
+            self.projectors = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.GELU(),
+                )
+                for dim in modality_dims
+            ])
+            self.modality_emb = nn.Parameter(
+                torch.randn(self.n_modalities, hidden_dim) * 0.02
+            )
+            self.output_proj = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.GELU(),
+                nn.Dropout(dropout),
             )
-            for dim in modality_dims
-        ])
-
-        # Learnable modality embeddings (NSD improvement)
-        # Each modality gets a unique embedding so attention can distinguish origins
-        self.modality_emb = nn.Parameter(
-            torch.randn(self.n_modalities, hidden_dim) * 0.02
-        )
-
-        # Output projection: hidden_dim → hidden_dim (with dropout)
-        self.output_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+            self.fusion_to_hidden = None
+            self.concat_dim = None
+        else:
+            self.projectors = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(dim, fusion_proj_dim),
+                    nn.LayerNorm(fusion_proj_dim),
+                    nn.GELU(),
+                )
+                for dim in modality_dims
+            ])
+            self.modality_emb = nn.Parameter(
+                torch.randn(self.n_modalities, fusion_proj_dim) * 0.02
+            )
+            self.concat_dim = self.n_modalities * fusion_proj_dim
+            self.fusion_to_hidden = nn.Sequential(
+                nn.Linear(self.concat_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            self.output_proj = None
 
     def forward(self, modality_features: list[torch.Tensor]) -> torch.Tensor:
         """
@@ -238,33 +254,29 @@ class MultiTokenFusion(nn.Module):
         B, T = modality_features[0].shape[:2]
         T = min(T, self.max_seq_len)
 
-        # Project each modality and add modality embedding
         projected = []
         for i, (feat, proj) in enumerate(zip(modality_features, self.projectors)):
-            h = proj(feat[:, :T])  # (B, T, hidden_dim)
-            h = h + self.modality_emb[i]  # broadcast (hidden_dim,) → (B, T, hidden_dim)
+            h = proj(feat[:, :T])
+            h = h + self.modality_emb[i]
             projected.append(h)
 
-        # Modality dropout during training
         if self.training and self.modality_dropout > 0:
             keep_mask = (
                 torch.rand(B, 1, self.n_modalities, device=projected[0].device)
                 > self.modality_dropout
             )
-            # Ensure at least one modality is kept
             all_dropped = (keep_mask.sum(dim=2, keepdim=True) == 0)
             keep_mask[:, :, 0:1] = torch.max(keep_mask[:, :, 0:1], all_dropped)
 
             for i in range(self.n_modalities):
                 projected[i] = projected[i] * keep_mask[:, :, i:i+1]
 
-        # Average across modalities (preserves temporal structure)
-        # Each projected[i] is (B, T, hidden_dim) with modality_emb baked in
-        x = torch.stack(projected, dim=0).mean(dim=0)  # (B, T, hidden_dim)
+        if self.fusion_mode == "mean":
+            x = torch.stack(projected, dim=0).mean(dim=0)
+            return self.output_proj(x)
 
-        # Output projection
-        context = self.output_proj(x)  # (B, T, hidden_dim)
-        return context
+        x = torch.cat(projected, dim=-1)
+        return self.fusion_to_hidden(x)
 
 
 # =============================================================================
@@ -319,15 +331,10 @@ class SimpleFiLMBlock(nn.Module):
 # =============================================================================
 
 class VelocityNet(nn.Module):
-    """Velocity network v3 with temporal self-attention context refinement.
+    """Velocity network: temporal context encoder + FiLM/DiT-style blocks.
 
-    Architecture:
-      1. LinearFusion: per-modality proj → concat → (B, T, hidden)
-      2. Temporal Self-Attention: 2-layer TransformerEncoder for temporal reasoning
-      3. Input: x_t (B, V) → Linear → (B, hidden)
-      4. Time: sinusoidal → MLP → + subject embedding → t_emb
-      5. N blocks of SimpleFiLMBlock(h, t_emb, context)
-      6. SubjectLayers output head → (B, V)
+    With ``use_subject_head=True`` (Proposal A / TRIBE-style): time MLP has no
+    subject add; trunk maps to ``latent_dim`` then ``subject_layers`` → voxels.
     """
 
     def __init__(
@@ -343,13 +350,18 @@ class VelocityNet(nn.Module):
         max_seq_len: int = 31,
         n_subjects: int = 4,
         temporal_attn_layers: int = 2,
+        fusion_mode: str = "concat",
+        fusion_proj_dim: int = 384,
+        use_subject_head: bool = True,
+        latent_dim: int | None = None,
     ):
         super().__init__()
         self.output_dim = output_dim
         self.hidden_dim = hidden_dim
         self.modality_dims = modality_dims or [1408]
+        self.use_subject_head = use_subject_head
+        self.latent_dim = latent_dim if latent_dim is not None else hidden_dim
 
-        # --- MultiTokenFusion (NSD-style) ---
         self.fusion_block = MultiTokenFusion(
             modality_dims=self.modality_dims,
             hidden_dim=hidden_dim,
@@ -357,14 +369,14 @@ class VelocityNet(nn.Module):
             max_seq_len=max_seq_len,
             dropout=dropout,
             modality_dropout=modality_dropout,
+            fusion_mode=fusion_mode,
+            fusion_proj_dim=fusion_proj_dim,
         )
 
-        # --- Temporal positional embedding ---
         self.context_pos_emb = nn.Parameter(
             torch.randn(1, max_seq_len, hidden_dim) * 0.02
         )
 
-        # --- Temporal Self-Attention (#5: model temporal dependencies) ---
         self.temporal_attn = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=hidden_dim,
@@ -379,35 +391,40 @@ class VelocityNet(nn.Module):
         )
         self.temporal_norm = nn.LayerNorm(hidden_dim)
 
-        # --- Input projection ---
         self.input_proj = nn.Sequential(
             nn.Linear(output_dim, hidden_dim),
             nn.GELU(),
         )
 
-        # --- Time embedding MLP ---
         self.time_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # --- Subject Embedding ---
-        self.subject_emb = nn.Embedding(n_subjects, hidden_dim)
+        if use_subject_head:
+            self.subject_layers = SubjectLayers(self.latent_dim, output_dim, n_subjects)
+            self.subject_emb = None
+        else:
+            self.subject_layers = None
+            self.subject_emb = nn.Embedding(n_subjects, hidden_dim)
 
-        # --- Velocity blocks ---
         self.blocks = nn.ModuleList([
             SimpleFiLMBlock(hidden_dim, hidden_dim, hidden_dim, n_heads, dropout)
             for _ in range(n_blocks)
         ])
 
-        # --- Output ---
         self.final_norm = nn.LayerNorm(hidden_dim)
-        self.output_layer = nn.Linear(hidden_dim, output_dim)
-
-        # Zero-init output for stable start
-        nn.init.constant_(self.output_layer.weight, 0)
-        nn.init.constant_(self.output_layer.bias, 0)
+        if use_subject_head:
+            self.latent_head = nn.Linear(hidden_dim, self.latent_dim)
+            nn.init.constant_(self.latent_head.weight, 0)
+            nn.init.constant_(self.latent_head.bias, 0)
+            self.output_layer = None
+        else:
+            self.latent_head = None
+            self.output_layer = nn.Linear(hidden_dim, output_dim)
+            nn.init.constant_(self.output_layer.weight, 0)
+            nn.init.constant_(self.output_layer.bias, 0)
 
     def encode_context_from_cond(self, cond: torch.Tensor) -> torch.Tensor:
         """Encode concatenated context tensor via linear fusion + temporal attention.
@@ -471,20 +488,22 @@ class VelocityNet(nn.Module):
                 x.shape[0], 1, self.hidden_dim, device=x.device, dtype=x.dtype
             )
 
-        # --- Embeddings ---
         t_emb = self.time_mlp(SinusoidalPosEmb(self.hidden_dim)(t))
 
-        if subject_ids is not None:
+        if not self.use_subject_head and self.subject_emb is not None and subject_ids is not None:
             t_emb = t_emb + self.subject_emb(subject_ids)
 
-        # --- Forward through velocity blocks ---
         h = self.input_proj(x)
 
         for block in self.blocks:
             h = block(h, t_emb, context_encoded)
 
-        # --- Output ---
         h = self.final_norm(h)
+        if self.use_subject_head:
+            z = self.latent_head(h)
+            if subject_ids is None:
+                subject_ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            return self.subject_layers(z, subject_ids)
         return self.output_layer(h)
 
 
@@ -536,13 +555,14 @@ class BrainFlow(nn.Module):
         self.reg_weight = reg_weight
         self.cont_weight = cont_weight
 
-        # Velocity network
         vn_cfg = dict(velocity_net_params or {})
         vn_cfg.setdefault("output_dim", output_dim)
         vn_cfg.setdefault("n_subjects", n_subjects)
         self.velocity_net = VelocityNet(**vn_cfg)
 
         hidden_dim = vn_cfg.get("hidden_dim", 1024)
+        use_subject_head = vn_cfg.get("use_subject_head", True)
+        latent_dim = vn_cfg.get("latent_dim", hidden_dim)
 
         # --- Tensor Flow Matching (optional) ---
         self.use_tensor_fm = tensor_fm_params is not None
@@ -557,7 +577,6 @@ class BrainFlow(nn.Module):
         else:
             self.gamma_reg_weight = 0.0
 
-        # --- Deepened Regression Head (NSD: 4-layer instead of 2) ---
         reg_hidden = hidden_dim * 2
         self.reg_head = nn.Sequential(
             nn.Linear(hidden_dim, reg_hidden),
@@ -569,7 +588,8 @@ class BrainFlow(nn.Module):
             nn.Linear(reg_hidden, reg_hidden),
             nn.GELU(),
         )
-        self.reg_output = nn.Linear(reg_hidden, output_dim)
+        reg_out_dim = latent_dim if use_subject_head else output_dim
+        self.reg_output = nn.Linear(reg_hidden, reg_out_dim)
 
         # --- Contrastive Projection Heads ---
         self.contrastive_proj = nn.Sequential(
@@ -631,7 +651,13 @@ class BrainFlow(nn.Module):
         ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
         ctx_pooled = ctx_detached.mean(dim=1)  # (B, hidden)
         reg_hidden = self.reg_head(ctx_pooled)
-        fmri_pred = self.reg_output(reg_hidden)
+        latent_reg = self.reg_output(reg_hidden)
+        if self.velocity_net.use_subject_head:
+            if subject_ids is None:
+                subject_ids = torch.zeros(target.shape[0], dtype=torch.long, device=target.device)
+            fmri_pred = self.velocity_net.subject_layers(latent_reg, subject_ids)
+        else:
+            fmri_pred = latent_reg
 
         reg_loss = F.mse_loss(fmri_pred, target)
 

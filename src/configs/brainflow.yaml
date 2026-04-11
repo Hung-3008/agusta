@@ -88,6 +88,11 @@ brainflow:
     modality_dropout: 0.3
     max_seq_len: 31            # 30 past + 1 current (#4)
     temporal_attn_layers: 2    # Temporal self-attention (#5)
+    # Proposal A (TRIBE-style): concat fusion + shared latent + per-subject voxel head
+    fusion_mode: concat         # "mean" = legacy average fusion (old checkpoints)
+    fusion_proj_dim: 384
+    use_subject_head: true
+    latent_dim: 1024            # velocity/regression trunk ends here → SubjectLayers → voxels
 
 # =====================================================================
 # Solver args (validation inference)
