@@ -39,6 +39,96 @@ from flow_matching.solver import ODESolver
 
 
 # =============================================================================
+# Tensor Flow Matching — per-dimension adaptive schedule
+# =============================================================================
+
+def tensor_warp_schedule(
+    gamma: torch.Tensor, t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-dimension exponential time-warping schedule.
+
+    lambda_t = (exp(gamma * t) - 1) / (exp(gamma) - 1)
+    d_lambda  = gamma * exp(gamma * t) / (exp(gamma) - 1)
+
+    Boundary conditions: lambda(0)=0, lambda(1)=1 for any gamma.
+    When |gamma| -> 0 the limit is the standard OT schedule: lambda_t=t, d_lambda=1.
+
+    Args:
+        gamma: (B, D) per-dimension speed parameters (clamped internally).
+        t:     (B,)   timestep in [0, 1].
+
+    Returns:
+        lambda_t:   (B, D) interpolation coefficients.
+        d_lambda_t: (B, D) time-derivatives of lambda_t.
+    """
+    gamma = gamma.clamp(-5.0, 5.0)
+    t = t.unsqueeze(-1)                       # (B, 1)
+
+    exp_gt = torch.exp(gamma * t)             # (B, D)
+    exp_g = torch.exp(gamma)                  # (B, D)
+    denom = exp_g - 1.0                       # (B, D)
+
+    lambda_t = (exp_gt - 1.0) / denom
+    d_lambda_t = gamma * exp_gt / denom
+
+    small = gamma.abs() < 1e-4
+    lambda_t = torch.where(small, t.expand_as(gamma), lambda_t)
+    d_lambda_t = torch.where(small, torch.ones_like(gamma), d_lambda_t)
+
+    return lambda_t, d_lambda_t
+
+
+class TimeWarpNet(nn.Module):
+    """Predicts per-dimension (or per-group) speed parameters gamma from context.
+
+    Zero-initialized output layer so gamma=0 at init, recovering standard OT.
+    """
+
+    def __init__(
+        self,
+        context_dim: int,
+        output_dim: int,
+        warp_hidden_dim: int = 512,
+        n_groups: int | None = None,
+    ):
+        super().__init__()
+        self.output_dim = output_dim
+        self.n_groups = n_groups
+
+        out_features = n_groups if n_groups else output_dim
+        if n_groups is not None:
+            assert output_dim % n_groups == 0, (
+                f"output_dim ({output_dim}) must be divisible by n_groups ({n_groups})"
+            )
+            self.group_size = output_dim // n_groups
+        else:
+            self.group_size = 1
+
+        self.net = nn.Sequential(
+            nn.Linear(context_dim, warp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(warp_hidden_dim, warp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(warp_hidden_dim, out_features),
+        )
+
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, context_pooled: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            context_pooled: (B, context_dim) mean-pooled context.
+        Returns:
+            gamma: (B, output_dim) per-dimension speed parameters.
+        """
+        gamma = self.net(context_pooled)          # (B, out_features)
+        if self.n_groups is not None:
+            gamma = gamma.repeat_interleave(self.group_size, dim=-1)
+        return gamma
+
+
+# =============================================================================
 # Building Blocks
 # =============================================================================
 
@@ -439,6 +529,7 @@ class BrainFlow(nn.Module):
         reg_weight: float = 1.0,
         cont_weight: float = 0.1,
         cont_dim: int = 256,
+        tensor_fm_params: dict = None,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -451,9 +542,23 @@ class BrainFlow(nn.Module):
         vn_cfg.setdefault("n_subjects", n_subjects)
         self.velocity_net = VelocityNet(**vn_cfg)
 
-        # --- Deepened Regression Head (NSD: 4-layer instead of 2) ---
         hidden_dim = vn_cfg.get("hidden_dim", 1024)
-        reg_hidden = hidden_dim * 2  # 1024 → 2048 intermediate
+
+        # --- Tensor Flow Matching (optional) ---
+        self.use_tensor_fm = tensor_fm_params is not None
+        if self.use_tensor_fm:
+            tfm = dict(tensor_fm_params)
+            self.gamma_reg_weight = tfm.pop("gamma_reg_weight", 0.01)
+            self.time_warp_net = TimeWarpNet(
+                context_dim=hidden_dim,
+                output_dim=output_dim,
+                **tfm,
+            )
+        else:
+            self.gamma_reg_weight = 0.0
+
+        # --- Deepened Regression Head (NSD: 4-layer instead of 2) ---
+        reg_hidden = hidden_dim * 2
         self.reg_head = nn.Sequential(
             nn.Linear(hidden_dim, reg_hidden),
             nn.GELU(),
@@ -466,7 +571,7 @@ class BrainFlow(nn.Module):
         )
         self.reg_output = nn.Linear(reg_hidden, output_dim)
 
-        # --- Contrastive Projection Heads (NSD improvement) ---
+        # --- Contrastive Projection Heads ---
         self.contrastive_proj = nn.Sequential(
             nn.Linear(output_dim, hidden_dim),
             nn.GELU(),
@@ -478,7 +583,7 @@ class BrainFlow(nn.Module):
             nn.Linear(hidden_dim, cont_dim),
         )
 
-        # OT-CFM path
+        # OT-CFM path (fallback when TensorFM disabled)
         self.path = AffineProbPath(scheduler=CondOTScheduler())
 
         # Log parameters
@@ -487,12 +592,15 @@ class BrainFlow(nn.Module):
                      sum(p.numel() for p in self.reg_output.parameters())
         cont_params = sum(p.numel() for p in self.contrastive_proj.parameters()) + \
                       sum(p.numel() for p in self.target_proj.parameters())
-        total = vn_params + reg_params + cont_params
+        warp_params = sum(p.numel() for p in self.time_warp_net.parameters()) if self.use_tensor_fm else 0
+        total = vn_params + reg_params + cont_params + warp_params
         print(f"[BrainFlow] VelocityNet: {vn_params:,} params")
         print(f"[BrainFlow] RegressionHead: {reg_params:,} params")
         print(f"[BrainFlow] ContrastiveHeads: {cont_params:,} params")
+        if self.use_tensor_fm:
+            print(f"[BrainFlow] TimeWarpNet: {warp_params:,} params (gamma_reg={self.gamma_reg_weight})")
         print(f"[BrainFlow] Total: {total:,} params "
-              f"(reg_w={reg_weight}, cont_w={cont_weight})")
+              f"(reg_w={reg_weight}, cont_w={cont_weight}, tensor_fm={self.use_tensor_fm})")
 
     def compute_loss(
         self,
@@ -541,26 +649,49 @@ class BrainFlow(nn.Module):
 
         # 5. Flow matching (gradient flows to encoder)
         t = torch.rand(x_1.shape[0], device=x_1.device)
-        sample_info = self.path.sample(t=t, x_0=x_0, x_1=x_1)
 
-        v_pred = self.velocity_net(
-            x=sample_info.x_t,
-            t=sample_info.t,
-            pre_encoded_context=context_encoded,  # ✅ gradient flows
-            subject_ids=subject_ids,
-        )
+        gamma_reg = torch.tensor(0.0, device=target.device)
 
-        flow_loss = F.mse_loss(v_pred, sample_info.dx_t)
+        if self.use_tensor_fm:
+            # Tensor FM: per-dimension adaptive schedule
+            gamma = self.time_warp_net(ctx_pooled)              # (B, D)
+            lambda_t, d_lambda_t = tensor_warp_schedule(gamma, t)
+
+            x_t = lambda_t * x_1 + (1.0 - lambda_t) * x_0
+            target_velocity = d_lambda_t * (x_1 - x_0)
+
+            v_pred = self.velocity_net(
+                x=x_t, t=t,
+                pre_encoded_context=context_encoded,
+                subject_ids=subject_ids,
+            )
+            flow_loss = F.mse_loss(v_pred, target_velocity)
+
+            gamma_reg = gamma.pow(2).mean()
+        else:
+            # Standard OT-CFM path
+            sample_info = self.path.sample(t=t, x_0=x_0, x_1=x_1)
+
+            v_pred = self.velocity_net(
+                x=sample_info.x_t,
+                t=sample_info.t,
+                pre_encoded_context=context_encoded,
+                subject_ids=subject_ids,
+            )
+            flow_loss = F.mse_loss(v_pred, sample_info.dx_t)
 
         # 6. Total loss
-        total_loss = flow_loss + self.reg_weight * reg_loss + self.cont_weight * cont_loss
+        total_loss = (flow_loss
+                      + self.reg_weight * reg_loss
+                      + self.cont_weight * cont_loss
+                      + self.gamma_reg_weight * gamma_reg)
 
         return {
             "total_loss": total_loss,
             "flow_loss": flow_loss,
-            "align_loss": reg_loss,    # compat key
+            "align_loss": reg_loss,
             "cont_loss": cont_loss,
-            "kld_loss": torch.tensor(0.0, device=target.device),
+            "gamma_reg": gamma_reg,
         }
 
     @torch.inference_mode()
@@ -571,18 +702,24 @@ class BrainFlow(nn.Module):
         solver_method: str = "midpoint",
         subject_ids: torch.Tensor = None,
         cfg_scale: float = 0.0,
+        starting_distribution: torch.Tensor = None,
+        temperature: float = 0.0,
     ) -> torch.Tensor:
-        """Generate fMRI by solving ODE from zeros, optionally with CFG.
+        """Generate fMRI by solving ODE, optionally with CFG.
 
         Classifier-Free Guidance (when cfg_scale > 0):
           v_guided = v_uncond + cfg_scale * (v_cond - v_uncond)
 
         Args:
-            context:        (B, T, total_dim) concatenated context.
-            n_timesteps:    Number of ODE solver steps.
-            solver_method:  ODE solver method.
-            subject_ids:    (B,) long tensor of subject indices.
-            cfg_scale:      CFG guidance scale (0 = no guidance).
+            context:                (B, T, total_dim) concatenated context.
+            n_timesteps:            Number of ODE solver steps.
+            solver_method:          ODE solver method.
+            subject_ids:            (B,) long tensor of subject indices.
+            cfg_scale:              CFG guidance scale (0 = no guidance).
+            starting_distribution:  (B, output_dim) custom x_0 for Residual FM.
+                                    If None, uses low-temperature Gaussian.
+            temperature:            Std-dev of starting noise (0 = deterministic zeros,
+                                    1 = full Gaussian, 0.1-0.5 = low-temperature).
 
         Returns:
             fmri_pred: (B, output_dim) predicted fMRI.
@@ -594,8 +731,13 @@ class BrainFlow(nn.Module):
         # 1. Encode context once
         context_encoded = self.velocity_net.encode_context_from_cond(context)
 
-        # 2. Start from zeros (deterministic → optimal PCC)
-        x_init = torch.zeros(B, self.output_dim, device=device, dtype=dtype)
+        # 2. Initial point
+        if starting_distribution is not None:
+            x_init = starting_distribution.to(device=device, dtype=dtype)
+        elif temperature > 0:
+            x_init = temperature * torch.randn(B, self.output_dim, device=device, dtype=dtype)
+        else:
+            x_init = torch.zeros(B, self.output_dim, device=device, dtype=dtype)
 
         if cfg_scale > 0:
             # CFG: also compute unconditional context (zeros)

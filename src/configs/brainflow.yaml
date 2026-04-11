@@ -64,8 +64,8 @@ sliding_window:
 
 # --- DataLoader ---
 dataloader:
-  batch_size: 512
-  val_batch_size: 512
+  batch_size: 1024
+  val_batch_size: 1024
   num_workers: 4
   pin_memory: true
 
@@ -96,6 +96,7 @@ solver_args:
   method: midpoint             # More accurate than euler
   time_points: 50              # More steps for better accuracy (#3)
   cfg_scale: 0.0               # CFG at inference (0 = disabled) (#3)
+  temperature: 0.1             # Starting noise std: 0=deterministic, (0,1)=low-temp sampling
 
 # =====================================================================
 # Training

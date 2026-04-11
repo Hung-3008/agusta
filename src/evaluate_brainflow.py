@@ -91,6 +91,8 @@ def evaluate_brainflow_direct():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--n_timesteps", type=int, default=20)
     parser.add_argument("--solver_method", type=str, default="euler")
+    parser.add_argument("--temperature", type=float, default=None,
+                        help="Starting noise std (overrides config). 0=deterministic.")
     parser.add_argument("--resume", action="store_true", default=True,
                         help="Skip subjects whose per-subject npy file already exists.")
     parser.add_argument("--no_resume", dest="resume", action="store_false")
@@ -267,13 +269,16 @@ def evaluate_brainflow_direct():
                 ctx_batch = torch.from_numpy(all_contexts[bi:be]).to(device)
                 subj_batch = torch.full((B,), subject_idx, dtype=torch.long, device=device)
 
+                solver_args = cfg.get("solver_args", {})
+                temperature = args.temperature if args.temperature is not None else solver_args.get("temperature", 0.0)
                 synth_kwargs = dict(
                     n_timesteps=args.n_timesteps,
                     solver_method=args.solver_method,
                     subject_ids=subj_batch,
+                    temperature=temperature,
                 )
                 if model_version == "v3":
-                    cfg_scale = cfg.get("solver_args", {}).get("cfg_scale", 0.0)
+                    cfg_scale = solver_args.get("cfg_scale", 0.0)
                     if cfg_scale > 0:
                         synth_kwargs["cfg_scale"] = cfg_scale
 
