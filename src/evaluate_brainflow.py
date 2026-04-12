@@ -64,7 +64,11 @@ def load_context_for_clip(
             ctx_path = c_dir / f"{task}_{clip_name}.npy"
         
         if ctx_path.exists():
-            ctx_arrays.append(np.load(ctx_path).astype(np.float32))
+            arr = np.load(ctx_path).astype(np.float32)
+            # Flatten 3-D features (T, N, D) → (T, N*D)
+            if arr.ndim == 3:
+                arr = arr.reshape(arr.shape[0], -1)
+            ctx_arrays.append(arr)
         else:
             # Zero-pad missing modality
             key = str(ctx_dir)

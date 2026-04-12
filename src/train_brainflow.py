@@ -170,7 +170,11 @@ class DirectFlowDataset(Dataset):
                             if not ctx_path.exists():
                                 ctx_path = c_dir / f"{task}_{norm_name}.npy"
                             if ctx_path.exists():
-                                ctx_arrays.append(np.load(ctx_path).astype(np.float32))
+                                arr = np.load(ctx_path).astype(np.float32)
+                                # Flatten 3-D features (T, N, D) → (T, N*D)
+                                if arr.ndim == 3:
+                                    arr = arr.reshape(arr.shape[0], -1)
+                                ctx_arrays.append(arr)
                             else:
                                 mod_dim = self._get_modality_dim(ctx_dir)
                                 ref_len = ctx_arrays[0].shape[0] if ctx_arrays else 500
