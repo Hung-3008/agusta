@@ -122,8 +122,10 @@ def evaluate_brainflow_direct():
     subject_to_idx = {s: i for i, s in enumerate(subjects)}
 
     # Sliding window config
-    feature_context_trs = cfg["sliding_window"].get("feature_context_trs", 10)
-    feat_seq_len = feature_context_trs + 1  # 10 past + 1 current
+    feature_past_trs = cfg["sliding_window"].get("feature_past_trs",
+                          cfg["sliding_window"].get("feature_context_trs", 10))
+    feature_future_trs = cfg["sliding_window"].get("feature_future_trs", 0)
+    feat_seq_len = feature_past_trs + 1 + feature_future_trs
 
     # NOTE: S7 test features are pre-aligned 1:1 with target TRs
     # (e.g. 460 feature frames for 460 target TRs).
@@ -206,7 +208,7 @@ def evaluate_brainflow_direct():
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model loaded: {n_params:,} params (source_mode={source_mode})")
-    print(f"Config: hrf_delay={hrf_delay}, context_trs={feature_context_trs}, "
+    print(f"Config: hrf_delay={hrf_delay}, past_trs={feature_past_trs}, future_trs={feature_future_trs}, "
           f"n_timesteps={args.n_timesteps}, solver={args.solver_method}")
 
     # ── 2. Per-subject inference ─────────────────────────────────────────────
@@ -251,8 +253,8 @@ def evaluate_brainflow_direct():
                 actual_movie_tr = target_tr + excl_start
                 feat_current_tr = actual_movie_tr - hrf_delay
 
-                feat_start = feat_current_tr - feature_context_trs
-                feat_end = feat_current_tr + 1
+                feat_start = feat_current_tr - feature_past_trs
+                feat_end = feat_current_tr + 1 + feature_future_trs
 
                 safe_start = max(0, feat_start)
                 safe_end = min(ctx_data.shape[0], feat_end)
@@ -263,8 +265,10 @@ def evaluate_brainflow_direct():
                     ctx = np.zeros((0, ctx_data.shape[-1]), dtype=np.float32)
 
                 if ctx.shape[0] < feat_seq_len:
-                    pad_len = feat_seq_len - ctx.shape[0]
-                    ctx = np.pad(ctx, ((pad_len, 0), (0, 0)), mode="constant")
+                    pad_before = max(0, -feat_start)
+                    pad_after = feat_seq_len - ctx.shape[0] - pad_before
+                    pad_after = max(0, pad_after)
+                    ctx = np.pad(ctx, ((pad_before, pad_after), (0, 0)), mode="constant")
 
                 all_contexts.append(ctx)
 

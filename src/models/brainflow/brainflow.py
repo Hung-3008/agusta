@@ -212,6 +212,157 @@ class SubjectLayers(nn.Module):
         return out
 
 
+class NetworkSubjectLayers(nn.Module):
+    """Per-network SubjectLayers: 7 independent per-subject linear heads.
+
+    Each Yeo functional network gets its own SubjectLayers mapping
+    latent_dim -> n_parcels_k for each subject independently.
+    Output is concatenated in network order to produce (B, total_output_dim).
+
+    Schaefer 1000Par7Net parcels are ordered: LH networks then RH networks,
+    each hemisphere in order: Vis, SomMot, DorsAttn, SalVentAttn, Limbic, Cont, Default.
+    """
+
+    SCHAEFER_7NET_PER_HEMI = [75, 74, 66, 68, 38, 61, 118]  # sum = 500
+    NETWORK_NAMES = ['Visual', 'SomMot', 'DorsAttn', 'SalVentAttn', 'Limbic', 'Cont', 'Default']
+
+    def __init__(self, in_channels: int, n_subjects: int, network_counts: list[int] | None = None):
+        super().__init__()
+        if network_counts is None:
+            # Default: Schaefer 1000 parcels, 7 networks, both hemispheres
+            network_counts = [2 * c for c in self.SCHAEFER_7NET_PER_HEMI]
+        self.network_counts = network_counts
+        self.total_output_dim = sum(network_counts)
+        self.n_networks = len(network_counts)
+
+        self.heads = nn.ModuleList([
+            SubjectLayers(in_channels, n_k, n_subjects)
+            for n_k in network_counts
+        ])
+
+        print(f"  [NetworkSubjectLayers] {self.n_networks} heads: "
+              f"{list(zip(self.NETWORK_NAMES[:self.n_networks], network_counts))} "
+              f"= {self.total_output_dim} total voxels")
+
+    def forward(self, x: torch.Tensor, subject_ids: torch.Tensor) -> torch.Tensor:
+        """Run all network heads and concatenate outputs.
+
+        Args:
+            x: (B, in_channels) shared latent representation.
+            subject_ids: (B,) subject index.
+
+        Returns:
+            (B, total_output_dim) concatenated per-network predictions.
+        """
+        parts = [head(x, subject_ids) for head in self.heads]
+        return torch.cat(parts, dim=-1)
+
+
+# =============================================================================
+# Rotary Position Embedding (RoPE)
+# =============================================================================
+
+class RotaryEmbedding(nn.Module):
+    """Precomputes sin/cos rotation frequencies for RoPE."""
+
+    def __init__(self, dim: int, max_seq_len: int = 128, theta: float = 10000.0):
+        super().__init__()
+        # dim is head_dim (hidden_dim // n_heads)
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+
+        # Precompute for max_seq_len
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.einsum('i,j->ij', t, inv_freq)  # (T, dim//2)
+        self.register_buffer('cos_cached', freqs.cos(), persistent=False)  # (T, dim//2)
+        self.register_buffer('sin_cached', freqs.sin(), persistent=False)  # (T, dim//2)
+
+    def forward(self, seq_len: int):
+        """Return (cos, sin) each of shape (seq_len, dim//2)."""
+        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+
+
+def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply RoPE rotation to x of shape (B, H, T, D).
+
+    cos, sin: (T, D//2) — broadcast over B, H.
+    Splits x into even/odd pairs and applies 2D rotation.
+    """
+    # x: (B, H, T, D), cos/sin: (T, D//2) -> (1, 1, T, D//2)
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+
+class RoPETransformerEncoderLayer(nn.Module):
+    """Transformer encoder layer with RoPE on Q/K (pre-norm architecture)."""
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        rotary_emb: RotaryEmbedding,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.rotary_emb = rotary_emb
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_drop = nn.Dropout(dropout)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pre-norm transformer with RoPE attention.
+
+        Args:
+            x: (B, T, D)
+        Returns:
+            (B, T, D)
+        """
+        B, T, D = x.shape
+
+        # --- Self-attention with RoPE ---
+        residual = x
+        x_norm = self.norm1(x)
+
+        qkv = self.qkv_proj(x_norm).reshape(B, T, 3, self.nhead, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, T, D_h)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Apply RoPE to Q, K (not V)
+        cos, sin = self.rotary_emb(T)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+
+        # Scaled dot-product attention (uses FlashAttention when available)
+        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0 if not self.training else 0.0)
+        attn_out = attn_out.transpose(1, 2).reshape(B, T, D)  # (B, T, D)
+        attn_out = self.out_proj(self.attn_drop(attn_out))
+        x = residual + attn_out
+
+        # --- FFN ---
+        x = x + self.ffn(self.norm2(x))
+
+        return x
+
+
 # =============================================================================
 # MultiTokenFusion — NSD-style per-modality token preservation
 # =============================================================================
@@ -404,6 +555,8 @@ class VelocityNet(nn.Module):
         use_subject_head: bool = True,
         latent_dim: int | None = None,
         gradient_checkpointing: bool = False,
+        network_head: bool = False,
+        use_rope: bool = False,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -412,6 +565,8 @@ class VelocityNet(nn.Module):
         self.use_subject_head = use_subject_head
         self.latent_dim = latent_dim if latent_dim is not None else hidden_dim
         self.gradient_checkpointing = gradient_checkpointing
+        self.use_rope = use_rope
+        self.network_head = network_head and use_subject_head
 
         self.fusion_block = MultiTokenFusion(
             modality_dims=self.modality_dims,
@@ -424,22 +579,38 @@ class VelocityNet(nn.Module):
             fusion_proj_dim=fusion_proj_dim,
         )
 
-        self.context_pos_emb = nn.Parameter(
-            torch.randn(1, max_seq_len, hidden_dim) * 0.02
-        )
-
-        self.temporal_attn = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=n_heads,
-                dim_feedforward=hidden_dim * 4,
-                dropout=dropout,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True,
-            ),
-            num_layers=temporal_attn_layers,
-        )
+        # --- Temporal positional encoding ---
+        if use_rope:
+            head_dim = hidden_dim // n_heads
+            self.rotary_emb = RotaryEmbedding(head_dim, max_seq_len=max_seq_len)
+            self.context_pos_emb = None  # no absolute PE when using RoPE
+            rope_layers = nn.ModuleList([
+                RoPETransformerEncoderLayer(
+                    d_model=hidden_dim,
+                    nhead=n_heads,
+                    dim_feedforward=hidden_dim * 4,
+                    dropout=dropout,
+                    rotary_emb=self.rotary_emb,
+                )
+                for _ in range(temporal_attn_layers)
+            ])
+            self.temporal_attn = rope_layers
+        else:
+            self.context_pos_emb = nn.Parameter(
+                torch.randn(1, max_seq_len, hidden_dim) * 0.02
+            )
+            self.temporal_attn = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=hidden_dim,
+                    nhead=n_heads,
+                    dim_feedforward=hidden_dim * 4,
+                    dropout=dropout,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                ),
+                num_layers=temporal_attn_layers,
+            )
         self.temporal_norm = nn.LayerNorm(hidden_dim)
 
         self.input_proj = nn.Sequential(
@@ -455,7 +626,10 @@ class VelocityNet(nn.Module):
         )
 
         if use_subject_head:
-            self.subject_layers = SubjectLayers(self.latent_dim, output_dim, n_subjects)
+            if self.network_head:
+                self.subject_layers = NetworkSubjectLayers(self.latent_dim, n_subjects)
+            else:
+                self.subject_layers = SubjectLayers(self.latent_dim, output_dim, n_subjects)
             self.subject_emb = None
         else:
             self.subject_layers = None
@@ -497,17 +671,26 @@ class VelocityNet(nn.Module):
         # Linear fusion: (B, T, hidden_dim)
         context = self.fusion_block(splits)
 
-        # Add temporal positional embedding
-        T = context.shape[1]
-        context = context + self.context_pos_emb[:, :T, :]
+        # Add absolute positional embedding (only when NOT using RoPE)
+        if self.context_pos_emb is not None:
+            T = context.shape[1]
+            context = context + self.context_pos_emb[:, :T, :]
 
-        def _temporal_fwd(x):
-            return self.temporal_norm(self.temporal_attn(x))
-
-        if self.gradient_checkpointing and self.training:
-            context = checkpoint(_temporal_fwd, context, use_reentrant=False)
+        # Temporal attention (RoPE layers apply position internally)
+        if self.use_rope:
+            for layer in self.temporal_attn:
+                if self.gradient_checkpointing and self.training:
+                    context = checkpoint(layer, context, use_reentrant=False)
+                else:
+                    context = layer(context)
+            context = self.temporal_norm(context)
         else:
-            context = _temporal_fwd(context)
+            def _temporal_fwd(x):
+                return self.temporal_norm(self.temporal_attn(x))
+            if self.gradient_checkpointing and self.training:
+                context = checkpoint(_temporal_fwd, context, use_reentrant=False)
+            else:
+                context = _temporal_fwd(context)
 
         return context
 

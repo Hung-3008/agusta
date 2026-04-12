@@ -66,8 +66,10 @@ class DirectFlowDataset(Dataset):
         self.excl_start = cfg["fmri"].get("excluded_samples_start", 0)
         self.excl_end = cfg["fmri"].get("excluded_samples_end", 0)
 
-        self.feature_context_trs = cfg["sliding_window"].get("feature_context_trs", 10)
-        self.feat_seq_len = self.feature_context_trs + 1
+        self.feature_past_trs = cfg["sliding_window"].get("feature_past_trs",
+                                  cfg["sliding_window"].get("feature_context_trs", 10))
+        self.feature_future_trs = cfg["sliding_window"].get("feature_future_trs", 0)
+        self.feat_seq_len = self.feature_past_trs + 1 + self.feature_future_trs
         self.stride = cfg["sliding_window"].get("stride", 1)
         self.hrf_delay = cfg["fmri"].get("hrf_delay", 5)
         self.temporal_jitter = cfg["sliding_window"].get("temporal_jitter", 0) if split == "train" else 0
@@ -247,14 +249,18 @@ class DirectFlowDataset(Dataset):
         if self.temporal_jitter > 0:
             feat_current_tr += random.randint(-self.temporal_jitter, self.temporal_jitter)
 
-        feat_start = feat_current_tr - self.feature_context_trs
-        feat_end = feat_current_tr + 1
+        feat_start = feat_current_tr - self.feature_past_trs
+        feat_end = feat_current_tr + 1 + self.feature_future_trs
 
         safe_start = max(0, feat_start)
         safe_end = min(ctx_data.shape[0], feat_end)
         ctx = ctx_data[safe_start:safe_end] if safe_start < safe_end else torch.zeros(0, ctx_data.shape[-1])
         if ctx.shape[0] < self.feat_seq_len:
-            ctx = F.pad(ctx, (0, 0, self.feat_seq_len - ctx.shape[0], 0))
+            # Pad at the beginning (missing past) and/or end (missing future)
+            pad_before = max(0, -feat_start)
+            pad_after = self.feat_seq_len - ctx.shape[0] - pad_before
+            pad_after = max(0, pad_after)
+            ctx = F.pad(ctx, (0, 0, pad_before, pad_after))
 
         if target_tr < fmri_data.shape[0]:
             fmri_target = fmri_data[target_tr].clone()
