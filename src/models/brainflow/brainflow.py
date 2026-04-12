@@ -20,14 +20,63 @@ Usage:
 
 import math
 import random
+import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from flow_matching.path import AffineProbPath
 from flow_matching.path.scheduler import CondOTScheduler
 from flow_matching.solver import ODESolver
+
+
+# =============================================================================
+# InDI (Inversion by Direct Iteration) — training target x_1 - x_t, recover dx/dt
+# =============================================================================
+
+def recover_velocity_indi(
+    u: torch.Tensor,
+    t: torch.Tensor,
+    min_denom: float = 1e-3,
+) -> torch.Tensor:
+    """Map InDI-trained output u ≈ (1-t)(x_1-x_0) to OT velocity v = x_1 - x_0.
+
+    ``t`` may be scalar (ODE solvers) or (B,) matching batch of ``u`` (B, D).
+    """
+    if t.dim() == 0:
+        denom = (1.0 - t).clamp(min=min_denom)
+        return u / denom
+    denom = (1.0 - t).clamp(min=min_denom)
+    while denom.dim() < u.dim():
+        denom = denom.unsqueeze(-1)
+    return u / denom
+
+
+class IndiVelocityCallable:
+    """Wraps ``VelocityNet`` for ODE integration without duplicating parameters."""
+
+    def __init__(self, net: nn.Module, min_denom: float = 1e-3):
+        self.net = net
+        self.min_denom = min_denom
+
+    def __call__(self, *, x, t, **kwargs):
+        u = self.net(x=x, t=t, **kwargs)
+        return recover_velocity_indi(u, t, self.min_denom)
+
+
+def flow_train_time_sample(
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    sqrt_bias_end: bool,
+) -> torch.Tensor:
+    """Sample t in [0, 1]. If ``sqrt_bias_end``, use t = sqrt(U) for more mass near t→1."""
+    u = torch.rand(batch_size, device=device, dtype=dtype)
+    if sqrt_bias_end:
+        return torch.sqrt(u)
+    return u
 
 
 # =============================================================================
@@ -354,6 +403,7 @@ class VelocityNet(nn.Module):
         fusion_proj_dim: int = 384,
         use_subject_head: bool = True,
         latent_dim: int | None = None,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -361,6 +411,7 @@ class VelocityNet(nn.Module):
         self.modality_dims = modality_dims or [1408]
         self.use_subject_head = use_subject_head
         self.latent_dim = latent_dim if latent_dim is not None else hidden_dim
+        self.gradient_checkpointing = gradient_checkpointing
 
         self.fusion_block = MultiTokenFusion(
             modality_dims=self.modality_dims,
@@ -449,9 +500,13 @@ class VelocityNet(nn.Module):
         T = context.shape[1]
         context = context + self.context_pos_emb[:, :T, :]
 
-        # Temporal self-attention: model sequential patterns
-        context = self.temporal_attn(context)
-        context = self.temporal_norm(context)
+        def _temporal_fwd(x):
+            return self.temporal_norm(self.temporal_attn(x))
+
+        if self.gradient_checkpointing and self.training:
+            context = checkpoint(_temporal_fwd, context, use_reentrant=False)
+        else:
+            context = _temporal_fwd(context)
 
         return context
 
@@ -496,7 +551,10 @@ class VelocityNet(nn.Module):
         h = self.input_proj(x)
 
         for block in self.blocks:
-            h = block(h, t_emb, context_encoded)
+            if self.gradient_checkpointing and self.training:
+                h = checkpoint(block, h, t_emb, context_encoded, use_reentrant=False)
+            else:
+                h = block(h, t_emb, context_encoded)
 
         h = self.final_norm(h)
         if self.use_subject_head:
@@ -549,11 +607,17 @@ class BrainFlow(nn.Module):
         cont_weight: float = 0.1,
         cont_dim: int = 256,
         tensor_fm_params: dict = None,
+        indi_flow_matching: bool = False,
+        indi_train_time_sqrt: bool = False,
+        indi_min_denom: float = 1e-3,
     ):
         super().__init__()
         self.output_dim = output_dim
         self.reg_weight = reg_weight
         self.cont_weight = cont_weight
+        self.indi_flow_matching = indi_flow_matching
+        self.indi_train_time_sqrt = indi_train_time_sqrt
+        self.indi_min_denom = indi_min_denom
 
         vn_cfg = dict(velocity_net_params or {})
         vn_cfg.setdefault("output_dim", output_dim)
@@ -566,6 +630,14 @@ class BrainFlow(nn.Module):
 
         # --- Tensor Flow Matching (optional) ---
         self.use_tensor_fm = tensor_fm_params is not None
+        if indi_flow_matching and self.use_tensor_fm:
+            warnings.warn(
+                "indi_flow_matching is ignored when tensor_fm is enabled "
+                "(InDI recovery is only defined for linear OT paths).",
+                stacklevel=2,
+            )
+        self._indi_effective = indi_flow_matching and not self.use_tensor_fm
+
         if self.use_tensor_fm:
             tfm = dict(tensor_fm_params)
             self.gamma_reg_weight = tfm.pop("gamma_reg_weight", 0.01)
@@ -620,7 +692,8 @@ class BrainFlow(nn.Module):
         if self.use_tensor_fm:
             print(f"[BrainFlow] TimeWarpNet: {warp_params:,} params (gamma_reg={self.gamma_reg_weight})")
         print(f"[BrainFlow] Total: {total:,} params "
-              f"(reg_w={reg_weight}, cont_w={cont_weight}, tensor_fm={self.use_tensor_fm})")
+              f"(reg_w={reg_weight}, cont_w={cont_weight}, tensor_fm={self.use_tensor_fm}, "
+              f"indi={self._indi_effective}, indi_t_sqrt={indi_train_time_sqrt})")
 
     def compute_loss(
         self,
@@ -674,12 +747,10 @@ class BrainFlow(nn.Module):
             x_0 = torch.randn_like(x_1)
 
         # 5. Flow matching (gradient flows to encoder)
-        t = torch.rand(x_1.shape[0], device=x_1.device)
-
         gamma_reg = torch.tensor(0.0, device=target.device)
 
         if self.use_tensor_fm:
-            # Tensor FM: per-dimension adaptive schedule
+            t = torch.rand(x_1.shape[0], device=x_1.device, dtype=x_1.dtype)
             gamma = self.time_warp_net(ctx_pooled)              # (B, D)
             lambda_t, d_lambda_t = tensor_warp_schedule(gamma, t)
 
@@ -695,7 +766,12 @@ class BrainFlow(nn.Module):
 
             gamma_reg = gamma.pow(2).mean()
         else:
-            # Standard OT-CFM path
+            t = flow_train_time_sample(
+                x_1.shape[0],
+                x_1.device,
+                x_1.dtype,
+                sqrt_bias_end=self.indi_train_time_sqrt and self._indi_effective,
+            )
             sample_info = self.path.sample(t=t, x_0=x_0, x_1=x_1)
 
             v_pred = self.velocity_net(
@@ -704,7 +780,11 @@ class BrainFlow(nn.Module):
                 pre_encoded_context=context_encoded,
                 subject_ids=subject_ids,
             )
-            flow_loss = F.mse_loss(v_pred, sample_info.dx_t)
+            if self._indi_effective:
+                target_velocity = x_1 - sample_info.x_t
+            else:
+                target_velocity = sample_info.dx_t
+            flow_loss = F.mse_loss(v_pred, target_velocity)
 
         # 6. Total loss
         total_loss = (flow_loss
@@ -720,6 +800,31 @@ class BrainFlow(nn.Module):
             "gamma_reg": gamma_reg,
         }
 
+    def _build_time_grid(
+        self,
+        n_timesteps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        time_grid_warp: str | None,
+    ) -> torch.Tensor:
+        """Monotone grid in [0, 1]. ``sqrt`` uses T = sqrt(s) for finer steps near t→1."""
+        if n_timesteps < 2:
+            n_timesteps = 2
+        s = torch.linspace(0, 1, n_timesteps, device=device, dtype=dtype)
+        if time_grid_warp is None or time_grid_warp in ("", "none", "linear"):
+            return s
+        if time_grid_warp == "sqrt":
+            return torch.sqrt(s)
+        raise ValueError(
+            f"time_grid_warp must be None, 'linear', or 'sqrt', got {time_grid_warp!r}"
+        )
+
+    def _velocity_for_ode(self):
+        """OT-CFM velocity for integration; InDI-trained nets need u/(1-t) recovery."""
+        if self._indi_effective:
+            return IndiVelocityCallable(self.velocity_net, self.indi_min_denom)
+        return self.velocity_net
+
     @torch.inference_mode()
     def synthesise(
         self,
@@ -730,6 +835,7 @@ class BrainFlow(nn.Module):
         cfg_scale: float = 0.0,
         starting_distribution: torch.Tensor = None,
         temperature: float = 0.0,
+        time_grid_warp: str | None = None,
     ) -> torch.Tensor:
         """Generate fMRI by solving ODE, optionally with CFG.
 
@@ -746,6 +852,8 @@ class BrainFlow(nn.Module):
                                     If None, uses low-temperature Gaussian.
             temperature:            Std-dev of starting noise (0 = deterministic zeros,
                                     1 = full Gaussian, 0.1-0.5 = low-temperature).
+            time_grid_warp:         ``None``/``linear`` = uniform; ``sqrt`` = ``sqrt(linspace)``
+                                    for smaller Δt near t→1 (pairs with InDI inference).
 
         Returns:
             fmri_pred: (B, output_dim) predicted fMRI.
@@ -754,10 +862,8 @@ class BrainFlow(nn.Module):
         device = context.device
         dtype = context.dtype
 
-        # 1. Encode context once
         context_encoded = self.velocity_net.encode_context_from_cond(context)
 
-        # 2. Initial point
         if starting_distribution is not None:
             x_init = starting_distribution.to(device=device, dtype=dtype)
         elif temperature > 0:
@@ -765,47 +871,49 @@ class BrainFlow(nn.Module):
         else:
             x_init = torch.zeros(B, self.output_dim, device=device, dtype=dtype)
 
+        T_grid = self._build_time_grid(n_timesteps, device, dtype, time_grid_warp)
+        n_steps = T_grid.shape[0]
+        deltas = T_grid[1:] - T_grid[:-1]
+        ode_step_size = float(deltas.min().clamp_min(torch.tensor(1e-6, device=device, dtype=dtype)))
+
         if cfg_scale > 0:
-            # CFG: also compute unconditional context (zeros)
             uncond_context = torch.zeros_like(context)
             uncond_encoded = self.velocity_net.encode_context_from_cond(uncond_context)
 
-            # Manual ODE solve with CFG
-            T_grid = torch.linspace(0, 1, n_timesteps, device=device, dtype=dtype)
-            dt = 1.0 / (n_timesteps - 1)
             x = x_init
-
-            for i in range(n_timesteps - 1):
+            for i in range(n_steps - 1):
                 t_val = T_grid[i]
+                dt_i = T_grid[i + 1] - T_grid[i]
                 t_batch = t_val.expand(B)
 
-                v_cond = self.velocity_net(
+                u_cond = self.velocity_net(
                     x=x, t=t_batch,
                     pre_encoded_context=context_encoded,
                     subject_ids=subject_ids,
                 )
-                v_uncond = self.velocity_net(
+                u_uncond = self.velocity_net(
                     x=x, t=t_batch,
                     pre_encoded_context=uncond_encoded,
                     subject_ids=subject_ids,
                 )
-                v_guided = v_uncond + cfg_scale * (v_cond - v_uncond)
-                x = x + dt * v_guided
+                u_guided = u_uncond + cfg_scale * (u_cond - u_uncond)
+                if self._indi_effective:
+                    v_guided = recover_velocity_indi(u_guided, t_val, self.indi_min_denom)
+                else:
+                    v_guided = u_guided
+                x = x + dt_i * v_guided
 
             return x
-        else:
-            # Standard ODE solve (no CFG)
-            solver = ODESolver(velocity_model=self.velocity_net)
-            T = torch.linspace(0, 1, n_timesteps, device=device, dtype=dtype)
 
-            fmri_pred = solver.sample(
-                time_grid=T,
-                x_init=x_init,
-                method=solver_method,
-                step_size=1.0 / n_timesteps,
-                return_intermediates=False,
-                pre_encoded_context=context_encoded,
-                subject_ids=subject_ids,
-            )
+        solver = ODESolver(velocity_model=self._velocity_for_ode())
+        fmri_pred = solver.sample(
+            time_grid=T_grid,
+            x_init=x_init,
+            method=solver_method,
+            step_size=ode_step_size,
+            return_intermediates=False,
+            pre_encoded_context=context_encoded,
+            subject_ids=subject_ids,
+        )
 
-            return fmri_pred
+        return fmri_pred

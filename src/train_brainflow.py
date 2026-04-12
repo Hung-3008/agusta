@@ -327,25 +327,37 @@ def pearson_corr_per_dim(pred, target):
 
 
 class EMAModel:
-    def __init__(self, model, decay=0.999):
+    """EMA weights. Optional ``store_on_cpu`` frees VRAM (shadow updated on CPU)."""
+
+    def __init__(self, model, decay=0.999, store_on_cpu: bool = False):
         self.decay = decay
+        self.store_on_cpu = store_on_cpu
         self.shadow = {}
         self.backup = {}
         for name, param in model.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+                sh = param.data.clone()
+                self.shadow[name] = sh.cpu() if store_on_cpu else sh
 
     @torch.no_grad()
     def update(self, model):
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
-                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
+                if self.store_on_cpu:
+                    self.shadow[name].mul_(self.decay).add_(
+                        param.data.detach().cpu(), alpha=1 - self.decay
+                    )
+                else:
+                    self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
 
     def apply_shadow(self, model):
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
                 self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
+                sh = self.shadow[name]
+                if self.store_on_cpu:
+                    sh = sh.to(device=param.device, dtype=param.dtype, non_blocking=True)
+                param.data.copy_(sh)
 
     def restore(self, model):
         for name, param in model.named_parameters():
@@ -353,12 +365,22 @@ class EMAModel:
                 param.data.copy_(self.backup[name])
         self.backup = {}
 
+    def to_cpu_shadow(self):
+        """Move shadow tensors to CPU (e.g. after loading an old GPU checkpoint)."""
+        if not self.store_on_cpu:
+            return
+        for name in self.shadow:
+            self.shadow[name] = self.shadow[name].cpu()
+
     def state_dict(self):
         return {"shadow": self.shadow, "decay": self.decay}
 
     def load_state_dict(self, state_dict):
-        self.shadow = state_dict["shadow"]
+        self.shadow = dict(state_dict["shadow"])
         self.decay = state_dict["decay"]
+        if self.store_on_cpu:
+            for name in self.shadow:
+                self.shadow[name] = self.shadow[name].cpu()
 
 
 # =============================================================================
@@ -415,13 +437,31 @@ def _get_base_prediction(base_model, context, subject_ids: torch.Tensor):
 # =============================================================================
 
 def train(args):
-    cfg = load_config(args.config)
+    cfg_path = Path(args.config).resolve()
+    cfg = load_config(cfg_path)
     cfg = resolve_paths(cfg, PROJECT_ROOT)
+
+    if args.train_batch_size is not None:
+        cfg.setdefault("dataloader", {})["batch_size"] = int(args.train_batch_size)
+    if args.val_batch_size is not None:
+        cfg.setdefault("dataloader", {})["val_batch_size"] = int(args.val_batch_size)
+
+    logger.info("Loaded config: %s", cfg_path)
 
     torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_loader, val_loader = get_dataloaders(cfg)
+    _dl = cfg["dataloader"]
+    _bs, _vbs = _dl["batch_size"], _dl["val_batch_size"]
+    logger.info(
+        "DataLoader: train batch_size=%d → %d micro-batches/epoch (~%d samples/epoch, drop_last); "
+        "val batch_size=%d",
+        _bs,
+        len(train_loader),
+        len(train_loader) * _bs,
+        _vbs,
+    )
 
     if args.fast_dev_run:
         logger.info("Fast dev run mode")
@@ -451,6 +491,9 @@ def train(args):
         cont_weight=bf_cfg.get("cont_weight", 0.1),
         cont_dim=bf_cfg.get("cont_dim", 256),
         tensor_fm_params=bf_cfg.get("tensor_fm", None),
+        indi_flow_matching=bf_cfg.get("indi_flow_matching", False),
+        indi_train_time_sqrt=bf_cfg.get("indi_train_time_sqrt", False),
+        indi_min_denom=bf_cfg.get("indi_min_denom", 1e-3),
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -489,11 +532,14 @@ def train(args):
 
     # --- Optimizer & Scheduler ---
     tr_cfg = cfg["training"]
+    accum_steps = max(1, int(tr_cfg.get("gradient_accumulation_steps", 1)))
+    opt_steps_per_epoch = max(1, (len(train_loader) + accum_steps - 1) // accum_steps)
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=tr_cfg["lr"], weight_decay=tr_cfg["weight_decay"],
     )
 
-    total_steps = 2 if args.fast_dev_run else len(train_loader) * tr_cfg["n_epochs"]
+    total_steps = 2 if args.fast_dev_run else opt_steps_per_epoch * tr_cfg["n_epochs"]
     warmup_steps = int(total_steps * tr_cfg.get("warmup_ratio", 0.05))
     min_lr = tr_cfg.get("min_lr", 1e-6)
     base_lr = tr_cfg["lr"]
@@ -511,7 +557,16 @@ def train(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(args.config, out_dir / "config.yaml")
 
-    ema = EMAModel(model, decay=tr_cfg.get("ema_decay", 0.999))
+    ema_on_cpu = tr_cfg.get("ema_on_cpu", True)
+    ema = EMAModel(
+        model, decay=tr_cfg.get("ema_decay", 0.999), store_on_cpu=ema_on_cpu,
+    )
+    gckpt = vn_params.get("gradient_checkpointing", False)
+    logger.info(
+        "Memory opts: grad_accum=%d (~%d opt-steps/epoch), EMA_on_cpu=%s, "
+        "velocity_grad_ckpt=%s",
+        accum_steps, opt_steps_per_epoch, ema_on_cpu, gckpt,
+    )
     logger.info("EMA decay=%.4f", ema.decay)
 
     # --- Resume / Warmstart ---
@@ -560,19 +615,27 @@ def train(args):
     val_cfg_scale = solver_cfg.get("cfg_scale", 0.0)
     val_temperature = solver_cfg.get("temperature", 0.0)
 
+    context_bf16 = tr_cfg.get("context_bf16_when_amp", True)
+    pin = cfg.get("dataloader", {}).get("pin_memory", False)
+
     # --- Training loop ---
     for epoch in range(start_epoch, tr_cfg["n_epochs"] + 1):
         model.train()
         train_losses = []
+        micro_accum = 0
+        optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{tr_cfg['n_epochs']}")
         for batch_idx, batch in enumerate(pbar):
             if args.fast_dev_run and batch_idx >= 2:
                 break
 
-            context = batch["context"].to(device)
-            subject_ids = batch["subject_idx"].to(device)
-            target = batch["fmri"].to(device)
+            context = batch["context"].to(device, non_blocking=pin)
+            subject_ids = batch["subject_idx"].to(device, non_blocking=pin)
+            target = batch["fmri"].to(device, non_blocking=pin)
+            if tr_cfg["use_amp"] and context_bf16:
+                context = context.to(dtype=torch.bfloat16)
+                target = target.to(dtype=torch.bfloat16)
 
             if random.random() < 0.1:
                 context = torch.zeros_like(context)
@@ -590,29 +653,44 @@ def train(args):
                     subject_ids=subject_ids,
                     starting_distribution=starting_distribution,
                 )
-                loss = losses["total_loss"]
+                raw_loss = losses["total_loss"]
+                loss = raw_loss / accum_steps
 
-            optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            train_losses.append(float(raw_loss.detach()))
+
+            micro_accum += 1
+            if micro_accum >= accum_steps:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), tr_cfg["grad_clip"])
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                ema.update(model)
+                micro_accum = 0
+                global_step += 1
+
+                if global_step % tr_cfg["log_every_n_steps"] == 0:
+                    postfix = {
+                        "loss": f"{np.mean(train_losses[-50:]):.4f}",
+                        "flow": f"{losses['flow_loss'].item():.4f}",
+                        "reg": f"{losses['align_loss'].item():.4f}",
+                        "cont": f"{losses.get('cont_loss', torch.tensor(0.0)).item():.4f}",
+                        "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                    }
+                    if model.use_tensor_fm:
+                        postfix["g_reg"] = f"{losses['gamma_reg'].item():.4f}"
+                    pbar.set_postfix(postfix)
+
+        if micro_accum > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), tr_cfg["grad_clip"])
             optimizer.step()
             scheduler.step()
-
-            train_losses.append(loss.item())
-            global_step += 1
+            optimizer.zero_grad(set_to_none=True)
             ema.update(model)
+            global_step += 1
 
-            if global_step % tr_cfg["log_every_n_steps"] == 0:
-                postfix = {
-                    "loss": f"{np.mean(train_losses[-50:]):.4f}",
-                    "flow": f"{losses['flow_loss'].item():.4f}",
-                    "reg": f"{losses['align_loss'].item():.4f}",
-                    "cont": f"{losses.get('cont_loss', torch.tensor(0.0)).item():.4f}",
-                    "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-                }
-                if model.use_tensor_fm:
-                    postfix["g_reg"] = f"{losses['gamma_reg'].item():.4f}"
-                pbar.set_postfix(postfix)
+        if tr_cfg.get("empty_cuda_cache_each_epoch", False) and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # --- Validation ---
         mean_fmri_corr = 0.0
@@ -637,6 +715,9 @@ def train(args):
                         subject_ids=subject_ids,
                         temperature=val_temperature,
                     )
+                    tw = solver_cfg.get("time_grid_warp")
+                    if tw:
+                        synth_kwargs["time_grid_warp"] = tw
                     if val_cfg_scale > 0:
                         synth_kwargs["cfg_scale"] = val_cfg_scale
 
@@ -717,6 +798,18 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="src/configs/brainflow.yaml")
+    parser.add_argument(
+        "--train-batch-size",
+        type=int,
+        default=None,
+        help="Override dataloader.batch_size (YAML on disk must be saved; use this if unsure).",
+    )
+    parser.add_argument(
+        "--val-batch-size",
+        type=int,
+        default=None,
+        help="Override dataloader.val_batch_size.",
+    )
     parser.add_argument("--fast_dev_run", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--warmstart", type=str, default=None)

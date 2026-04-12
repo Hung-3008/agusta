@@ -58,14 +58,14 @@ splits:
 
 # --- Sliding window ---
 sliding_window:
-  feature_context_trs: 30     # Expanded from 10 → 30 (#4)
+  feature_context_trs: 30     # 0: no context
   stride: 1
   temporal_jitter: 2
 
 # --- DataLoader ---
 dataloader:
-  batch_size: 1024
-  val_batch_size: 1024
+  batch_size: 512
+  val_batch_size: 512
   num_workers: 4
   pin_memory: true
 
@@ -77,6 +77,10 @@ model_version: v1
 brainflow:
   output_dim: 1000
   reg_weight: 0.5              # Auxiliary regression loss weight (#1)
+  # InDI Flow Matching — Proposal C (OT path only; ignored if tensor_fm is set)
+  indi_flow_matching: true
+  indi_train_time_sqrt: false  # true: t = sqrt(U) for more training mass near t→1
+  indi_min_denom: 1.0e-3       # u/(1-t) clamp at inference
 
   velocity_net:
     output_dim: 1000
@@ -88,6 +92,7 @@ brainflow:
     modality_dropout: 0.3
     max_seq_len: 31            # 30 past + 1 current (#4)
     temporal_attn_layers: 2    # Temporal self-attention (#5)
+    gradient_checkpointing: true   # less VRAM in backward (more compute)
     # Proposal A (TRIBE-style): concat fusion + shared latent + per-subject voxel head
     fusion_mode: concat         # "mean" = legacy average fusion (old checkpoints)
     fusion_proj_dim: 384
@@ -102,6 +107,7 @@ solver_args:
   time_points: 50              # More steps for better accuracy (#3)
   cfg_scale: 0.0               # CFG at inference (0 = disabled) (#3)
   temperature: 0.1             # Starting noise std: 0=deterministic, (0,1)=low-temp sampling
+  time_grid_warp: sqrt          # finer Δt near t→1; pair with indi_flow_matching
 
 # =====================================================================
 # Training
@@ -117,6 +123,11 @@ training:
   log_every_n_steps: 20
   val_every_n_epochs: 10
   ema_decay: 0.999
+  # VRAM: effective batch ≈ batch_size × gradient_accumulation_steps
+  gradient_accumulation_steps: 2
+  ema_on_cpu: true                 # shadow weights on CPU (slower EMA update, less GPU)
+  context_bf16_when_amp: true      # halve context/target footprint before forward
+  empty_cuda_cache_each_epoch: false
 
 # --- Output ---
 output_dir: outputs/brainflow_direct_v3

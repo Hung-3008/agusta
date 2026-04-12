@@ -177,6 +177,12 @@ def evaluate_brainflow_direct():
             velocity_net_params=vn_params,
             n_subjects=len(subjects),
             reg_weight=reg_weight,
+            cont_weight=bf_cfg.get("cont_weight", 0.1),
+            cont_dim=bf_cfg.get("cont_dim", 256),
+            tensor_fm_params=bf_cfg.get("tensor_fm", None),
+            indi_flow_matching=bf_cfg.get("indi_flow_matching", False),
+            indi_train_time_sqrt=bf_cfg.get("indi_train_time_sqrt", False),
+            indi_min_denom=bf_cfg.get("indi_min_denom", 1e-3),
         ).to(device)
     else:
         sp_params = dict(bf_cfg.get("source_predictor", {}))
@@ -281,6 +287,9 @@ def evaluate_brainflow_direct():
                     cfg_scale = solver_args.get("cfg_scale", 0.0)
                     if cfg_scale > 0:
                         synth_kwargs["cfg_scale"] = cfg_scale
+                    tw = solver_args.get("time_grid_warp")
+                    if tw:
+                        synth_kwargs["time_grid_warp"] = tw
 
                 # Use float32 for ODE solver — bfloat16 causes overflow/NaN
                 pred = model.synthesise(
