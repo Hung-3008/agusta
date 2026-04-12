@@ -17,7 +17,7 @@ fmri:
   hrf_delay: 2
   use_global_stats: true
 
-# --- Pre-extracted encoder context latents (8 modalities) ---
+# --- Pre-extracted encoder context latents (10 modalities) ---
 context_latent_dirs:
   - Data/features_npy_pooled/vjepa2_avg_feat       # Visual (V-JEPA 2)
   - Data/features_npy_pooled/whisper                # Audio (Whisper)
@@ -27,16 +27,20 @@ context_latent_dirs:
   - Data/features_npy_pooled/qwen-2-5-omni-7b       # Multimodal (Qwen-Omni)
   - Data/features_npy_pooled/internvl3_8b_8bit      # Vision-Language (InternVL3-8B)
   - Data/features_npy_pooled/InternVL3_14B          # Vision-Language (InternVL3-14B)
+  - Data/features_npy_pooled/dinov2_giant            # Visual (DINOv2-giant multiplexed)
+  - Data/features_npy_pooled/vlm2vec_7b              # Vision-Language (VLM2Vec-7B)
 
 modality_dims:
-  - 1408   # vjepa2_avg_feat
-  - 1280   # whisper
-  - 2048   # Llama-3.2-1B
-  - 3072   # Llama-3.2-3B
-  - 2048   # qwen2-5_3B
-  - 3584   # qwen-2-5-omni-7b
-  - 3584   # internvl3_8b_8bit
-  - 5120   # InternVL3_14B
+  - 1408   # [0] vjepa2_avg_feat
+  - 1280   # [1] whisper
+  - 2048   # [2] Llama-3.2-1B
+  - 3072   # [3] Llama-3.2-3B
+  - 2048   # [4] qwen2-5_3B
+  - 3584   # [5] qwen-2-5-omni-7b
+  - 3584   # [6] internvl3_8b_8bit
+  - 5120   # [7] InternVL3_14B
+  - 6144   # [8] dinov2_giant (4 × 1536)
+  - 3584   # [9] vlm2vec_7b
 
 # --- Multi-subject training ---
 subjects:

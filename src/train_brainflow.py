@@ -637,7 +637,8 @@ def train(args):
                 context = context.to(dtype=torch.bfloat16)
                 target = target.to(dtype=torch.bfloat16)
 
-            if random.random() < 0.1:
+            cfg_drop = random.random() < 0.1
+            if cfg_drop:
                 context = torch.zeros_like(context)
 
             starting_distribution = None
@@ -652,6 +653,7 @@ def train(args):
                     context, target,
                     subject_ids=subject_ids,
                     starting_distribution=starting_distribution,
+                    skip_aux=cfg_drop,
                 )
                 raw_loss = losses["total_loss"]
                 loss = raw_loss / accum_steps

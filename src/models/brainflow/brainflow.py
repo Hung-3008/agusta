@@ -447,6 +447,7 @@ class VelocityNet(nn.Module):
             nn.GELU(),
         )
 
+        self.time_embed = SinusoidalPosEmb(hidden_dim)
         self.time_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
@@ -543,7 +544,7 @@ class VelocityNet(nn.Module):
                 x.shape[0], 1, self.hidden_dim, device=x.device, dtype=x.dtype
             )
 
-        t_emb = self.time_mlp(SinusoidalPosEmb(self.hidden_dim)(t))
+        t_emb = self.time_mlp(self.time_embed(t))
 
         if not self.use_subject_head and self.subject_emb is not None and subject_ids is not None:
             t_emb = t_emb + self.subject_emb(subject_ids)
@@ -701,6 +702,7 @@ class BrainFlow(nn.Module):
         target: torch.Tensor,
         subject_ids: torch.Tensor = None,
         starting_distribution: torch.Tensor = None,
+        skip_aux: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Compute flow + regression + contrastive loss.
 
@@ -712,32 +714,41 @@ class BrainFlow(nn.Module):
             context: (B, T, total_dim) concatenated multimodal context.
             target:  (B, output_dim) ground truth fMRI.
             subject_ids: (B,) long tensor of subject indices.
+            skip_aux: if True, skip regression and contrastive losses (used when
+                      context is zeroed out for CFG unconditional training).
 
         Returns:
-            dict with keys: total_loss, flow_loss, align_loss, cont_loss, kld_loss.
+            dict with keys: total_loss, flow_loss, align_loss, cont_loss, gamma_reg.
         """
         # 1. Encode context once (shared)
         context_encoded = self.velocity_net.encode_context_from_cond(context)
 
         # 2. Regression branch with gradient isolation (NSD improvement)
         # .detach() prevents regression from pulling the shared encoder
-        ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
-        ctx_pooled = ctx_detached.mean(dim=1)  # (B, hidden)
-        reg_hidden = self.reg_head(ctx_pooled)
-        latent_reg = self.reg_output(reg_hidden)
-        if self.velocity_net.use_subject_head:
-            if subject_ids is None:
-                subject_ids = torch.zeros(target.shape[0], dtype=torch.long, device=target.device)
-            fmri_pred = self.velocity_net.subject_layers(latent_reg, subject_ids)
+        _zero = torch.tensor(0.0, device=target.device)
+        if skip_aux:
+            reg_loss = _zero
+            cont_loss = _zero
         else:
-            fmri_pred = latent_reg
+            ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
+            ctx_pooled_reg = ctx_detached.mean(dim=1)  # (B, hidden)
+            reg_hidden = self.reg_head(ctx_pooled_reg)
+            latent_reg = self.reg_output(reg_hidden)
+            if self.velocity_net.use_subject_head:
+                if subject_ids is None:
+                    subject_ids = torch.zeros(target.shape[0], dtype=torch.long, device=target.device)
+                fmri_pred = self.velocity_net.subject_layers(latent_reg, subject_ids)
+            else:
+                fmri_pred = latent_reg
 
-        reg_loss = F.mse_loss(fmri_pred, target)
+            reg_loss = F.mse_loss(fmri_pred, target)
 
-        # 3. Contrastive loss in 256-D projected space (NSD improvement)
-        z_pred = F.normalize(self.contrastive_proj(fmri_pred), dim=-1)
-        z_target = F.normalize(self.target_proj(target), dim=-1)
-        cont_loss = info_nce_loss(z_pred, z_target)
+            # 3. Contrastive loss in 256-D projected space (NSD improvement)
+            # .detach() on fmri_pred prevents contrastive gradient from leaking
+            # through shared SubjectLayers into the velocity flow branch.
+            z_pred = F.normalize(self.contrastive_proj(fmri_pred.detach()), dim=-1)
+            z_target = F.normalize(self.target_proj(target), dim=-1)
+            cont_loss = info_nce_loss(z_pred, z_target)
 
         # 4. Flow matching source distribution (x_0)
         x_1 = target
@@ -747,11 +758,13 @@ class BrainFlow(nn.Module):
             x_0 = torch.randn_like(x_1)
 
         # 5. Flow matching (gradient flows to encoder)
-        gamma_reg = torch.tensor(0.0, device=target.device)
+        gamma_reg = _zero
 
         if self.use_tensor_fm:
             t = torch.rand(x_1.shape[0], device=x_1.device, dtype=x_1.dtype)
-            gamma = self.time_warp_net(ctx_pooled)              # (B, D)
+            # Use NON-detached pooling so TimeWarpNet gradients flow through encoder
+            ctx_pooled_flow = context_encoded.mean(dim=1)  # ✅ gradient flows
+            gamma = self.time_warp_net(ctx_pooled_flow)     # (B, D)
             lambda_t, d_lambda_t = tensor_warp_schedule(gamma, t)
 
             x_t = lambda_t * x_1 + (1.0 - lambda_t) * x_0
