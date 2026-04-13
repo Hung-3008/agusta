@@ -1,25 +1,19 @@
-"""BrainFlow Direct v3 — Flow Matching + Aux Reg + Contrastive in fMRI Space.
+"""BrainFlow — Seq2Seq Flow Matching with 1D-DiT velocity (v5) or legacy FiLM (v3/v4).
 
-Key features:
-  - MultiTokenFusion: per-modality proj + modality embeddings; ``fusion_mode=concat``
-    (TRIBE-style) concatenates per-modality projections then maps to ``hidden_dim``.
-    ``fusion_mode=mean`` preserves the legacy average fusion.
-  - Temporal Self-Attention over fused context tokens
-  - Optional shared latent + SubjectLayers: velocity/regression end in ``latent_dim``,
-    then per-subject linear maps to voxels (``use_subject_head=True``, default).
-  - Auxiliary regression (encoder detached) + InfoNCE + CFG at inference
+Seq2seq (``n_target_trs`` > 1, default):
+  - Flat ``Linear(D_total, H) → LayerNorm → GELU`` on concatenated context
+  - RoPE temporal encoder over full context TRs (no causal mask)
+  - Temporal slice to ``n_target_trs`` tokens aligned with fMRI targets
+  - ``x_t_emb + context`` hybrid conditioning + DiT blocks (AdaLN-Zero, RoPE self-attn)
+  - Optional 7 Yeo network heads (``network_head``) with optional zero-init
 
-Architecture (default, Proposal A):
-  Context → MultiTokenFusion (concat) → (B,T,H) → temporal Transformer
-  Velocity trunk → latent_head (B,H)→(B,L) → SubjectLayers → (B,V)
-  Reg: pool(detach) → reg_head → reg_output → (B,L) → same SubjectLayers → fmri_pred
+Legacy: MultiTokenFusion + FiLM + cross-attention (``use_dit_decoder: false``).
 
 Usage:
     python src/train_brainflow.py --config src/configs/brainflow.yaml
 """
 
 import math
-import random
 import warnings
 
 import torch
@@ -29,7 +23,6 @@ from torch.utils.checkpoint import checkpoint
 
 from flow_matching.path import AffineProbPath
 from flow_matching.path.scheduler import CondOTScheduler
-from flow_matching.solver import ODESolver
 
 
 # =============================================================================
@@ -232,7 +225,13 @@ class NetworkSubjectLayers(nn.Module):
     SCHAEFER_7NET_PER_HEMI = [75, 74, 66, 68, 38, 61, 118]  # sum = 500
     NETWORK_NAMES = ['Visual', 'SomMot', 'DorsAttn', 'SalVentAttn', 'Limbic', 'Cont', 'Default']
 
-    def __init__(self, in_channels: int, n_subjects: int, network_counts: list[int] | None = None):
+    def __init__(
+        self,
+        in_channels: int,
+        n_subjects: int,
+        network_counts: list[int] | None = None,
+        zero_init: bool = False,
+    ):
         super().__init__()
         if network_counts is None:
             # Default: Schaefer 1000 parcels, 7 networks, both hemispheres
@@ -245,6 +244,11 @@ class NetworkSubjectLayers(nn.Module):
             SubjectLayers(in_channels, n_k, n_subjects)
             for n_k in network_counts
         ])
+        if zero_init:
+            for head in self.heads:
+                nn.init.zeros_(head.weights)
+                if head.bias is not None:
+                    nn.init.zeros_(head.bias)
 
         print(f"  [NetworkSubjectLayers] {self.n_networks} heads: "
               f"{list(zip(self.NETWORK_NAMES[:self.n_networks], network_counts))} "
@@ -318,6 +322,7 @@ class RoPETransformerEncoderLayer(nn.Module):
         self.nhead = nhead
         self.head_dim = d_model // nhead
         self.rotary_emb = rotary_emb
+        self.attn_dropout_p = dropout
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -358,7 +363,12 @@ class RoPETransformerEncoderLayer(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
 
         # Scaled dot-product attention (uses FlashAttention when available)
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0 if not self.training else 0.0)
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+        )
         attn_out = attn_out.transpose(1, 2).reshape(B, T, D)  # (B, T, D)
         attn_out = self.out_proj(self.attn_drop(attn_out))
         x = residual + attn_out
@@ -367,6 +377,97 @@ class RoPETransformerEncoderLayer(nn.Module):
         x = x + self.ffn(self.norm2(x))
 
         return x
+
+
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """AdaLN-style modulation: x * (1 + scale) + shift. x is (B,T,D); shift/scale are (B,D)."""
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class DiT1DBlock(nn.Module):
+    """1D DiT block: AdaLN-Zero + RoPE self-attention + FFN (temporal consistency on T_target)."""
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        time_dim: int,
+        rotary_emb: RotaryEmbedding,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.rotary_emb = rotary_emb
+        self.attn_dropout_p = dropout
+
+        self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False)
+
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, 6 * d_model, bias=True),
+        )
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_drop = nn.Dropout(dropout)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(t_emb).chunk(
+            6, dim=-1
+        )
+
+        x_norm = modulate(self.norm1(x), shift_msa, scale_msa)
+        qkv = self.qkv_proj(x_norm).reshape(B, T, 3, self.nhead, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        cos, sin = self.rotary_emb(T)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(B, T, D)
+        attn_out = self.out_proj(self.attn_drop(attn_out))
+        x = x + gate_msa.unsqueeze(1) * attn_out
+
+        x_norm2 = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp.unsqueeze(1) * self.ffn(x_norm2)
+        return x
+
+
+class FlatContextProjection(nn.Module):
+    """Single ``Linear(D_total, H) → LayerNorm → GELU`` on concatenated multimodal features."""
+
+    def __init__(self, d_total: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_total, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 # =============================================================================
@@ -541,15 +642,11 @@ class SimpleFiLMBlock(nn.Module):
 
 
 # =============================================================================
-# VelocityNet — Velocity Network with Temporal Self-Attention
+# VelocityNet — Temporal encoder + DiT (seq2seq) or FiLM + cross-attn (legacy)
 # =============================================================================
 
 class VelocityNet(nn.Module):
-    """Velocity network: temporal context encoder + FiLM/DiT-style blocks.
-
-    With ``use_subject_head=True`` (Proposal A / TRIBE-style): time MLP has no
-    subject add; trunk maps to ``latent_dim`` then ``subject_layers`` → voxels.
-    """
+    """Velocity network: flat or multitoken context encoder, optional temporal slice, DiT or FiLM trunk."""
 
     def __init__(
         self,
@@ -562,6 +659,7 @@ class VelocityNet(nn.Module):
         dropout: float = 0.1,
         modality_dropout: float = 0.3,
         max_seq_len: int = 31,
+        context_trs: int | None = None,
         n_subjects: int = 4,
         temporal_attn_layers: int = 2,
         fusion_mode: str = "concat",
@@ -571,7 +669,11 @@ class VelocityNet(nn.Module):
         gradient_checkpointing: bool = False,
         network_head: bool = False,
         use_rope: bool = False,
-        n_target_trs: int = 1,  # number of target fMRI TRs predicted simultaneously
+        n_target_trs: int = 1,
+        context_encoder: str = "flat",
+        use_dit_decoder: bool = True,
+        dit_num_blocks: int | None = None,
+        zero_init_network_heads: bool = False,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -583,31 +685,47 @@ class VelocityNet(nn.Module):
         self.use_rope = use_rope
         self.network_head = network_head and use_subject_head
         self.n_target_trs = n_target_trs
-        # Learned positional embeddings for the target sequence (seq2seq mode)
-        if n_target_trs > 1:
+        self.context_encoder = context_encoder
+        self.context_trs = int(context_trs) if context_trs is not None else int(max_seq_len)
+
+        if context_encoder not in ("flat", "multitoken"):
+            raise ValueError(f"context_encoder must be 'flat' or 'multitoken', got {context_encoder!r}")
+
+        use_dit = bool(use_dit_decoder and n_target_trs > 1)
+        self._use_dit = use_dit
+        dit_depth = dit_num_blocks if dit_num_blocks is not None else n_blocks
+
+        # Learned positional embeddings for legacy seq2seq FiLM (not used with DiT + RoPE on target)
+        if n_target_trs > 1 and not use_dit:
             self.target_pos_emb = nn.Parameter(
                 torch.randn(1, n_target_trs, hidden_dim) * 0.02
             )
         else:
             self.target_pos_emb = None
 
-        self.fusion_block = MultiTokenFusion(
-            modality_dims=self.modality_dims,
-            hidden_dim=hidden_dim,
-            proj_dim=proj_dim,
-            max_seq_len=max_seq_len,
-            dropout=dropout,
-            modality_dropout=modality_dropout,
-            fusion_mode=fusion_mode,
-            fusion_proj_dim=fusion_proj_dim,
-        )
+        d_total = sum(self.modality_dims)
+        if context_encoder == "flat":
+            self.flat_context_proj = FlatContextProjection(d_total, hidden_dim)
+            self.fusion_block = None
+        else:
+            self.flat_context_proj = None
+            self.fusion_block = MultiTokenFusion(
+                modality_dims=self.modality_dims,
+                hidden_dim=hidden_dim,
+                proj_dim=proj_dim,
+                max_seq_len=max_seq_len,
+                dropout=dropout,
+                modality_dropout=modality_dropout,
+                fusion_mode=fusion_mode,
+                fusion_proj_dim=fusion_proj_dim,
+            )
 
-        # --- Temporal positional encoding ---
+        enc_max_len = max(self.context_trs, max_seq_len)
         if use_rope:
             head_dim = hidden_dim // n_heads
-            self.rotary_emb = RotaryEmbedding(head_dim, max_seq_len=max_seq_len)
-            self.context_pos_emb = None  # no absolute PE when using RoPE
-            rope_layers = nn.ModuleList([
+            self.rotary_emb = RotaryEmbedding(head_dim, max_seq_len=enc_max_len)
+            self.context_pos_emb = None
+            self.temporal_attn = nn.ModuleList([
                 RoPETransformerEncoderLayer(
                     d_model=hidden_dim,
                     nhead=n_heads,
@@ -617,11 +735,11 @@ class VelocityNet(nn.Module):
                 )
                 for _ in range(temporal_attn_layers)
             ])
-            self.temporal_attn = rope_layers
         else:
             self.context_pos_emb = nn.Parameter(
-                torch.randn(1, max_seq_len, hidden_dim) * 0.02
+                torch.randn(1, enc_max_len, hidden_dim) * 0.02
             )
+            self.rotary_emb = None
             self.temporal_attn = nn.TransformerEncoder(
                 nn.TransformerEncoderLayer(
                     d_model=hidden_dim,
@@ -650,7 +768,11 @@ class VelocityNet(nn.Module):
 
         if use_subject_head:
             if self.network_head:
-                self.subject_layers = NetworkSubjectLayers(self.latent_dim, n_subjects)
+                self.subject_layers = NetworkSubjectLayers(
+                    self.latent_dim,
+                    n_subjects,
+                    zero_init=zero_init_network_heads,
+                )
             else:
                 self.subject_layers = SubjectLayers(self.latent_dim, output_dim, n_subjects)
             self.subject_emb = None
@@ -658,10 +780,29 @@ class VelocityNet(nn.Module):
             self.subject_layers = None
             self.subject_emb = nn.Embedding(n_subjects, hidden_dim)
 
-        self.blocks = nn.ModuleList([
-            SimpleFiLMBlock(hidden_dim, hidden_dim, hidden_dim, n_heads, dropout)
-            for _ in range(n_blocks)
-        ])
+        if use_dit:
+            dec_max = max(n_target_trs, 64)
+            head_dim_d = hidden_dim // n_heads
+            self.rotary_emb_decoder = RotaryEmbedding(head_dim_d, max_seq_len=dec_max)
+            self.dit_blocks = nn.ModuleList([
+                DiT1DBlock(
+                    d_model=hidden_dim,
+                    nhead=n_heads,
+                    dim_feedforward=hidden_dim * 4,
+                    dropout=dropout,
+                    time_dim=hidden_dim,
+                    rotary_emb=self.rotary_emb_decoder,
+                )
+                for _ in range(dit_depth)
+            ])
+            self.blocks = None
+        else:
+            self.rotary_emb_decoder = None
+            self.dit_blocks = None
+            self.blocks = nn.ModuleList([
+                SimpleFiLMBlock(hidden_dim, hidden_dim, hidden_dim, n_heads, dropout)
+                for _ in range(n_blocks)
+            ])
 
         self.final_norm = nn.LayerNorm(hidden_dim)
         if use_subject_head:
@@ -676,30 +817,21 @@ class VelocityNet(nn.Module):
             nn.init.constant_(self.output_layer.bias, 0)
 
     def encode_context_from_cond(self, cond: torch.Tensor) -> torch.Tensor:
-        """Encode concatenated context tensor via linear fusion + temporal attention.
+        """Encode context: flat/multitoken fusion → temporal encoder → optional slice to ``n_target_trs``."""
+        if self.flat_context_proj is not None:
+            context = self.flat_context_proj(cond)
+        else:
+            splits = []
+            offset = 0
+            for dim in self.modality_dims:
+                splits.append(cond[:, :, offset:offset + dim])
+                offset += dim
+            context = self.fusion_block(splits)
 
-        Args:
-            cond: (B, T, total_context_dim) pre-concatenated modality features.
-
-        Returns:
-            context_encoded: (B, T, hidden_dim) fused + temporally refined context.
-        """
-        # Split into per-modality tensors
-        splits = []
-        offset = 0
-        for dim in self.modality_dims:
-            splits.append(cond[:, :, offset:offset + dim])
-            offset += dim
-
-        # Linear fusion: (B, T, hidden_dim)
-        context = self.fusion_block(splits)
-
-        # Add absolute positional embedding (only when NOT using RoPE)
         if self.context_pos_emb is not None:
-            T = context.shape[1]
-            context = context + self.context_pos_emb[:, :T, :]
+            Tc = context.shape[1]
+            context = context + self.context_pos_emb[:, :Tc, :]
 
-        # Temporal attention (RoPE layers apply position internally)
         if self.use_rope:
             for layer in self.temporal_attn:
                 if self.gradient_checkpointing and self.training:
@@ -708,13 +840,18 @@ class VelocityNet(nn.Module):
                     context = layer(context)
             context = self.temporal_norm(context)
         else:
+
             def _temporal_fwd(x):
                 return self.temporal_norm(self.temporal_attn(x))
+
             if self.gradient_checkpointing and self.training:
                 context = checkpoint(_temporal_fwd, context, use_reentrant=False)
             else:
                 context = _temporal_fwd(context)
 
+        if self._use_dit:
+            slice_start = (self.context_trs - self.n_target_trs) // 2
+            context = context[:, slice_start : slice_start + self.n_target_trs, :]
         return context
 
     def forward(
@@ -726,28 +863,20 @@ class VelocityNet(nn.Module):
         subject_ids: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
-        """
-        Args:
-            x:                    (B, output_dim) noisy fMRI at time t.
-            t:                    (B,) or scalar, timestep in [0, 1].
-            cond:                 (B, T, total_dim) concatenated context.
-            pre_encoded_context:  (B, T, hidden_dim) already-fused context.
-            subject_ids:          (B,) long tensor of subject indices.
-
-        Returns:
-            v_pred: (B, output_dim) predicted velocity.
-        """
         if t.dim() == 0:
             t = t.expand(x.shape[0])
 
-        # --- Encode context (skip if pre-encoded) ---
         if pre_encoded_context is not None:
             context_encoded = pre_encoded_context
         elif cond is not None:
             context_encoded = self.encode_context_from_cond(cond)
         else:
+            if self._use_dit:
+                tlen = self.n_target_trs
+            else:
+                tlen = 1
             context_encoded = torch.zeros(
-                x.shape[0], 1, self.hidden_dim, device=x.device, dtype=x.dtype
+                x.shape[0], tlen, self.hidden_dim, device=x.device, dtype=x.dtype
             )
 
         t_emb = self.time_mlp(self.time_embed(t))
@@ -755,17 +884,24 @@ class VelocityNet(nn.Module):
         if not self.use_subject_head and self.subject_emb is not None and subject_ids is not None:
             t_emb = t_emb + self.subject_emb(subject_ids)
 
-        h = self.input_proj(x)  # (B, D) or (B, T_target, D) → (B, H) or (B, T_target, H)
-        # Seq2seq mode: inject target positional embeddings
-        if x.dim() == 3 and self.target_pos_emb is not None:
-            T = h.shape[1]
-            h = h + self.target_pos_emb[:, :T, :]
+        h = self.input_proj(x)
 
-        for block in self.blocks:
-            if self.gradient_checkpointing and self.training:
-                h = checkpoint(block, h, t_emb, context_encoded, use_reentrant=False)
-            else:
-                h = block(h, t_emb, context_encoded)
+        if self._use_dit:
+            h = h + context_encoded
+            for block in self.dit_blocks:
+                if self.gradient_checkpointing and self.training:
+                    h = checkpoint(block, h, t_emb, use_reentrant=False)
+                else:
+                    h = block(h, t_emb)
+        else:
+            if x.dim() == 3 and self.target_pos_emb is not None:
+                T = h.shape[1]
+                h = h + self.target_pos_emb[:, :T, :]
+            for block in self.blocks:
+                if self.gradient_checkpointing and self.training:
+                    h = checkpoint(block, h, t_emb, context_encoded, use_reentrant=False)
+                else:
+                    h = block(h, t_emb, context_encoded)
 
         h = self.final_norm(h)
         if self.use_subject_head:
@@ -799,14 +935,11 @@ def info_nce_loss(z_pred, z_target, temperature=0.07):
 
 
 class BrainFlow(nn.Module):
-    """Flow matching v3 with auxiliary regression, contrastive, and CFG.
+    """Flow matching with auxiliary regression, optional contrastive loss, and CFG.
 
-    NSD-inspired improvements:
-      - MultiTokenFusion: modality embeddings preserve token identity
-      - Gradient isolation: .detach() prevents reg from conflicting with flow
-      - Contrastive branch: InfoNCE in 256-D for ranking signal
-      - Deeper regression head: 4-layer MLP
-      - CFG at inference (trained with 10% context dropout)
+    Context encoding is handled inside ``VelocityNet`` (flat or multitoken fusion,
+    temporal encoder, optional slice to ``n_target_trs`` for seq2seq DiT).
+    Regression pools detached context over time (aligned slice when using DiT).
     """
 
     def __init__(
@@ -921,8 +1054,8 @@ class BrainFlow(nn.Module):
           - Reg branch: .detach() prevents conflict (updates reg head + proj only)
 
         Args:
-            context: (B, T, total_dim) concatenated multimodal context.
-            target:  (B, output_dim) ground truth fMRI.
+            context: (B, T_ctx, total_dim) concatenated multimodal context.
+            target:  (B, output_dim) or (B, n_target_trs, output_dim) ground-truth fMRI.
             subject_ids: (B,) long tensor of subject indices.
             skip_aux: if True, skip regression and contrastive losses (used when
                       context is zeroed out for CFG unconditional training).
@@ -955,10 +1088,12 @@ class BrainFlow(nn.Module):
             target_for_reg = target.mean(dim=1) if target.dim() == 3 else target  # (B, V)
             reg_loss = F.mse_loss(fmri_pred, target_for_reg)
 
-            # 3. Contrastive loss in 256-D projected space (NSD improvement)
-            z_pred = F.normalize(self.contrastive_proj(fmri_pred.detach()), dim=-1)
-            z_target = F.normalize(self.target_proj(target_for_reg), dim=-1)
-            cont_loss = info_nce_loss(z_pred, z_target)
+            if self.cont_weight > 0:
+                z_pred = F.normalize(self.contrastive_proj(fmri_pred.detach()), dim=-1)
+                z_target = F.normalize(self.target_proj(target_for_reg), dim=-1)
+                cont_loss = info_nce_loss(z_pred, z_target)
+            else:
+                cont_loss = _zero
 
         # 4. Flow matching source distribution (x_0)
         x_1 = target

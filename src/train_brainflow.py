@@ -290,6 +290,10 @@ class DirectFlowDataset(Dataset):
                 pad_after = max(0, self.context_trs - ctx.shape[0] - pad_before)
                 ctx = F.pad(ctx, (0, 0, pad_before, pad_after))
             ctx = ctx[:self.context_trs]
+            if ctx.shape[0] != self.context_trs:
+                raise RuntimeError(
+                    f"Seq2seq context length mismatch: got {ctx.shape[0]}, expected {self.context_trs}"
+                )
 
             # Target fMRI: (n_target_trs, V)
             fmri_end = min(target_start + self.n_target_trs, fmri_data.shape[0])
@@ -300,6 +304,10 @@ class DirectFlowDataset(Dataset):
                     fmri_seq,
                     fmri_seq.new_zeros(pad_len, fmri_seq.shape[1]),
                 ], dim=0)
+            if fmri_seq.shape[0] != self.n_target_trs:
+                raise RuntimeError(
+                    f"Seq2seq fMRI length mismatch: got {fmri_seq.shape[0]}, expected {self.n_target_trs}"
+                )
 
             return {
                 "context": ctx,                                        # (101, D)
