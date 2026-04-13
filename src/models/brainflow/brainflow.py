@@ -204,11 +204,17 @@ class SubjectLayers(nn.Module):
             self.bias.data.normal_(0, 1.0 / in_channels ** 0.5)
 
     def forward(self, x: torch.Tensor, subject_ids: torch.Tensor) -> torch.Tensor:
-        w = self.weights[subject_ids]
-        out = torch.einsum("bd,bdo->bo", x, w)
-        if self.bias is not None:
-            b = self.bias[subject_ids]
-            out = out + b
+        w = self.weights[subject_ids]  # (B, in_channels, out_channels)
+        if x.dim() == 3:
+            # Seq2seq mode: (B, T, in_channels) → (B, T, out_channels)
+            out = torch.einsum("btd,bdo->bto", x, w)
+            if self.bias is not None:
+                out = out + self.bias[subject_ids].unsqueeze(1)  # (B, 1, out_channels)
+        else:
+            # Single-step mode: (B, in_channels) → (B, out_channels)
+            out = torch.einsum("bd,bdo->bo", x, w)
+            if self.bias is not None:
+                out = out + self.bias[subject_ids]
         return out
 
 
@@ -511,17 +517,25 @@ class SimpleFiLMBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        # FiLM conditioning
-        scale_shift = self.film(t_emb)
-        scale, shift = scale_shift.chunk(2, dim=-1)
+        # FiLM conditioning — broadcast over T_target dim if x is a sequence
+        scale_shift = self.film(t_emb)                    # (B, D*2)
+        scale, shift = scale_shift.chunk(2, dim=-1)       # (B, D) each
+        is_seq = x.dim() == 3
+        if is_seq:
+            scale = scale.unsqueeze(1)                    # (B, 1, D) → broadcast over T_target
+            shift = shift.unsqueeze(1)
         h = self.norm1(x) * (1 + scale) + shift
         x = x + self.ffn(h)
 
-        # Cross-attention (standard, no time-adaptive KV)
-        q = self.norm_q(x).unsqueeze(1)
-        kv = self.norm_kv(context)
-        attn_out, _ = self.cross_attn(q, kv, kv)
-        x = x + attn_out.squeeze(1)
+        # Cross-attention: Q=x (1 or T_target tokens), KV=context (T_ctx tokens)
+        q = self.norm_q(x)                                # (B, D) or (B, T_target, D)
+        kv = self.norm_kv(context)                        # (B, T_ctx, D)
+        if not is_seq:
+            attn_out, _ = self.cross_attn(q.unsqueeze(1), kv, kv)
+            x = x + attn_out.squeeze(1)
+        else:
+            attn_out, _ = self.cross_attn(q, kv, kv)     # (B, T_target, D)
+            x = x + attn_out
 
         return x
 
@@ -557,6 +571,7 @@ class VelocityNet(nn.Module):
         gradient_checkpointing: bool = False,
         network_head: bool = False,
         use_rope: bool = False,
+        n_target_trs: int = 1,  # number of target fMRI TRs predicted simultaneously
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -567,6 +582,14 @@ class VelocityNet(nn.Module):
         self.gradient_checkpointing = gradient_checkpointing
         self.use_rope = use_rope
         self.network_head = network_head and use_subject_head
+        self.n_target_trs = n_target_trs
+        # Learned positional embeddings for the target sequence (seq2seq mode)
+        if n_target_trs > 1:
+            self.target_pos_emb = nn.Parameter(
+                torch.randn(1, n_target_trs, hidden_dim) * 0.02
+            )
+        else:
+            self.target_pos_emb = None
 
         self.fusion_block = MultiTokenFusion(
             modality_dims=self.modality_dims,
@@ -732,7 +755,11 @@ class VelocityNet(nn.Module):
         if not self.use_subject_head and self.subject_emb is not None and subject_ids is not None:
             t_emb = t_emb + self.subject_emb(subject_ids)
 
-        h = self.input_proj(x)
+        h = self.input_proj(x)  # (B, D) or (B, T_target, D) → (B, H) or (B, T_target, H)
+        # Seq2seq mode: inject target positional embeddings
+        if x.dim() == 3 and self.target_pos_emb is not None:
+            T = h.shape[1]
+            h = h + self.target_pos_emb[:, :T, :]
 
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
@@ -914,23 +941,23 @@ class BrainFlow(nn.Module):
             cont_loss = _zero
         else:
             ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
-            ctx_pooled_reg = ctx_detached.mean(dim=1)  # (B, hidden)
+            ctx_pooled_reg = ctx_detached.mean(dim=1)  # (B, hidden) — pool over T_ctx
             reg_hidden = self.reg_head(ctx_pooled_reg)
             latent_reg = self.reg_output(reg_hidden)
             if self.velocity_net.use_subject_head:
                 if subject_ids is None:
                     subject_ids = torch.zeros(target.shape[0], dtype=torch.long, device=target.device)
-                fmri_pred = self.velocity_net.subject_layers(latent_reg, subject_ids)
+                fmri_pred = self.velocity_net.subject_layers(latent_reg, subject_ids)  # (B, V)
             else:
                 fmri_pred = latent_reg
 
-            reg_loss = F.mse_loss(fmri_pred, target)
+            # Regression target: temporal mean for seq2seq mode, direct for single-TR
+            target_for_reg = target.mean(dim=1) if target.dim() == 3 else target  # (B, V)
+            reg_loss = F.mse_loss(fmri_pred, target_for_reg)
 
             # 3. Contrastive loss in 256-D projected space (NSD improvement)
-            # .detach() on fmri_pred prevents contrastive gradient from leaking
-            # through shared SubjectLayers into the velocity flow branch.
             z_pred = F.normalize(self.contrastive_proj(fmri_pred.detach()), dim=-1)
-            z_target = F.normalize(self.target_proj(target), dim=-1)
+            z_target = F.normalize(self.target_proj(target_for_reg), dim=-1)
             cont_loss = info_nce_loss(z_pred, z_target)
 
         # 4. Flow matching source distribution (x_0)
@@ -968,18 +995,23 @@ class BrainFlow(nn.Module):
                 x_1.dtype,
                 sqrt_bias_end=self.indi_train_time_sqrt and self._indi_effective,
             )
-            sample_info = self.path.sample(t=t, x_0=x_0, x_1=x_1)
+            # Manual OT interpolation — supports both (B, V) and (B, T, V) shapes
+            t_bc = t
+            while t_bc.dim() < x_1.dim():
+                t_bc = t_bc.unsqueeze(-1)          # (B, 1, 1) for seq mode
+            x_t = t_bc * x_1 + (1.0 - t_bc) * x_0
+
+            if self._indi_effective:
+                target_velocity = x_1 - x_t       # InDI: residual = (1-t)*(x_1-x_0)
+            else:
+                target_velocity = x_1 - x_0       # OT-CFM: constant velocity
 
             v_pred = self.velocity_net(
-                x=sample_info.x_t,
-                t=sample_info.t,
+                x=x_t,
+                t=t,
                 pre_encoded_context=context_encoded,
                 subject_ids=subject_ids,
             )
-            if self._indi_effective:
-                target_velocity = x_1 - sample_info.x_t
-            else:
-                target_velocity = sample_info.dx_t
             flow_loss = F.mse_loss(v_pred, target_velocity)
 
         # 6. Total loss
@@ -1033,83 +1065,85 @@ class BrainFlow(nn.Module):
         temperature: float = 0.0,
         time_grid_warp: str | None = None,
     ) -> torch.Tensor:
-        """Generate fMRI by solving ODE, optionally with CFG.
+        """Generate fMRI by solving ODE. Supports single-TR and seq2seq modes.
 
-        Classifier-Free Guidance (when cfg_scale > 0):
-          v_guided = v_uncond + cfg_scale * (v_cond - v_uncond)
+        Single-step: returns (B, output_dim).
+        Seq2seq:     returns (B, n_target_trs, output_dim).
 
         Args:
-            context:                (B, T, total_dim) concatenated context.
-            n_timesteps:            Number of ODE solver steps.
-            solver_method:          ODE solver method.
-            subject_ids:            (B,) long tensor of subject indices.
-            cfg_scale:              CFG guidance scale (0 = no guidance).
-            starting_distribution:  (B, output_dim) custom x_0 for Residual FM.
-                                    If None, uses low-temperature Gaussian.
-            temperature:            Std-dev of starting noise (0 = deterministic zeros,
-                                    1 = full Gaussian, 0.1-0.5 = low-temperature).
-            time_grid_warp:         ``None``/``linear`` = uniform; ``sqrt`` = ``sqrt(linspace)``
-                                    for smaller Δt near t→1 (pairs with InDI inference).
+            context:               (B, T_ctx, total_dim) concatenated context.
+            n_timesteps:           Number of ODE steps.
+            solver_method:         ``'midpoint'`` (default) or ``'euler'``.
+            subject_ids:           (B,) subject indices.
+            cfg_scale:             CFG guidance scale (0 = disabled).
+            starting_distribution: Custom x_0 — any shape matching output.
+            temperature:           Std-dev of starting noise (0 = zero init).
+            time_grid_warp:        ``'sqrt'`` = finer steps near t→1.
 
         Returns:
-            fmri_pred: (B, output_dim) predicted fMRI.
+            fmri_pred: (B, output_dim) or (B, n_target_trs, output_dim).
         """
         B = context.shape[0]
         device = context.device
         dtype = context.dtype
+        n_target = getattr(self.velocity_net, 'n_target_trs', 1)
 
+        # --- Encode context ---
         context_encoded = self.velocity_net.encode_context_from_cond(context)
-
-        if starting_distribution is not None:
-            x_init = starting_distribution.to(device=device, dtype=dtype)
-        elif temperature > 0:
-            x_init = temperature * torch.randn(B, self.output_dim, device=device, dtype=dtype)
-        else:
-            x_init = torch.zeros(B, self.output_dim, device=device, dtype=dtype)
-
-        T_grid = self._build_time_grid(n_timesteps, device, dtype, time_grid_warp)
-        n_steps = T_grid.shape[0]
-        deltas = T_grid[1:] - T_grid[:-1]
-        ode_step_size = float(deltas.min().clamp_min(torch.tensor(1e-6, device=device, dtype=dtype)))
-
+        uncond_encoded = None
         if cfg_scale > 0:
-            uncond_context = torch.zeros_like(context)
-            uncond_encoded = self.velocity_net.encode_context_from_cond(uncond_context)
+            uncond_encoded = self.velocity_net.encode_context_from_cond(
+                torch.zeros_like(context)
+            )
 
-            x = x_init
-            for i in range(n_steps - 1):
-                t_val = T_grid[i]
-                dt_i = T_grid[i + 1] - T_grid[i]
-                t_batch = t_val.expand(B)
+        # --- Initialise x_0 ---
+        if starting_distribution is not None:
+            x = starting_distribution.to(device=device, dtype=dtype)
+        elif temperature > 0:
+            shape = (B, n_target, self.output_dim) if n_target > 1 else (B, self.output_dim)
+            x = temperature * torch.randn(*shape, device=device, dtype=dtype)
+        else:
+            shape = (B, n_target, self.output_dim) if n_target > 1 else (B, self.output_dim)
+            x = torch.zeros(*shape, device=device, dtype=dtype)
 
-                u_cond = self.velocity_net(
-                    x=x, t=t_batch,
-                    pre_encoded_context=context_encoded,
-                    subject_ids=subject_ids,
-                )
-                u_uncond = self.velocity_net(
-                    x=x, t=t_batch,
-                    pre_encoded_context=uncond_encoded,
-                    subject_ids=subject_ids,
-                )
-                u_guided = u_uncond + cfg_scale * (u_cond - u_uncond)
-                if self._indi_effective:
-                    v_guided = recover_velocity_indi(u_guided, t_val, self.indi_min_denom)
-                else:
-                    v_guided = u_guided
-                x = x + dt_i * v_guided
+        # --- Build time grid ---
+        T_grid = self._build_time_grid(n_timesteps, device, dtype, time_grid_warp)
 
-            return x
+        # --- Velocity helper (handles InDI recovery) ---
+        def _vel(x_in, t_scalar, ctx_enc):
+            t_b = t_scalar.reshape(1).expand(B)
+            u = self.velocity_net(
+                x=x_in, t=t_b,
+                pre_encoded_context=ctx_enc,
+                subject_ids=subject_ids,
+            )
+            if self._indi_effective:
+                u = recover_velocity_indi(u, t_scalar, self.indi_min_denom)
+            return u
 
-        solver = ODESolver(velocity_model=self._velocity_for_ode())
-        fmri_pred = solver.sample(
-            time_grid=T_grid,
-            x_init=x_init,
-            method=solver_method,
-            step_size=ode_step_size,
-            return_intermediates=False,
-            pre_encoded_context=context_encoded,
-            subject_ids=subject_ids,
-        )
+        # --- Manual ODE integration (works for any x shape) ---
+        for i in range(len(T_grid) - 1):
+            t_i = T_grid[i]
+            dt = T_grid[i + 1] - T_grid[i]
 
-        return fmri_pred
+            if solver_method == "midpoint":
+                # Stage 1: velocity at t_i
+                v1 = _vel(x, t_i, context_encoded)
+                if cfg_scale > 0:
+                    v1 = _vel(x, t_i, uncond_encoded) + cfg_scale * (v1 - _vel(x, t_i, uncond_encoded))
+                # Stage 2: velocity at t_i + dt/2
+                x_mid = x + 0.5 * dt * v1
+                t_mid = t_i + 0.5 * dt
+                v2 = _vel(x_mid, t_mid, context_encoded)
+                if cfg_scale > 0:
+                    v2 = _vel(x_mid, t_mid, uncond_encoded) + cfg_scale * (
+                        v2 - _vel(x_mid, t_mid, uncond_encoded)
+                    )
+                x = x + dt * v2
+            else:  # euler
+                v = _vel(x, t_i, context_encoded)
+                if cfg_scale > 0:
+                    v = _vel(x, t_i, uncond_encoded) + cfg_scale * (v - _vel(x, t_i, uncond_encoded))
+                x = x + dt * v
+
+        return x

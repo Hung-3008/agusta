@@ -1,15 +1,16 @@
 # =====================================================================
-# BrainFlow Direct v3 — Flow Matching + Aux Regression + CFG
+# BrainFlow Seq2Seq v4 — 101 TR Context → 50 TR fMRI Simultaneous
 # =====================================================================
-# LinearFusion → Temporal Self-Attention → Aux Regression Head
-# 4 SimpleFiLMBlocks, Gaussian source, OT-CFM
-# CFG inference support (trained with 10% context dropout)
+# Encoder:  101 TR context → RoPE Temporal Transformer → (B, 101, H)
+# Decoder:  Flow matching over fMRI sequence (B, 50, V)
+#           SimpleFiLMBlocks: Q=(B,50,H) cross-attends KV=(B,101,H)
+# Reg head: predicts temporal-mean fMRI → anchor for flow matching
 # =====================================================================
 
 data_root: Data
 
 fmri:
-  dir: algonauts_2025.competitors/fmri # 
+  dir: algonauts_2025.competitors/fmri
   tr: 1.49
   n_voxels: 1000
   excluded_samples_start: 5
@@ -27,7 +28,7 @@ context_latent_dirs:
   - Data/features_npy_pooled/qwen-2-5-omni-7b       # Multimodal (Qwen-Omni)
   - Data/features_npy_pooled/internvl3_8b_8bit      # Vision-Language (InternVL3-8B)
   - Data/features_npy_pooled/InternVL3_14B          # Vision-Language (InternVL3-14B)
-  - Data/features_npy_pooled/dinov2_giant            # Visual (DINOv2-giant multiplexed)
+  - Data/features_npy_pooled/dinov2_giant            # Visual (DINOv2-giant)
   - Data/features_npy_pooled/vlm2vec_7b              # Vision-Language (VLM2Vec-7B)
 
 modality_dims:
@@ -60,32 +61,36 @@ splits:
     train: [bourne, figures, life, wolf]
     val: []
 
-# --- Sliding window ---
+# --- Seq2Seq sliding window ---
+# Context: 101 TRs = 25 past-buffer + 50 target + 26 future-buffer (+ HRF shift)
+# Each sample: context (101, D) → fMRI sequence (50, V)
 sliding_window:
-  feature_past_trs: 20        # 20 past TRs
-  feature_future_trs: 10      # 10 future TRs  → total = 20+1+10 = 31
-  stride: 1
-  temporal_jitter: 2
+  context_trs: 101         # total context window length fed to encoder
+  n_target_trs: 50         # simultaneous fMRI TRs predicted (decoder output)
+  stride: 10               # step between target window starts (10 TR → 80% overlap)
+  temporal_jitter: 2       # ±2 TR jitter for context (train only)
 
 # --- DataLoader ---
 dataloader:
   batch_size: 512
   val_batch_size: 512
-  num_workers: 4
+  num_workers: 0
   pin_memory: true
 
 # =====================================================================
-# Model config — V3 with improvements
+# Model config — Seq2Seq Decoder v4
 # =====================================================================
-model_version: v1
+model_version: v4
 
 brainflow:
   output_dim: 1000
-  reg_weight: 0.5              # Auxiliary regression loss weight (#1)
-  # InDI Flow Matching — Proposal C (OT path only; ignored if tensor_fm is set)
+  reg_weight: 0.5              # Reg head: predict temporal-mean fMRI
+  cont_weight: 0.1
+  cont_dim: 256
+  # InDI Flow Matching over 50-TR sequence
   indi_flow_matching: true
-  indi_train_time_sqrt: false  # true: t = sqrt(U) for more training mass near t→1
-  indi_min_denom: 1.0e-3       # u/(1-t) clamp at inference
+  indi_train_time_sqrt: false
+  indi_min_denom: 1.0e-3
 
   velocity_net:
     output_dim: 1000
@@ -95,26 +100,26 @@ brainflow:
     n_heads: 8
     dropout: 0.1
     modality_dropout: 0.3
-    max_seq_len: 31            # 30 past + 1 current (#4)
-    temporal_attn_layers: 2    # Temporal self-attention (#5)
-    gradient_checkpointing: true   # less VRAM in backward (more compute)
-    # Proposal A (TRIBE-style): concat fusion + shared latent + per-subject voxel head
-    fusion_mode: concat         # "mean" = legacy average fusion (old checkpoints)
+    max_seq_len: 101           # encoder RoPE / context length
+    n_target_trs: 50           # decoder sequence length (NEW)
+    temporal_attn_layers: 2    # encoder temporal self-attention layers
+    gradient_checkpointing: true
+    fusion_mode: concat
     fusion_proj_dim: 384
     use_subject_head: true
-    network_head: true            # 7 Yeo-network specialized output heads
-    use_rope: true                # Rotary PE (relative temporal encoding)
-    latent_dim: 1024            # velocity/regression trunk ends here → SubjectLayers → voxels
+    network_head: true
+    use_rope: true
+    latent_dim: 1024
 
 # =====================================================================
 # Solver args (validation inference)
 # =====================================================================
 solver_args:
-  method: midpoint             # More accurate than euler
-  time_points: 50              # More steps for better accuracy (#3)
-  cfg_scale: 0.0               # CFG at inference (0 = disabled) (#3)
-  temperature: 0.1             # Starting noise std: 0=deterministic, (0,1)=low-temp sampling
-  time_grid_warp: sqrt          # finer Δt near t→1; pair with indi_flow_matching
+  method: midpoint
+  time_points: 50
+  cfg_scale: 0.0
+  temperature: 0.1
+  time_grid_warp: sqrt
 
 # =====================================================================
 # Training
@@ -130,11 +135,10 @@ training:
   log_every_n_steps: 20
   val_every_n_epochs: 10
   ema_decay: 0.999
-  # VRAM: effective batch ≈ batch_size × gradient_accumulation_steps
-  gradient_accumulation_steps: 2
-  ema_on_cpu: true                 # shadow weights on CPU (slower EMA update, less GPU)
-  context_bf16_when_amp: true      # halve context/target footprint before forward
+  gradient_accumulation_steps: 4   # effective = 8 × 4 = 32 samples = 1600 fMRI/step
+  ema_on_cpu: true
+  context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
 # --- Output ---
-output_dir: outputs/brainflow_direct_v3
+output_dir: outputs/brainflow_seq2seq_v4

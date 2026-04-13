@@ -66,13 +66,31 @@ class DirectFlowDataset(Dataset):
         self.excl_start = cfg["fmri"].get("excluded_samples_start", 0)
         self.excl_end = cfg["fmri"].get("excluded_samples_end", 0)
 
-        self.feature_past_trs = cfg["sliding_window"].get("feature_past_trs",
-                                  cfg["sliding_window"].get("feature_context_trs", 10))
-        self.feature_future_trs = cfg["sliding_window"].get("feature_future_trs", 0)
-        self.feat_seq_len = self.feature_past_trs + 1 + self.feature_future_trs
-        self.stride = cfg["sliding_window"].get("stride", 1)
+        sw = cfg["sliding_window"]
+        self.stride = sw.get("stride", 1)
         self.hrf_delay = cfg["fmri"].get("hrf_delay", 5)
-        self.temporal_jitter = cfg["sliding_window"].get("temporal_jitter", 0) if split == "train" else 0
+        self.temporal_jitter = sw.get("temporal_jitter", 0) if split == "train" else 0
+
+        # --- Seq2seq vs legacy single-TR mode ---
+        if "n_target_trs" in sw:
+            # Seq2seq: encoder sees context_trs TRs, decoder predicts n_target_trs fMRI
+            self.n_target_trs = sw["n_target_trs"]
+            self.context_trs = sw["context_trs"]
+            # Split extra context evenly before/after the target feature window
+            _extra = self.context_trs - self.n_target_trs
+            self.context_extra_past = _extra // 2
+            self.context_extra_future = _extra - self.context_extra_past
+            self.feat_seq_len = self.context_trs   # encoder input length
+        else:
+            # Legacy: one fMRI per sample
+            self.n_target_trs = 1
+            self.feature_past_trs = sw.get("feature_past_trs",
+                                    sw.get("feature_context_trs", 10))
+            self.feature_future_trs = sw.get("feature_future_trs", 0)
+            self.feat_seq_len = self.feature_past_trs + 1 + self.feature_future_trs
+            self.context_trs = self.feat_seq_len
+            self.context_extra_past = None
+            self.context_extra_future = None
 
         self.subject_to_idx = {s: i for i, s in enumerate(self.subjects)}
 
@@ -213,7 +231,12 @@ class DirectFlowDataset(Dataset):
                             continue
 
                         n_trs = fmri_data.shape[0]
-                        for target_tr in range(0, n_trs, self.stride):
+                        # Seq2seq: ensure each sample has a full n_target_trs window
+                        if self.n_target_trs > 1:
+                            n_valid = max(0, n_trs - self.n_target_trs + 1)
+                        else:
+                            n_valid = n_trs
+                        for target_tr in range(0, n_valid, self.stride):
                             samples.append({
                                 "ctx_key": ctx_key,
                                 "fmri_key": fmri_key,
@@ -240,41 +263,78 @@ class DirectFlowDataset(Dataset):
 
     def __getitem__(self, idx):
         info = self.samples[idx]
-        ctx_data = self._ctx_clips[info["ctx_key"]]
-        fmri_data = self._fmri_clips[info["fmri_key"]]
-        target_tr = info["target_tr"]
+        ctx_data = self._ctx_clips[info["ctx_key"]]    # (T_ctx_full, D)
+        fmri_data = self._fmri_clips[info["fmri_key"]]  # (N_trs, V)
+        target_start = info["target_tr"]
 
-        actual_movie_tr = target_tr + self.excl_start
-        feat_current_tr = actual_movie_tr - self.hrf_delay
+        # Feature TR for the FIRST target fMRI (accounts for excl_start and HRF)
+        actual_start_tr = target_start + self.excl_start
+        feat_first = actual_start_tr - self.hrf_delay
         if self.temporal_jitter > 0:
-            feat_current_tr += random.randint(-self.temporal_jitter, self.temporal_jitter)
+            feat_first += random.randint(-self.temporal_jitter, self.temporal_jitter)
 
-        feat_start = feat_current_tr - self.feature_past_trs
-        feat_end = feat_current_tr + 1 + self.feature_future_trs
+        if self.n_target_trs > 1:
+            # ========== SEQ2SEQ MODE ==========
+            # Context window: context_extra_past TRs before feat_first, then context_trs total
+            ctx_start = feat_first - self.context_extra_past
+            ctx_end = ctx_start + self.context_trs
+            safe_start = max(0, ctx_start)
+            safe_end = min(ctx_data.shape[0], ctx_end)
+            if safe_start < safe_end:
+                ctx = ctx_data[safe_start:safe_end]
+            else:
+                ctx = ctx_data.new_zeros(0, ctx_data.shape[-1])
+            # Pad to exact context_trs length
+            if ctx.shape[0] < self.context_trs:
+                pad_before = max(0, -ctx_start)
+                pad_after = max(0, self.context_trs - ctx.shape[0] - pad_before)
+                ctx = F.pad(ctx, (0, 0, pad_before, pad_after))
+            ctx = ctx[:self.context_trs]
 
-        safe_start = max(0, feat_start)
-        safe_end = min(ctx_data.shape[0], feat_end)
-        ctx = ctx_data[safe_start:safe_end] if safe_start < safe_end else torch.zeros(0, ctx_data.shape[-1])
-        if ctx.shape[0] < self.feat_seq_len:
-            # Pad at the beginning (missing past) and/or end (missing future)
-            pad_before = max(0, -feat_start)
-            pad_after = self.feat_seq_len - ctx.shape[0] - pad_before
-            pad_after = max(0, pad_after)
-            ctx = F.pad(ctx, (0, 0, pad_before, pad_after))
+            # Target fMRI: (n_target_trs, V)
+            fmri_end = min(target_start + self.n_target_trs, fmri_data.shape[0])
+            fmri_seq = fmri_data[target_start:fmri_end].clone()
+            if fmri_seq.shape[0] < self.n_target_trs:
+                pad_len = self.n_target_trs - fmri_seq.shape[0]
+                fmri_seq = torch.cat([
+                    fmri_seq,
+                    fmri_seq.new_zeros(pad_len, fmri_seq.shape[1]),
+                ], dim=0)
 
-        if target_tr < fmri_data.shape[0]:
-            fmri_target = fmri_data[target_tr].clone()
+            return {
+                "context": ctx,                                        # (101, D)
+                "fmri": fmri_seq,                                      # (50, V)
+                "clip_key": f"{info['subject']}/{info['ctx_key']}",
+                "subject_idx": info["subject_idx"],
+                "target_tr_start": target_start,
+                "n_trs": info["n_trs"],
+            }
         else:
-            fmri_target = torch.zeros(self.cfg["fmri"].get("n_voxels", 1000), dtype=torch.float32)
+            # ========== LEGACY SINGLE-TR MODE ==========
+            feat_start = feat_first - self.feature_past_trs
+            feat_end = feat_first + 1 + self.feature_future_trs
+            safe_start = max(0, feat_start)
+            safe_end = min(ctx_data.shape[0], feat_end)
+            ctx = ctx_data[safe_start:safe_end] if safe_start < safe_end else torch.zeros(0, ctx_data.shape[-1])
+            if ctx.shape[0] < self.feat_seq_len:
+                pad_before = max(0, -feat_start)
+                pad_after = self.feat_seq_len - ctx.shape[0] - pad_before
+                pad_after = max(0, pad_after)
+                ctx = F.pad(ctx, (0, 0, pad_before, pad_after))
 
-        return {
-            "context": ctx,
-            "fmri": fmri_target,
-            "clip_key": f"{info['subject']}/{info['ctx_key']}",
-            "subject_idx": info["subject_idx"],
-            "target_tr": target_tr,
-            "n_trs": info["n_trs"],
-        }
+            if target_start < fmri_data.shape[0]:
+                fmri_target = fmri_data[target_start].clone()
+            else:
+                fmri_target = torch.zeros(self.cfg["fmri"].get("n_voxels", 1000), dtype=torch.float32)
+
+            return {
+                "context": ctx,                                        # (31, D)
+                "fmri": fmri_target,                                   # (V,)
+                "clip_key": f"{info['subject']}/{info['ctx_key']}",
+                "subject_idx": info["subject_idx"],
+                "target_tr_start": target_start,
+                "n_trs": info["n_trs"],
+            }
 
 
 # =============================================================================
@@ -742,24 +802,40 @@ def train(args):
                     gen_fmri = model.synthesise(context, **synth_kwargs)
 
                     clip_keys = batch["clip_key"]
-                    target_trs = batch["target_tr"]
+                    target_tr_starts = batch["target_tr_start"]
                     n_trs_batch = batch["n_trs"]
                     fmri_target = batch["fmri"].to(device)
 
-                    B, fmri_dim = gen_fmri.shape
+                    B = gen_fmri.shape[0]
+                    fmri_dim = gen_fmri.shape[-1]
+                    is_seq = gen_fmri.dim() == 3
                     for b in range(B):
                         ck = clip_keys[b]
-                        tr_idx = int(target_trs[b].item())
+                        tr_start = int(target_tr_starts[b].item())
                         n_t = int(n_trs_batch[b].item())
 
                         if ck not in fmri_pred_acc:
                             fmri_pred_acc[ck] = {"sum": torch.zeros(n_t, fmri_dim), "count": torch.zeros(n_t)}
                             fmri_tgt_acc[ck] = {"sum": torch.zeros(n_t, fmri_dim), "count": torch.zeros(n_t)}
 
-                        fmri_pred_acc[ck]["sum"][tr_idx] += gen_fmri[b].cpu()
-                        fmri_pred_acc[ck]["count"][tr_idx] += 1
-                        fmri_tgt_acc[ck]["sum"][tr_idx] += fmri_target[b].cpu()
-                        fmri_tgt_acc[ck]["count"][tr_idx] += 1
+                        if is_seq:
+                            # Seq2seq: accumulate each TR offset
+                            for off in range(gen_fmri.shape[1]):
+                                tr_idx = tr_start + off
+                                if tr_idx >= n_t:
+                                    break
+                                fmri_pred_acc[ck]["sum"][tr_idx] += gen_fmri[b, off].cpu()
+                                fmri_pred_acc[ck]["count"][tr_idx] += 1
+                                fmri_tgt_acc[ck]["sum"][tr_idx] += fmri_target[b, off].cpu()
+                                fmri_tgt_acc[ck]["count"][tr_idx] += 1
+                        else:
+                            # Legacy single-TR
+                            tr_idx = tr_start
+                            if tr_idx < n_t:
+                                fmri_pred_acc[ck]["sum"][tr_idx] += gen_fmri[b].cpu()
+                                fmri_pred_acc[ck]["count"][tr_idx] += 1
+                                fmri_tgt_acc[ck]["sum"][tr_idx] += fmri_target[b].cpu()
+                                fmri_tgt_acc[ck]["count"][tr_idx] += 1
 
             all_gen, all_tgt = [], []
             for ck in sorted(fmri_pred_acc.keys()):
