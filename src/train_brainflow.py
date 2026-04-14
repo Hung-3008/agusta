@@ -47,7 +47,8 @@ def resolve_paths(cfg: dict, project_root: Path) -> dict:
 class DirectFlowDataset(Dataset):
     """Pre-extracted context latents + raw fMRI, fully preloaded into RAM.
 
-    Each sample: windowed context (feat_seq_len, context_dim) -> 1 fMRI (V,).
+    Seq2seq: ``(context_trs, D)`` -> ``(n_target_trs, V)`` fMRI window.
+    Legacy single-TR: ``(feat_seq_len, D)`` -> ``(V,)``.
     """
 
     def __init__(self, cfg, split="train"):
@@ -471,18 +472,19 @@ def get_dataloaders(cfg):
 
     dl_cfg = cfg["dataloader"]
     batch_size = dl_cfg["batch_size"]
+    num_workers = int(dl_cfg.get("num_workers", 0))
 
     train_loader = DataLoader(
         train_set,
         batch_sampler=ClipGroupedBatchSampler(train_set, batch_size, drop_last=True),
-        num_workers=0,
+        num_workers=num_workers,
         pin_memory=dl_cfg["pin_memory"],
     )
     val_loader = DataLoader(
         val_set,
         batch_size=dl_cfg["val_batch_size"],
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
         pin_memory=dl_cfg["pin_memory"],
         drop_last=False,
     )
@@ -494,7 +496,11 @@ def get_dataloaders(cfg):
 # =============================================================================
 
 def _get_base_prediction(base_model, context, subject_ids: torch.Tensor):
-    """Run frozen base model regression head -> (starting_dist, residual_context)."""
+    """Run frozen base model regression head -> (starting_dist, residual_context).
+
+    Requires ``base_model.velocity_net.fusion_block`` (multitoken path); not compatible
+    with ``context_encoder: flat`` on the base checkpoint without code changes.
+    """
     base_dim = sum(base_model.velocity_net.fusion_block.modality_dims)
     base_context = context[..., :base_dim]
     residual_context = context[..., base_dim:]

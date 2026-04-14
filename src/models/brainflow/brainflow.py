@@ -21,9 +21,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from flow_matching.path import AffineProbPath
-from flow_matching.path.scheduler import CondOTScheduler
-
 
 # =============================================================================
 # InDI (Inversion by Direct Iteration) — training target x_1 - x_t, recover dx/dt
@@ -1018,9 +1015,6 @@ class BrainFlow(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, cont_dim),
         )
-
-        # OT-CFM path (fallback when TensorFM disabled)
-        self.path = AffineProbPath(scheduler=CondOTScheduler())
 
         # Log parameters
         vn_params = sum(p.numel() for p in self.velocity_net.parameters())

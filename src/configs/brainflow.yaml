@@ -6,13 +6,13 @@
 # Decoder:  x_t_emb + context_50 → DiT blocks (RoPE self-attn, AdaLN-Zero) → 7 net heads
 # Reg head:  pool(detach) over 50 context steps → temporal-mean fMRI anchor
 # Legacy:   set context_encoder: multitoken, use_dit_decoder: false (FiLM + cross-attn)
+# fMRI acquisition TR ~1.49s (metadata only; not read by train_brainflow / evaluate_brainflow)
 # =====================================================================
 
 data_root: Data
 
 fmri:
   dir: algonauts_2025.competitors/fmri
-  tr: 1.49
   n_voxels: 1000
   excluded_samples_start: 5
   excluded_samples_end: 5
@@ -51,8 +51,6 @@ subjects:
   - sub-03
   - sub-05
 
-subject_mode: multi
-
 # --- Splits ---
 splits:
   friends:
@@ -80,11 +78,12 @@ dataloader:
 
 # =====================================================================
 # Model config — Seq2Seq v5 (1D-DiT + temporal slicing)
+# model_version: used by evaluate_brainflow.py
 # =====================================================================
 model_version: v5
 
 brainflow:
-  output_dim: 1000
+  output_dim: 1000             # also used as velocity_net output_dim via default
   reg_weight: 0.5              # Reg head: predict temporal-mean fMRI
   cont_weight: 0.0             # InfoNCE off by default (less auxiliary noise)
   cont_dim: 256
@@ -94,29 +93,28 @@ brainflow:
   indi_min_denom: 1.0e-3
 
   velocity_net:
-    output_dim: 1000
     hidden_dim: 1024
-    proj_dim: 256              # multitoken legacy only
-    n_blocks: 4                # legacy FiLM depth (if use_dit_decoder: false)
-    dit_num_blocks: 4          # 1D-DiT blocks (seq2seq)
+    dit_num_blocks: 4
     n_heads: 8
     dropout: 0.1
-    modality_dropout: 0.0      # unused with context_encoder: flat; CFG 10% replaces modality dropout
-    max_seq_len: 101           # encoder RoPE / fusion cap (multitoken)
     context_trs: 101           # must match sliding_window.context_trs (slice centering)
-    n_target_trs: 50
-    temporal_attn_layers: 2    # encoder temporal self-attention (2–4 typical)
+    n_target_trs: 50           # must match sliding_window.n_target_trs
+    temporal_attn_layers: 2
     gradient_checkpointing: true
-    fusion_mode: concat        # multitoken only
-    fusion_proj_dim: 384
     use_subject_head: true
     network_head: true
     use_rope: true
     latent_dim: 1024
-    # v5 defaults
     context_encoder: flat      # flat | multitoken
     use_dit_decoder: true
     zero_init_network_heads: true
+    # --- multitoken / legacy FiLM (ignored when context_encoder: flat + use_dit_decoder: true)
+    proj_dim: 256
+    n_blocks: 4
+    modality_dropout: 0.0
+    max_seq_len: 101
+    fusion_mode: concat
+    fusion_proj_dim: 384
 
 # =====================================================================
 # Solver args (validation inference)
@@ -132,7 +130,7 @@ solver_args:
 # Training
 # =====================================================================
 training:
-  n_epochs: 200
+  n_epochs: 100
   lr: 1.0e-4
   weight_decay: 0.01
   warmup_ratio: 0.05
@@ -142,7 +140,7 @@ training:
   log_every_n_steps: 20
   val_every_n_epochs: 10
   ema_decay: 0.999
-  gradient_accumulation_steps: 4   # effective = 8 × 4 = 32 samples = 1600 fMRI/step
+  gradient_accumulation_steps: 4   # effective batch = batch_size × 4 (e.g. 256×4 samples per optimizer step)
   ema_on_cpu: true
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
