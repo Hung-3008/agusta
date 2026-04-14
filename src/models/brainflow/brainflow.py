@@ -1,16 +1,16 @@
-"""BrainFlow — Seq2Seq Flow Matching with 1D-DiT velocity (v5) or legacy FiLM (v3/v4).
+"""BrainFlow — Seq2Seq Flow Matching with multitoken context fusion.
 
 Seq2seq (``n_target_trs`` > 1, default):
-  - Flat ``Linear(D_total, H) → LayerNorm → GELU`` on concatenated context
-  - RoPE temporal encoder over full context TRs (no causal mask)
-  - Temporal slice to ``n_target_trs`` tokens aligned with fMRI targets
-  - ``x_t_emb + context`` hybrid conditioning + DiT blocks (AdaLN-Zero, RoPE self-attn)
-  - Optional 7 Yeo network heads (``network_head``) with optional zero-init
+    - MultiTokenFusion over modality-preserved context streams
+    - RoPE temporal encoder over full context TRs (no causal mask)
+    - Temporal slice to ``n_target_trs`` tokens aligned with fMRI targets
+    - ``x_t_emb + context`` hybrid conditioning + DiT blocks (AdaLN-Zero, RoPE self-attn)
+    - Optional 7 Yeo network heads (``network_head``) with optional zero-init
 
-Legacy: MultiTokenFusion + FiLM + cross-attention (``use_dit_decoder: false``).
+Legacy decoder option: FiLM + cross-attention (``use_dit_decoder: false``).
 
 Usage:
-    python src/train_brainflow.py --config src/configs/brainflow.yaml
+        python src/train_brainflow.py --config src/configs/brainflow.yaml
 """
 
 import math
@@ -452,21 +452,6 @@ class DiT1DBlock(nn.Module):
         return x
 
 
-class FlatContextProjection(nn.Module):
-    """Single ``Linear(D_total, H) → LayerNorm → GELU`` on concatenated multimodal features."""
-
-    def __init__(self, d_total: int, hidden_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_total, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
 # =============================================================================
 # MultiTokenFusion — NSD-style per-modality token preservation
 # =============================================================================
@@ -643,7 +628,7 @@ class SimpleFiLMBlock(nn.Module):
 # =============================================================================
 
 class VelocityNet(nn.Module):
-    """Velocity network: flat or multitoken context encoder, optional temporal slice, DiT or FiLM trunk."""
+    """Velocity network with multitoken context encoder, optional temporal slice, DiT or FiLM trunk."""
 
     def __init__(
         self,
@@ -667,7 +652,7 @@ class VelocityNet(nn.Module):
         network_head: bool = False,
         use_rope: bool = False,
         n_target_trs: int = 1,
-        context_encoder: str = "flat",
+        context_encoder: str = "multitoken",
         use_dit_decoder: bool = True,
         dit_num_blocks: int | None = None,
         zero_init_network_heads: bool = False,
@@ -685,8 +670,11 @@ class VelocityNet(nn.Module):
         self.context_encoder = context_encoder
         self.context_trs = int(context_trs) if context_trs is not None else int(max_seq_len)
 
-        if context_encoder not in ("flat", "multitoken"):
-            raise ValueError(f"context_encoder must be 'flat' or 'multitoken', got {context_encoder!r}")
+        if context_encoder != "multitoken":
+            raise ValueError(
+                "context_encoder must be 'multitoken'. "
+                f"Got {context_encoder!r}. Flat encoder was removed in this version."
+            )
 
         use_dit = bool(use_dit_decoder and n_target_trs > 1)
         self._use_dit = use_dit
@@ -700,22 +688,16 @@ class VelocityNet(nn.Module):
         else:
             self.target_pos_emb = None
 
-        d_total = sum(self.modality_dims)
-        if context_encoder == "flat":
-            self.flat_context_proj = FlatContextProjection(d_total, hidden_dim)
-            self.fusion_block = None
-        else:
-            self.flat_context_proj = None
-            self.fusion_block = MultiTokenFusion(
-                modality_dims=self.modality_dims,
-                hidden_dim=hidden_dim,
-                proj_dim=proj_dim,
-                max_seq_len=max_seq_len,
-                dropout=dropout,
-                modality_dropout=modality_dropout,
-                fusion_mode=fusion_mode,
-                fusion_proj_dim=fusion_proj_dim,
-            )
+        self.fusion_block = MultiTokenFusion(
+            modality_dims=self.modality_dims,
+            hidden_dim=hidden_dim,
+            proj_dim=proj_dim,
+            max_seq_len=max_seq_len,
+            dropout=dropout,
+            modality_dropout=modality_dropout,
+            fusion_mode=fusion_mode,
+            fusion_proj_dim=fusion_proj_dim,
+        )
 
         enc_max_len = max(self.context_trs, max_seq_len)
         if use_rope:
@@ -814,16 +796,13 @@ class VelocityNet(nn.Module):
             nn.init.constant_(self.output_layer.bias, 0)
 
     def encode_context_from_cond(self, cond: torch.Tensor) -> torch.Tensor:
-        """Encode context: flat/multitoken fusion → temporal encoder → optional slice to ``n_target_trs``."""
-        if self.flat_context_proj is not None:
-            context = self.flat_context_proj(cond)
-        else:
-            splits = []
-            offset = 0
-            for dim in self.modality_dims:
-                splits.append(cond[:, :, offset:offset + dim])
-                offset += dim
-            context = self.fusion_block(splits)
+        """Encode context: multitoken fusion → temporal encoder → optional slice to ``n_target_trs``."""
+        splits = []
+        offset = 0
+        for dim in self.modality_dims:
+            splits.append(cond[:, :, offset:offset + dim])
+            offset += dim
+        context = self.fusion_block(splits)
 
         if self.context_pos_emb is not None:
             Tc = context.shape[1]
@@ -934,7 +913,7 @@ def info_nce_loss(z_pred, z_target, temperature=0.07):
 class BrainFlow(nn.Module):
     """Flow matching with auxiliary regression, optional contrastive loss, and CFG.
 
-    Context encoding is handled inside ``VelocityNet`` (flat or multitoken fusion,
+    Context encoding is handled inside ``VelocityNet`` (multitoken fusion,
     temporal encoder, optional slice to ``n_target_trs`` for seq2seq DiT).
     Regression pools detached context over time (aligned slice when using DiT).
     """

@@ -498,9 +498,13 @@ def get_dataloaders(cfg):
 def _get_base_prediction(base_model, context, subject_ids: torch.Tensor):
     """Run frozen base model regression head -> (starting_dist, residual_context).
 
-    Requires ``base_model.velocity_net.fusion_block`` (multitoken path); not compatible
-    with ``context_encoder: flat`` on the base checkpoint without code changes.
+    Requires ``base_model.velocity_net.fusion_block`` (multitoken path).
     """
+    if base_model.velocity_net.fusion_block is None:
+        raise RuntimeError(
+            "Residual FM requires a multitoken base model. "
+            "The loaded base model does not expose fusion_block (flat encoder is unsupported)."
+        )
     base_dim = sum(base_model.velocity_net.fusion_block.modality_dims)
     base_context = context[..., :base_dim]
     residual_context = context[..., base_dim:]
@@ -556,6 +560,7 @@ def train(args):
     bf_cfg = cfg["brainflow"]
     output_dim = bf_cfg.get("output_dim", cfg["fmri"]["n_voxels"])
     vn_params = dict(bf_cfg.get("velocity_net", {}))
+    logger.info("Context encoder mode: %s", vn_params.get("context_encoder", "multitoken"))
     modality_dims = cfg.get("modality_dims", None)
 
     if "base_model" in cfg and modality_dims:

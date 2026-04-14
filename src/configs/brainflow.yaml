@@ -1,11 +1,11 @@
 # =====================================================================
-# BrainFlow Seq2Seq v5 — 101 TR → slice 50 TR + 1D-DiT velocity (AdaLN-Zero)
+# BrainFlow Seq2Seq v5 — multitoken context fusion + 1D-DiT velocity
 # =====================================================================
-# Encoder:  Linear(D_total,H)→LN→GELU → RoPE Transformer (no mask) → (B,101,H)
+# Encoder:  Per-modality MultiTokenFusion → RoPE Transformer (no mask) → (B,101,H)
 #           Temporal slice [T_past:T_past+50] with T_past=(101-50)//2 → (B,50,H)
 # Decoder:  x_t_emb + context_50 → DiT blocks (RoPE self-attn, AdaLN-Zero) → 7 net heads
-# Reg head:  pool(detach) over 50 context steps → temporal-mean fMRI anchor
-# Legacy:   set context_encoder: multitoken, use_dit_decoder: false (FiLM + cross-attn)
+# Reg head: pool(detach) over 50 context steps → temporal-mean fMRI anchor
+# Legacy decoder: set use_dit_decoder: false (FiLM + cross-attn)
 # fMRI acquisition TR ~1.49s (metadata only; not read by train_brainflow / evaluate_brainflow)
 # =====================================================================
 
@@ -105,10 +105,10 @@ brainflow:
     network_head: true
     use_rope: true
     latent_dim: 1024
-    context_encoder: flat      # flat | multitoken
+    context_encoder: multitoken
     use_dit_decoder: true
     zero_init_network_heads: true
-    # --- multitoken / legacy FiLM (ignored when context_encoder: flat + use_dit_decoder: true)
+    # --- multitoken fusion + optional legacy FiLM decoder path
     proj_dim: 256
     n_blocks: 4
     modality_dropout: 0.0
@@ -121,9 +121,9 @@ brainflow:
 # =====================================================================
 solver_args:
   method: midpoint
-  time_points: 50
+  time_points: 30
   cfg_scale: 0.0
-  temperature: 0.1
+  temperature: 0.05
   time_grid_warp: sqrt
 
 # =====================================================================
