@@ -4,10 +4,16 @@ Seq2seq (``n_target_trs`` > 1, default):
     - MultiTokenFusion over modality-preserved context streams
     - RoPE temporal encoder over full context TRs (no causal mask)
     - Temporal slice to ``n_target_trs`` tokens aligned with fMRI targets
-    - ``x_t_emb + context`` hybrid conditioning + DiT blocks (AdaLN-Zero, RoPE self-attn)
+    - Decoder: DiT-X (cross-attention + AdaLN-Zero) or DiT-1D (additive + AdaLN-Zero)
     - Optional 7 Yeo network heads (``network_head``) with optional zero-init
 
-Legacy decoder option: FiLM + cross-attention (``use_dit_decoder: false``).
+Decoder types:
+    ``decoder_type='ditx'`` (default): DiT-X from ManiFlow — 9-param AdaLN-Zero
+        modulating Self-Attention + Cross-Attention + FFN. Context is queried at every
+        block via cross-attention with RoPE on Q/K for temporal alignment.
+    ``decoder_type='dit1d'``: Legacy 1D-DiT — 6-param AdaLN-Zero on Self-Attention + FFN.
+        Context is added once to x_t_emb before entering the block stack.
+    ``use_dit_decoder: false``: FiLM + cross-attention (oldest legacy path).
 
 Usage:
         python src/train_brainflow.py --config src/configs/brainflow.yaml
@@ -452,6 +458,187 @@ class DiT1DBlock(nn.Module):
         return x
 
 
+class CrossAttention(nn.Module):
+    """Cross-attention with RoPE on Q/K for temporally-aligned context.
+
+    Adapted from ManiFlow DiT-X. Q comes from target/action tokens,
+    K/V from context tokens. RoPE is applied when both sequences share
+    the same temporal axis (e.g. BrainFlow's 50-token aligned windows).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dropout: float = 0.0,
+        rotary_emb: RotaryEmbedding = None,
+    ):
+        super().__init__()
+        assert d_model % nhead == 0
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.rotary_emb = rotary_emb
+        self.attn_dropout_p = dropout
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.kv_proj = nn.Linear(d_model, 2 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_drop = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cross-attend from x (query) to context (key/value).
+
+        Args:
+            x:       (B, T_q, D) target/action tokens.
+            context: (B, T_kv, D) context tokens.
+
+        Returns:
+            (B, T_q, D) attended output.
+        """
+        B, T_q, D = x.shape
+        _, T_kv, _ = context.shape
+
+        q = self.q_proj(x).reshape(B, T_q, self.nhead, self.head_dim).permute(0, 2, 1, 3)
+        kv = self.kv_proj(context).reshape(B, T_kv, 2, self.nhead, self.head_dim).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+
+        # Apply RoPE to Q and K when context is temporally aligned with target
+        if self.rotary_emb is not None:
+            cos_q, sin_q = self.rotary_emb(T_q)
+            q = apply_rotary_emb(q, cos_q, sin_q)
+            cos_k, sin_k = self.rotary_emb(T_kv)
+            k = apply_rotary_emb(k, cos_k, sin_k)
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(B, T_q, D)
+        attn_out = self.out_proj(self.attn_drop(attn_out))
+        return attn_out
+
+
+class DiTXBlock(nn.Module):
+    """DiT-X block: AdaLN-Zero on Self-Attention + Cross-Attention + FFN.
+
+    Adapted from ManiFlow. Key difference from DiT1DBlock:
+    - 9 modulation parameters (3×3) instead of 6 (3×2)
+    - Cross-attention at every block with AdaLN-Zero gating
+    - Context is queried every layer (not added once at start)
+    - RoPE on both Self-Attention and Cross-Attention Q/K
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        time_dim: int,
+        rotary_emb: RotaryEmbedding,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.rotary_emb = rotary_emb
+        self.attn_dropout_p = dropout
+
+        # Layer norms (no affine — modulated by AdaLN)
+        self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False)  # self-attn
+        self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False)  # cross-attn
+        self.norm3 = nn.LayerNorm(d_model, elementwise_affine=False)  # FFN
+
+        # AdaLN-Zero: 9 modulation params (shift, scale, gate) × 3 sub-layers
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, 9 * d_model, bias=True),
+        )
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+        # Self-attention
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_drop = nn.Dropout(dropout)
+
+        # Cross-attention (Q from target, K/V from context)
+        self.cross_attn = CrossAttention(
+            d_model=d_model,
+            nhead=nhead,
+            dropout=dropout,
+            rotary_emb=rotary_emb,  # RoPE on Q/K for temporal alignment
+        )
+
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t_emb: torch.Tensor,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
+        """DiT-X forward: Self-Attn → Cross-Attn → FFN, all with AdaLN-Zero.
+
+        Args:
+            x:       (B, T, D) target tokens (fMRI states).
+            t_emb:   (B, D) time embedding.
+            context: (B, T_ctx, D) encoded context tokens.
+
+        Returns:
+            (B, T, D) updated tokens.
+        """
+        B, T, D = x.shape
+
+        # Generate 9 modulation parameters from time embedding
+        modulation = self.adaLN_modulation(t_emb)  # (B, 9*D)
+        chunks = modulation.chunk(9, dim=-1)
+        shift_msa, scale_msa, gate_msa = chunks[0], chunks[1], chunks[2]
+        shift_cross, scale_cross, gate_cross = chunks[3], chunks[4], chunks[5]
+        shift_mlp, scale_mlp, gate_mlp = chunks[6], chunks[7], chunks[8]
+
+        # 1. Self-Attention with AdaLN-Zero
+        x_norm = modulate(self.norm1(x), shift_msa, scale_msa)
+        qkv = self.qkv_proj(x_norm).reshape(B, T, 3, self.nhead, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        cos, sin = self.rotary_emb(T)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(B, T, D)
+        attn_out = self.out_proj(self.attn_drop(attn_out))
+        x = x + gate_msa.unsqueeze(1) * attn_out
+
+        # 2. Cross-Attention with AdaLN-Zero
+        x_norm_cross = modulate(self.norm2(x), shift_cross, scale_cross)
+        cross_out = self.cross_attn(x_norm_cross, context)
+        x = x + gate_cross.unsqueeze(1) * cross_out
+
+        # 3. FFN with AdaLN-Zero
+        x_norm_mlp = modulate(self.norm3(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp.unsqueeze(1) * self.ffn(x_norm_mlp)
+
+        return x
+
+
+
 # =============================================================================
 # MultiTokenFusion — NSD-style per-modality token preservation
 # =============================================================================
@@ -628,7 +815,7 @@ class SimpleFiLMBlock(nn.Module):
 # =============================================================================
 
 class VelocityNet(nn.Module):
-    """Velocity network with multitoken context encoder, optional temporal slice, DiT or FiLM trunk."""
+    """Velocity network with multitoken context encoder, optional temporal slice, DiT/DiT-X/FiLM trunk."""
 
     def __init__(
         self,
@@ -655,6 +842,7 @@ class VelocityNet(nn.Module):
         context_encoder: str = "multitoken",
         use_dit_decoder: bool = True,
         dit_num_blocks: int | None = None,
+        decoder_type: str = "ditx",
         zero_init_network_heads: bool = False,
     ):
         super().__init__()
@@ -678,10 +866,19 @@ class VelocityNet(nn.Module):
 
         use_dit = bool(use_dit_decoder and n_target_trs > 1)
         self._use_dit = use_dit
+        self._decoder_type = decoder_type if use_dit else "film"
         dit_depth = dit_num_blocks if dit_num_blocks is not None else n_blocks
 
-        # Learned positional embeddings for legacy seq2seq FiLM (not used with DiT + RoPE on target)
+        # Learned positional embeddings:
+        # - FiLM legacy path: used for seq2seq
+        # - DiT-X path: used instead of additive context (context goes to cross-attn)
+        # - DiT-1D legacy path: not needed (context added to x_t_emb)
         if n_target_trs > 1 and not use_dit:
+            self.target_pos_emb = nn.Parameter(
+                torch.randn(1, n_target_trs, hidden_dim) * 0.02
+            )
+        elif use_dit and decoder_type == "ditx":
+            # DiT-X needs pos emb on target tokens (context goes via cross-attn)
             self.target_pos_emb = nn.Parameter(
                 torch.randn(1, n_target_trs, hidden_dim) * 0.02
             )
@@ -763,17 +960,34 @@ class VelocityNet(nn.Module):
             dec_max = max(n_target_trs, 64)
             head_dim_d = hidden_dim // n_heads
             self.rotary_emb_decoder = RotaryEmbedding(head_dim_d, max_seq_len=dec_max)
-            self.dit_blocks = nn.ModuleList([
-                DiT1DBlock(
-                    d_model=hidden_dim,
-                    nhead=n_heads,
-                    dim_feedforward=hidden_dim * 4,
-                    dropout=dropout,
-                    time_dim=hidden_dim,
-                    rotary_emb=self.rotary_emb_decoder,
-                )
-                for _ in range(dit_depth)
-            ])
+            if decoder_type == "ditx":
+                self.dit_blocks = nn.ModuleList([
+                    DiTXBlock(
+                        d_model=hidden_dim,
+                        nhead=n_heads,
+                        dim_feedforward=hidden_dim * 4,
+                        dropout=dropout,
+                        time_dim=hidden_dim,
+                        rotary_emb=self.rotary_emb_decoder,
+                    )
+                    for _ in range(dit_depth)
+                ])
+                print(f"  [VelocityNet] DiT-X decoder: {dit_depth} DiTXBlock "
+                      f"(9-param AdaLN-Zero, cross-attention w/ RoPE)")
+            else:  # dit1d legacy
+                self.dit_blocks = nn.ModuleList([
+                    DiT1DBlock(
+                        d_model=hidden_dim,
+                        nhead=n_heads,
+                        dim_feedforward=hidden_dim * 4,
+                        dropout=dropout,
+                        time_dim=hidden_dim,
+                        rotary_emb=self.rotary_emb_decoder,
+                    )
+                    for _ in range(dit_depth)
+                ])
+                print(f"  [VelocityNet] DiT-1D decoder: {dit_depth} DiT1DBlock "
+                      f"(6-param AdaLN-Zero, additive context)")
             self.blocks = None
         else:
             self.rotary_emb_decoder = None
@@ -863,12 +1077,28 @@ class VelocityNet(nn.Module):
         h = self.input_proj(x)
 
         if self._use_dit:
-            h = h + context_encoded
-            for block in self.dit_blocks:
-                if self.gradient_checkpointing and self.training:
-                    h = checkpoint(block, h, t_emb, use_reentrant=False)
-                else:
-                    h = block(h, t_emb)
+            if self._decoder_type == "ditx":
+                # DiT-X: additive context shortcut (baseline) + cross-attn (refinement)
+                # The additive path provides context from epoch 0 (identical to dit1d).
+                # Cross-attention gates start at 0 (AdaLN-Zero) and gradually open,
+                # adding per-layer, per-position context refinement on top.
+                h = h + context_encoded
+                if self.target_pos_emb is not None:
+                    T_h = h.shape[1]
+                    h = h + self.target_pos_emb[:, :T_h, :]
+                for block in self.dit_blocks:
+                    if self.gradient_checkpointing and self.training:
+                        h = checkpoint(block, h, t_emb, context_encoded, use_reentrant=False)
+                    else:
+                        h = block(h, t_emb, context_encoded)
+            else:
+                # DiT-1D legacy: additive context fusion, self-attn only
+                h = h + context_encoded
+                for block in self.dit_blocks:
+                    if self.gradient_checkpointing and self.training:
+                        h = checkpoint(block, h, t_emb, use_reentrant=False)
+                    else:
+                        h = block(h, t_emb)
         else:
             if x.dim() == 3 and self.target_pos_emb is not None:
                 T = h.shape[1]

@@ -1,9 +1,12 @@
 # =====================================================================
-# BrainFlow Seq2Seq v5 — multitoken context fusion + 1D-DiT velocity
+# BrainFlow Seq2Seq v6 — DiT-X decoder (ManiFlow-style cross-attention)
 # =====================================================================
 # Encoder:  Per-modality MultiTokenFusion → RoPE Transformer (no mask) → (B,101,H)
 #           Temporal slice [T_past:T_past+50] with T_past=(101-50)//2 → (B,50,H)
-# Decoder:  x_t_emb + context_50 → DiT blocks (RoPE self-attn, AdaLN-Zero) → 7 net heads
+# Decoder (decoder_type):
+#   'ditx':  DiT-X blocks (AdaLN-Zero on SelfAttn+CrossAttn+FFN, 9 params, RoPE Q/K)
+#            Context queried at every block via cross-attn (NOT additive)
+#   'dit1d': Legacy DiT blocks (AdaLN-Zero on SelfAttn+FFN, 6 params, additive context)
 # Reg head: pool(detach) over 50 context steps → temporal-mean fMRI anchor
 # Legacy decoder: set use_dit_decoder: false (FiLM + cross-attn)
 # fMRI acquisition TR ~1.49s (metadata only; not read by train_brainflow / evaluate_brainflow)
@@ -80,7 +83,7 @@ dataloader:
 # Model config — Seq2Seq v5 (1D-DiT + temporal slicing)
 # model_version: used by evaluate_brainflow.py
 # =====================================================================
-model_version: v5
+model_version: v6
 
 brainflow:
   output_dim: 1000             # also used as velocity_net output_dim via default
@@ -107,6 +110,7 @@ brainflow:
     latent_dim: 1024
     context_encoder: multitoken
     use_dit_decoder: true
+    decoder_type: ditx             # 'ditx' (DiT-X: cross-attn + 9-param AdaLN) or 'dit1d' (legacy: additive + 6-param AdaLN)
     zero_init_network_heads: true
     # --- multitoken fusion + optional legacy FiLM decoder path
     proj_dim: 256
@@ -130,7 +134,7 @@ solver_args:
 # Training
 # =====================================================================
 training:
-  n_epochs: 100
+  n_epochs: 200
   lr: 1.0e-4
   weight_decay: 0.01
   warmup_ratio: 0.05
@@ -146,4 +150,4 @@ training:
   empty_cuda_cache_each_epoch: false
 
 # --- Output ---
-output_dir: outputs/brainflow_seq2seq_v5
+output_dir: outputs/brainflow_seq2seq_v6_ditx
