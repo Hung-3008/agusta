@@ -70,8 +70,11 @@ brainflow:
   cont_weight: 0.0
   cont_dim: 256
   indi_flow_matching: true
-  indi_train_time_sqrt: false
+  indi_train_time_sqrt: true
   indi_min_denom: 1.0e-3
+  use_csfm: true
+  csfm_var_reg_weight: 0.1
+  csfm_align_weight: 0.1
 
   velocity_net:
     hidden_dim: 1024
@@ -107,7 +110,7 @@ solver_args:
 training:
   n_epochs: 200
   lr: 1.0e-4
-  weight_decay: 0.01
+  weight_decay: 0.05
   warmup_ratio: 0.05
   min_lr: 1.0e-6
   grad_clip: 1.0

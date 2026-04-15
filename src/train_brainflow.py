@@ -583,6 +583,9 @@ def train(args):
         indi_flow_matching=bf_cfg.get("indi_flow_matching", False),
         indi_train_time_sqrt=bf_cfg.get("indi_train_time_sqrt", False),
         indi_min_denom=bf_cfg.get("indi_min_denom", 1e-3),
+        use_csfm=bf_cfg.get("use_csfm", False),
+        csfm_var_reg_weight=bf_cfg.get("csfm_var_reg_weight", 0.1),
+        csfm_align_weight=bf_cfg.get("csfm_align_weight", 0.1),
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

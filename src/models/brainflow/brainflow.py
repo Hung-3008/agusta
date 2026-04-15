@@ -711,8 +711,13 @@ class MultiTokenFusion(nn.Module):
                 torch.randn(self.n_modalities, fusion_proj_dim) * 0.02
             )
             self.concat_dim = self.n_modalities * fusion_proj_dim
+            intermediate_dim = 2048
             self.fusion_to_hidden = nn.Sequential(
-                nn.Linear(self.concat_dim, hidden_dim),
+                nn.Linear(self.concat_dim, intermediate_dim),
+                nn.LayerNorm(intermediate_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(intermediate_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
@@ -1140,6 +1145,53 @@ def info_nce_loss(z_pred, z_target, temperature=0.07):
     return (loss_p2t + loss_t2p) / 2
 
 
+class AECNN_HRF_Source(nn.Module):
+    """
+    Condition-dependent Source Generator using Biological HRF Prior.
+    Compresses temporal context into neural events and filters through an HRF conv layer
+    to create a biological base distribution (mu_phi) and variance (sigma_phi).
+    """
+    def __init__(self, context_dim: int, latent_dim: int, hrf_kernel_size: int = 12):
+        super().__init__()
+        # Step 1: Neural Event Extractor
+        self.neural_event_net = nn.Sequential(
+            nn.Conv1d(context_dim, 512, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(512, latent_dim, kernel_size=3, padding=1),
+            nn.Sigmoid()  # Soft binarization to simulate neural firing
+        )
+        
+        # Step 2: HRF Convolutional Filter
+        # Linear Conv1D without activation simulating hemodynamic convolution
+        self.hrf_filter = nn.Conv1d(
+            latent_dim, latent_dim, 
+            kernel_size=hrf_kernel_size, 
+            padding='same', 
+            groups=latent_dim
+        )
+        
+        # Sigma Predictor (Variance)
+        self.sigma_net = nn.Sequential(
+            nn.Linear(context_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
+            nn.Softplus()  # Ensure strictly positive variance
+        )
+
+    def forward(self, context_sequence: torch.Tensor, context_pooled: torch.Tensor):
+        # context_sequence: [B, C, T]
+        # context_pooled: [B, C]
+        
+        neural_events = self.neural_event_net(context_sequence) # [B, latent_dim, T]
+        mu_phi = self.hrf_filter(neural_events)                # [B, latent_dim, T]
+        mu_phi = mu_phi.transpose(1, 2)                        # [B, T, latent_dim]
+        
+        sigma_phi = self.sigma_net(context_pooled).unsqueeze(1) # [B, 1, 1]
+        
+        return mu_phi, sigma_phi
+
+
+
 class BrainFlow(nn.Module):
     """Flow matching with auxiliary regression, optional contrastive loss, and CFG.
 
@@ -1160,6 +1212,9 @@ class BrainFlow(nn.Module):
         indi_flow_matching: bool = False,
         indi_train_time_sqrt: bool = False,
         indi_min_denom: float = 1e-3,
+        use_csfm: bool = False,
+        csfm_var_reg_weight: float = 0.1,
+        csfm_align_weight: float = 0.1,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -1168,6 +1223,9 @@ class BrainFlow(nn.Module):
         self.indi_flow_matching = indi_flow_matching
         self.indi_train_time_sqrt = indi_train_time_sqrt
         self.indi_min_denom = indi_min_denom
+        self.use_csfm = use_csfm
+        self.csfm_var_reg_weight = csfm_var_reg_weight
+        self.csfm_align_weight = csfm_align_weight
 
         vn_cfg = dict(velocity_net_params or {})
         vn_cfg.setdefault("output_dim", output_dim)
@@ -1200,18 +1258,29 @@ class BrainFlow(nn.Module):
             self.gamma_reg_weight = 0.0
 
         reg_hidden = hidden_dim * 2
-        self.reg_head = nn.Sequential(
-            nn.Linear(hidden_dim, reg_hidden),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(reg_hidden, reg_hidden),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(reg_hidden, reg_hidden),
-            nn.GELU(),
-        )
         reg_out_dim = latent_dim if use_subject_head else output_dim
-        self.reg_output = nn.Linear(reg_hidden, reg_out_dim)
+
+        if self.use_csfm:
+            self.hrf_source = AECNN_HRF_Source(
+                context_dim=hidden_dim,
+                latent_dim=latent_dim,
+                hrf_kernel_size=vn_cfg.get("hrf_kernel_size", 12)
+            )
+            self.reg_head = None
+            self.reg_output = None
+        else:
+            self.hrf_source = None
+            self.reg_head = nn.Sequential(
+                nn.Linear(hidden_dim, reg_hidden),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(reg_hidden, reg_hidden),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(reg_hidden, reg_hidden),
+                nn.GELU(),
+            )
+            self.reg_output = nn.Linear(reg_hidden, reg_out_dim)
 
         # --- Contrastive Projection Heads ---
         self.contrastive_proj = nn.Sequential(
@@ -1227,19 +1296,25 @@ class BrainFlow(nn.Module):
 
         # Log parameters
         vn_params = sum(p.numel() for p in self.velocity_net.parameters())
-        reg_params = sum(p.numel() for p in self.reg_head.parameters()) + \
-                     sum(p.numel() for p in self.reg_output.parameters())
+        reg_params = 0
+        if not self.use_csfm:
+            reg_params = sum(p.numel() for p in self.reg_head.parameters()) + \
+                         sum(p.numel() for p in self.reg_output.parameters())
+        csfm_params = sum(p.numel() for p in self.hrf_source.parameters()) if self.use_csfm else 0
         cont_params = sum(p.numel() for p in self.contrastive_proj.parameters()) + \
                       sum(p.numel() for p in self.target_proj.parameters())
         warp_params = sum(p.numel() for p in self.time_warp_net.parameters()) if self.use_tensor_fm else 0
-        total = vn_params + reg_params + cont_params + warp_params
+        total = vn_params + reg_params + csfm_params + cont_params + warp_params
         print(f"[BrainFlow] VelocityNet: {vn_params:,} params")
-        print(f"[BrainFlow] RegressionHead: {reg_params:,} params")
+        if self.use_csfm:
+            print(f"[BrainFlow] CSFM HRF Source: {csfm_params:,} params")
+        else:
+            print(f"[BrainFlow] RegressionHead: {reg_params:,} params")
         print(f"[BrainFlow] ContrastiveHeads: {cont_params:,} params")
         if self.use_tensor_fm:
             print(f"[BrainFlow] TimeWarpNet: {warp_params:,} params (gamma_reg={self.gamma_reg_weight})")
         print(f"[BrainFlow] Total: {total:,} params "
-              f"(reg_w={reg_weight}, cont_w={cont_weight}, tensor_fm={self.use_tensor_fm}, "
+              f"(csfm={self.use_csfm}, reg_w={reg_weight}, cont_w={cont_weight}, tensor_fm={self.use_tensor_fm}, "
               f"indi={self._indi_effective}, indi_t_sqrt={indi_train_time_sqrt})")
 
     def compute_loss(
@@ -1272,11 +1347,49 @@ class BrainFlow(nn.Module):
         # 2. Regression branch with gradient isolation (NSD improvement)
         # .detach() prevents regression from pulling the shared encoder
         _zero = torch.tensor(0.0, device=target.device)
+        csfm_var_reg_loss = _zero
+        csfm_align_loss = _zero
+        x_0_csfm = None
+
         if skip_aux:
             reg_loss = _zero
             cont_loss = _zero
         else:
-            if self.reg_weight > 0:
+            if self.use_csfm:
+                ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
+                ctx_transposed = ctx_detached.transpose(1, 2)
+                ctx_pooled_reg = ctx_detached.mean(dim=1)
+                
+                mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled_reg)
+                
+                if self.velocity_net.use_subject_head:
+                    if subject_ids is None:
+                        subject_ids = torch.zeros(target.shape[0], dtype=torch.long, device=target.device)
+                    fmri_pred = self.velocity_net.subject_layers(mu_phi_latent, subject_ids)
+                else:
+                    fmri_pred = mu_phi_latent
+
+                epsilon = torch.randn_like(target)
+                x_0_csfm = fmri_pred + sigma_phi * epsilon
+                
+                # CSFM Losses
+                csfm_var_reg_loss = torch.mean(sigma_phi**2 - torch.log(sigma_phi**2 + 1e-8) - 1.0)
+                
+                # Cosine alignment between the clean base distribution (mu_phi) and target
+                cos_sim = F.cosine_similarity(fmri_pred.flatten(1), target.flatten(1), dim=1)
+                csfm_align_loss = torch.mean(1.0 - cos_sim)
+                
+                reg_loss = _zero # Replaced by CSFM loss
+                if self.cont_weight > 0:
+                    pred_for_reg = fmri_pred.mean(dim=1) if fmri_pred.dim() == 3 else fmri_pred
+                    target_for_reg = target.mean(dim=1) if target.dim() == 3 else target
+                    z_pred = F.normalize(self.contrastive_proj(pred_for_reg.detach()), dim=-1)
+                    z_target = F.normalize(self.target_proj(target_for_reg), dim=-1)
+                    cont_loss = info_nce_loss(z_pred, z_target)
+                else:
+                    cont_loss = _zero
+
+            elif self.reg_weight > 0:
                 ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
                 ctx_pooled_reg = ctx_detached.mean(dim=1)  # (B, hidden) — pool over T_ctx
                 reg_hidden = self.reg_head(ctx_pooled_reg)
@@ -1306,6 +1419,8 @@ class BrainFlow(nn.Module):
         x_1 = target
         if starting_distribution is not None:
             x_0 = starting_distribution
+        elif self.use_csfm and not skip_aux:
+            x_0 = x_0_csfm
         else:
             x_0 = torch.randn_like(x_1)
 
@@ -1357,15 +1472,23 @@ class BrainFlow(nn.Module):
             flow_loss = F.mse_loss(v_pred, target_velocity)
 
         # 6. Total loss
-        total_loss = (flow_loss
-                      + self.reg_weight * reg_loss
-                      + self.cont_weight * cont_loss
-                      + self.gamma_reg_weight * gamma_reg)
+        total_loss = flow_loss
+        if self.use_csfm:
+            total_loss = total_loss + self.csfm_var_reg_weight * csfm_var_reg_loss
+            total_loss = total_loss + self.csfm_align_weight * csfm_align_loss
+            if self.cont_weight > 0:
+                total_loss = total_loss + self.cont_weight * cont_loss
+        else:
+            total_loss = total_loss + self.reg_weight * reg_loss
+            total_loss = total_loss + self.cont_weight * cont_loss
+            
+        total_loss = total_loss + self.gamma_reg_weight * gamma_reg
 
         return {
             "total_loss": total_loss,
             "flow_loss": flow_loss,
-            "align_loss": reg_loss,
+            "align_loss": csfm_align_loss if self.use_csfm else reg_loss,
+            "var_reg_loss": csfm_var_reg_loss if self.use_csfm else _zero,
             "cont_loss": cont_loss,
             "gamma_reg": gamma_reg,
         }
@@ -1445,6 +1568,19 @@ class BrainFlow(nn.Module):
             )
 
         # --- Initialise x_0 ---
+        if starting_distribution is None and self.use_csfm:
+            ctx_transposed = context_encoded.transpose(1, 2)
+            ctx_pooled = context_encoded.mean(dim=1)
+            mu_phi_latent, _ = self.hrf_source(ctx_transposed, ctx_pooled)
+            
+            if self.velocity_net.use_subject_head:
+                if subject_ids is None:
+                    subject_ids = torch.zeros(B, dtype=torch.long, device=device)
+                mu_phi_fmri = self.velocity_net.subject_layers(mu_phi_latent, subject_ids)
+            else:
+                mu_phi_fmri = mu_phi_latent
+            starting_distribution = mu_phi_fmri
+
         if starting_distribution is not None:
             x = starting_distribution.to(device=device, dtype=dtype)
         elif temperature > 0:
