@@ -1276,26 +1276,30 @@ class BrainFlow(nn.Module):
             reg_loss = _zero
             cont_loss = _zero
         else:
-            ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
-            ctx_pooled_reg = ctx_detached.mean(dim=1)  # (B, hidden) — pool over T_ctx
-            reg_hidden = self.reg_head(ctx_pooled_reg)
-            latent_reg = self.reg_output(reg_hidden)
-            if self.velocity_net.use_subject_head:
-                if subject_ids is None:
-                    subject_ids = torch.zeros(target.shape[0], dtype=torch.long, device=target.device)
-                fmri_pred = self.velocity_net.subject_layers(latent_reg, subject_ids)  # (B, V)
-            else:
-                fmri_pred = latent_reg
+            if self.reg_weight > 0:
+                ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
+                ctx_pooled_reg = ctx_detached.mean(dim=1)  # (B, hidden) — pool over T_ctx
+                reg_hidden = self.reg_head(ctx_pooled_reg)
+                latent_reg = self.reg_output(reg_hidden)
+                if self.velocity_net.use_subject_head:
+                    if subject_ids is None:
+                        subject_ids = torch.zeros(target.shape[0], dtype=torch.long, device=target.device)
+                    fmri_pred = self.velocity_net.subject_layers(latent_reg, subject_ids)  # (B, V)
+                else:
+                    fmri_pred = latent_reg
 
-            # Regression target: temporal mean for seq2seq mode, direct for single-TR
-            target_for_reg = target.mean(dim=1) if target.dim() == 3 else target  # (B, V)
-            reg_loss = F.mse_loss(fmri_pred, target_for_reg)
+                # Regression target: temporal mean for seq2seq mode, direct for single-TR
+                target_for_reg = target.mean(dim=1) if target.dim() == 3 else target  # (B, V)
+                reg_loss = F.mse_loss(fmri_pred, target_for_reg)
 
-            if self.cont_weight > 0:
-                z_pred = F.normalize(self.contrastive_proj(fmri_pred.detach()), dim=-1)
-                z_target = F.normalize(self.target_proj(target_for_reg), dim=-1)
-                cont_loss = info_nce_loss(z_pred, z_target)
+                if self.cont_weight > 0:
+                    z_pred = F.normalize(self.contrastive_proj(fmri_pred.detach()), dim=-1)
+                    z_target = F.normalize(self.target_proj(target_for_reg), dim=-1)
+                    cont_loss = info_nce_loss(z_pred, z_target)
+                else:
+                    cont_loss = _zero
             else:
+                reg_loss = _zero
                 cont_loss = _zero
 
         # 4. Flow matching source distribution (x_0)

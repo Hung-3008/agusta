@@ -24,7 +24,7 @@ fmri:
 
 # --- Pre-extracted encoder context latents (10 modalities) ---
 context_latent_dirs:
-  - Data/features_npy_pooled/vjepa2_avg_feat       # Visual (V-JEPA 2)
+  - Data/features_npy_pooled/vjepa2_avg_feat        # Visual (V-JEPA 2)
   - Data/features_npy_pooled/whisper                # Audio (Whisper)
   - Data/features_npy_pooled/Llama-3.2-1B           # Text (LLaMA-1B)
   - Data/features_npy_pooled/Llama-3.2-3B           # Text (LLaMA-3B)
@@ -32,8 +32,8 @@ context_latent_dirs:
   - Data/features_npy_pooled/qwen-2-5-omni-7b       # Multimodal (Qwen-Omni)
   - Data/features_npy_pooled/internvl3_8b_8bit      # Vision-Language (InternVL3-8B)
   - Data/features_npy_pooled/InternVL3_14B          # Vision-Language (InternVL3-14B)
-  - Data/features_npy_pooled/dinov2_giant            # Visual (DINOv2-giant)
-  - Data/features_npy_pooled/vlm2vec_7b              # Vision-Language (VLM2Vec-7B)
+  - Data/features_npy_pooled/dinov2_giant           # Visual (DINOv2-giant)
+  - Data/features_npy_pooled/vlm2vec_7b             # Vision-Language (VLM2Vec-7B)
 
 modality_dims:
   - 1408   # [0] vjepa2_avg_feat
