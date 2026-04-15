@@ -1372,15 +1372,17 @@ class BrainFlow(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
         time_grid_warp: str | None,
+        max_t: float = 1.0,
     ) -> torch.Tensor:
         """Monotone grid in [0, 1]. ``sqrt`` uses T = sqrt(s) for finer steps near t→1."""
         if n_timesteps < 2:
             n_timesteps = 2
-        s = torch.linspace(0, 1, n_timesteps, device=device, dtype=dtype)
+        max_t = float(max(0.0, min(1.0, max_t)))
+        s = torch.linspace(0, max_t, n_timesteps, device=device, dtype=dtype)
         if time_grid_warp is None or time_grid_warp in ("", "none", "linear"):
             return s
         if time_grid_warp == "sqrt":
-            return torch.sqrt(s)
+            return torch.sqrt(torch.clamp(s / max(max_t, 1e-8), min=0.0, max=1.0)) * max_t
         raise ValueError(
             f"time_grid_warp must be None, 'linear', or 'sqrt', got {time_grid_warp!r}"
         )
@@ -1402,6 +1404,8 @@ class BrainFlow(nn.Module):
         starting_distribution: torch.Tensor = None,
         temperature: float = 0.0,
         time_grid_warp: str | None = None,
+        time_grid_max: float = 1.0,
+        final_jump: bool = False,
     ) -> torch.Tensor:
         """Generate fMRI by solving ODE. Supports single-TR and seq2seq modes.
 
@@ -1417,6 +1421,8 @@ class BrainFlow(nn.Module):
             starting_distribution: Custom x_0 — any shape matching output.
             temperature:           Std-dev of starting noise (0 = zero init).
             time_grid_warp:        ``'sqrt'`` = finer steps near t→1.
+            time_grid_max:         Upper integration bound in [0,1] to avoid t→1 singularity.
+            final_jump:            If True and time_grid_max<1, perform a final residual jump.
 
         Returns:
             fmri_pred: (B, output_dim) or (B, n_target_trs, output_dim).
@@ -1445,7 +1451,13 @@ class BrainFlow(nn.Module):
             x = torch.zeros(*shape, device=device, dtype=dtype)
 
         # --- Build time grid ---
-        T_grid = self._build_time_grid(n_timesteps, device, dtype, time_grid_warp)
+        T_grid = self._build_time_grid(
+            n_timesteps,
+            device,
+            dtype,
+            time_grid_warp,
+            max_t=time_grid_max,
+        )
 
         # --- Velocity helper (handles InDI recovery) ---
         def _vel(x_in, t_scalar, ctx_enc):
@@ -1483,5 +1495,31 @@ class BrainFlow(nn.Module):
                 if cfg_scale > 0:
                     v = _vel(x, t_i, uncond_encoded) + cfg_scale * (v - _vel(x, t_i, uncond_encoded))
                 x = x + dt * v
+
+        # Optional final step for singularity-avoidance schedules that stop before t=1.
+        if final_jump and float(T_grid[-1].item()) < 1.0:
+            t_last = T_grid[-1]
+            t_b = t_last.reshape(1).expand(B)
+            u_last = self.velocity_net(
+                x=x,
+                t=t_b,
+                pre_encoded_context=context_encoded,
+                subject_ids=subject_ids,
+            )
+            if cfg_scale > 0:
+                u_uncond = self.velocity_net(
+                    x=x,
+                    t=t_b,
+                    pre_encoded_context=uncond_encoded,
+                    subject_ids=subject_ids,
+                )
+                u_last = u_uncond + cfg_scale * (u_last - u_uncond)
+
+            if self._indi_effective:
+                # InDI predicts residual u ≈ x_1 - x_t at late t.
+                x = x + u_last
+            else:
+                # Non-InDI models already predict velocity, so integrate remaining interval.
+                x = x + (1.0 - t_last) * u_last
 
         return x
