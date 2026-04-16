@@ -491,34 +491,6 @@ def get_dataloaders(cfg):
     return train_loader, val_loader
 
 
-# =============================================================================
-# Residual Flow Matching helper
-# =============================================================================
-
-def _get_base_prediction(base_model, context, subject_ids: torch.Tensor):
-    """Run frozen base model regression head -> (starting_dist, residual_context).
-
-    Requires ``base_model.velocity_net.fusion_block`` (multitoken path).
-    """
-    if base_model.velocity_net.fusion_block is None:
-        raise RuntimeError(
-            "Residual FM requires a multitoken base model. "
-            "The loaded base model does not expose fusion_block (flat encoder is unsupported)."
-        )
-    base_dim = sum(base_model.velocity_net.fusion_block.modality_dims)
-    base_context = context[..., :base_dim]
-    residual_context = context[..., base_dim:]
-
-    encoded = base_model.velocity_net.encode_context_from_cond(base_context)
-    pooled = encoded.mean(dim=1)
-    latent = base_model.reg_output(base_model.reg_head(pooled))
-    if base_model.velocity_net.use_subject_head:
-        starting_dist = base_model.velocity_net.subject_layers(latent, subject_ids)
-    else:
-        starting_dist = latent
-
-    return starting_dist, residual_context
-
 
 # =============================================================================
 # Training
@@ -563,22 +535,14 @@ def train(args):
     logger.info("Context encoder mode: %s", vn_params.get("context_encoder", "multitoken"))
     modality_dims = cfg.get("modality_dims", None)
 
-    if "base_model" in cfg and modality_dims:
-        base_model_cfg = load_config(cfg["base_model"]["config"])
-        base_modality_count = len(base_model_cfg.get("modalities", []))
-        vn_params["modality_dims"] = modality_dims[base_modality_count:]
-        logger.info("Residual FM: target model uses %d modalities %s",
-                     len(vn_params["modality_dims"]), vn_params["modality_dims"])
-    elif modality_dims:
+    if modality_dims:
         vn_params["modality_dims"] = modality_dims
 
     model = BrainFlow(
         output_dim=output_dim,
         velocity_net_params=vn_params,
         n_subjects=len(cfg["subjects"]),
-        reg_weight=bf_cfg.get("reg_weight", 1.0),
-        cont_weight=bf_cfg.get("cont_weight", 0.1),
-        cont_dim=bf_cfg.get("cont_dim", 256),
+
         tensor_fm_params=bf_cfg.get("tensor_fm", None),
         indi_flow_matching=bf_cfg.get("indi_flow_matching", False),
         indi_train_time_sqrt=bf_cfg.get("indi_train_time_sqrt", False),
@@ -590,37 +554,6 @@ def train(args):
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Trainable parameters: %s", f"{n_params:,}")
-
-    # --- Frozen base model (Residual FM) ---
-    base_model = None
-    if "base_model" in cfg:
-        base_cfg_path = cfg["base_model"].get("config")
-        base_ckpt_path = cfg["base_model"].get("checkpoint")
-        if base_cfg_path and base_ckpt_path:
-            logger.info("Loading frozen base model for Residual FM...")
-            bm_cfg = load_config(base_cfg_path)
-
-            bm_vn_params = dict(bm_cfg["brainflow"]["velocity_net"])
-            if "modalities" in bm_cfg:
-                bm_vn_params["modality_dims"] = [m["dim"] for m in bm_cfg["modalities"]]
-            else:
-                bm_vn_params["modality_dims"] = bm_cfg.get("modality_dims", [1408])
-
-            base_model = BrainFlow(
-                output_dim=bm_cfg["brainflow"].get("output_dim", 1000),
-                velocity_net_params=bm_vn_params,
-                n_subjects=len(cfg["subjects"]),
-                reg_weight=bm_cfg["brainflow"].get("reg_weight", 0.5),
-            ).to(device)
-
-            base_ckpt = torch.load(base_ckpt_path, map_location=device, weights_only=False)
-            bm_state = base_ckpt.get("model", base_ckpt)
-            base_model.load_state_dict(bm_state)
-            base_model.eval()
-            for p in base_model.parameters():
-                p.requires_grad_(False)
-            logger.info("Loaded frozen base model from %s", base_ckpt_path)
-            del base_ckpt
 
     # --- Optimizer & Scheduler ---
     tr_cfg = cfg["training"]
@@ -733,18 +666,10 @@ def train(args):
             if cfg_drop:
                 context = torch.zeros_like(context)
 
-            starting_distribution = None
-            if base_model is not None:
-                with torch.no_grad():
-                    starting_distribution, context = _get_base_prediction(
-                        base_model, context, subject_ids,
-                    )
-
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
                 losses = model.compute_loss(
                     context, target,
                     subject_ids=subject_ids,
-                    starting_distribution=starting_distribution,
                     skip_aux=cfg_drop,
                 )
                 raw_loss = losses["total_loss"]
@@ -767,8 +692,7 @@ def train(args):
                     postfix = {
                         "loss": f"{np.mean(train_losses[-50:]):.4f}",
                         "flow": f"{losses['flow_loss'].item():.4f}",
-                        "reg": f"{losses['align_loss'].item():.4f}",
-                        "cont": f"{losses.get('cont_loss', torch.tensor(0.0)).item():.4f}",
+                        "align": f"{losses['align_loss'].item():.4f}",
                         "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                     }
                     if model.use_tensor_fm:
@@ -814,12 +738,6 @@ def train(args):
                         synth_kwargs["time_grid_warp"] = tw
                     if val_cfg_scale > 0:
                         synth_kwargs["cfg_scale"] = val_cfg_scale
-
-                    if base_model is not None:
-                        starting_dist, context = _get_base_prediction(
-                            base_model, context, subject_ids,
-                        )
-                        synth_kwargs["starting_distribution"] = starting_dist
 
                     gen_fmri = model.synthesise(context, **synth_kwargs)
 
