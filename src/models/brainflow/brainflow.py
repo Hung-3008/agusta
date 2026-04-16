@@ -1005,8 +1005,8 @@ class VelocityNet(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_dim)
         if use_subject_head:
             self.latent_head = nn.Linear(hidden_dim, self.latent_dim)
-            nn.init.constant_(self.latent_head.weight, 0)
-            nn.init.constant_(self.latent_head.bias, 0)
+            # Removed zero initialization on latent_head back to standard PyTorch initialization.
+            # This prevents Double-Zero Initialization Gradient Death when NetworkSubjectLayers is also zero-initialized.
             self.output_layer = None
         else:
             self.latent_head = None
