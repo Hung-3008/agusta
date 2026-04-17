@@ -632,8 +632,6 @@ def train(args):
             logger.warning("--resume but no last.pt found.")
 
     history_file = out_dir / "history.csv"
-    if start_epoch == 1:
-        history_file.write_text("epoch,train_loss,val_fmri_pcc,lr\n")
 
     solver_cfg = cfg.get("solver_args", {})
     val_n_timesteps = solver_cfg.get("time_points", 50)
@@ -647,7 +645,7 @@ def train(args):
     # --- Training loop ---
     for epoch in range(start_epoch, tr_cfg["n_epochs"] + 1):
         model.train()
-        train_losses = []
+        train_losses = defaultdict(list)
         micro_accum = 0
         optimizer.zero_grad(set_to_none=True)
 
@@ -677,7 +675,8 @@ def train(args):
                 loss = raw_loss / accum_steps
 
             loss.backward()
-            train_losses.append(float(raw_loss.detach()))
+            for k, v in losses.items():
+                train_losses[k].append(v.item())
 
             micro_accum += 1
             if micro_accum >= accum_steps:
@@ -691,7 +690,7 @@ def train(args):
 
                 if global_step % tr_cfg["log_every_n_steps"] == 0:
                     postfix = {
-                        "loss": f"{np.mean(train_losses[-50:]):.4f}",
+                        "loss": f"{np.mean(train_losses['total_loss'][-50:]):.4f}",
                         "flow": f"{losses['flow_loss'].item():.4f}",
                         "pcc": f"{losses['pcc_loss'].item():.4f}",
                         "lr": f"{scheduler.get_last_lr()[0]:.2e}",
@@ -800,8 +799,13 @@ def train(args):
                 torch.save(model.state_dict(), out_dir / "best.pt")
                 logger.info("Saved new best EMA model (PCC=%.4f)", best_val_corr)
 
+            if not history_file.exists() or history_file.stat().st_size == 0:
+                header = "epoch," + ",".join(train_losses.keys()) + ",val_fmri_pcc,lr\n"
+                history_file.write_text(header)
+
             with open(history_file, "a") as f:
-                f.write(f"{epoch},{np.mean(train_losses):.6f},{mean_fmri_corr:.6f},"
+                loss_vals = [f"{np.mean(train_losses[k]):.6f}" for k in train_losses.keys()]
+                f.write(f"{epoch},{','.join(loss_vals)},{mean_fmri_corr:.6f},"
                         f"{scheduler.get_last_lr()[0]:.2e}\n")
 
             ema.restore(model)

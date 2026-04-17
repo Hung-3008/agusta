@@ -23,7 +23,7 @@ class InferenceStrategyConfig:
 	use_pruned_sampling: bool = False
 	prune_k: int = 5
 	n_seeds: int = 1
-	ensemble_mode: str = "none"  # none | mean | parcel_stitch
+	ensemble_mode: str = "none"  # none | mean | max | parcel_stitch
 	base_seed: int = 1234
 
 
@@ -161,6 +161,9 @@ def run_multiseed_synthesis(
 
 	if mode == "mean":
 		return torch.stack(preds_by_seed, dim=0).mean(dim=0), preds_by_seed
+
+	if mode == "max":
+		return torch.stack(preds_by_seed, dim=0).max(dim=0)[0], preds_by_seed
 
 	if mode == "parcel_stitch":
 		if parcel_seed_map is None:

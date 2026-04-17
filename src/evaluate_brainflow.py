@@ -152,13 +152,14 @@ class ModelRunner:
             output_dim=bf.get("output_dim", self.n_voxels),
             velocity_net_params=vn_params,
             n_subjects=len(self.subjects),
-            reg_weight=bf.get("reg_weight", 1.0),
-            cont_weight=bf.get("cont_weight", 0.0),
-            cont_dim=bf.get("cont_dim", 256),
             tensor_fm_params=bf.get("tensor_fm", None),
             indi_flow_matching=bf.get("indi_flow_matching", False),
             indi_train_time_sqrt=bf.get("indi_train_time_sqrt", False),
             indi_min_denom=bf.get("indi_min_denom", 1e-3),
+            use_csfm=bf.get("use_csfm", False),
+            csfm_var_reg_weight=bf.get("csfm_var_reg_weight", 0.1),
+            csfm_pcc_weight=bf.get("csfm_pcc_weight", 1.0),
+            flow_loss_weight=bf.get("flow_loss_weight", 1.0),
         ).to(self.device)
 
         log.info("Built BrainFlow: %s params | decoder=%s",
@@ -903,7 +904,7 @@ def main():
                    help="Enable strategy-2 pruned sampling around regression anchor")
     p.add_argument("--prune_k", type=int, default=None, help="Number of x0 candidates for pruning")
     p.add_argument("--n_seeds", type=int, default=None, help="Number of seeds for strategy-4 ensemble")
-    p.add_argument("--ensemble_mode", default=None, choices=["none", "mean", "parcel_stitch"],
+    p.add_argument("--ensemble_mode", default=None, choices=["none", "mean", "max", "parcel_stitch"],
                    help="Ensemble aggregation mode")
     p.add_argument("--base_seed", type=int, default=None, help="Base random seed for multi-seed inference")
 

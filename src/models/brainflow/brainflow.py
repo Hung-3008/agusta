@@ -1530,7 +1530,7 @@ class BrainFlow(nn.Module):
         if self.use_csfm:
             ctx_transposed = context_encoded.transpose(1, 2)
             ctx_pooled = context_encoded.mean(dim=1)
-            mu_phi_latent, _ = self.hrf_source(ctx_transposed, ctx_pooled)
+            mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled)
             
             if self.velocity_net.use_subject_head:
                 if subject_ids is None:
@@ -1539,6 +1539,9 @@ class BrainFlow(nn.Module):
             else:
                 mu_phi_fmri = mu_phi_latent
             x = mu_phi_fmri.to(device=device, dtype=dtype)
+            if temperature > 0:
+                epsilon = torch.randn_like(x)
+                x = x + temperature * sigma_phi * epsilon
         elif temperature > 0:
             shape = (B, n_target, self.output_dim) if n_target > 1 else (B, self.output_dim)
             x = temperature * torch.randn(*shape, device=device, dtype=dtype)
