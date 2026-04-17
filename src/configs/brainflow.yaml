@@ -6,9 +6,17 @@
 # Decoder (decoder_type):
 #   'ditx':  DiT-X blocks (AdaLN-Zero on SelfAttn+CrossAttn+FFN, 9 params, RoPE Q/K)
 #            Context queried at every block via cross-attn (NOT additive)
+#            + Full Attention Residuals theo depth (x_history) trong code hiện tại.
 #   'dit1d': Legacy DiT blocks (AdaLN-Zero on SelfAttn+FFN, 6 params, additive context)
-# Reg head: pool(detach) over 50 context steps → temporal-mean fMRI anchor
+# Regression head đã được loại bỏ ở nhánh hiện tại.
+# (Nếu còn `reg_weight` bên dưới thì chỉ là legacy key, model không dùng.)
 # Legacy decoder: set use_dit_decoder: false (FiLM + cross-attn)
+# Mode matrix hỗ trợ:
+#   - DiT-X + InDI (mặc định)
+#   - DiT-1D + InDI (set decoder_type: dit1d)
+#   - FiLM legacy (set use_dit_decoder: false)
+#   - + CSFM source prior (set use_csfm: true)
+#   - + Tensor FM schedule (set brainflow.tensor_fm: {...}; khi đó InDI sẽ bị bỏ qua)
 # fMRI acquisition TR ~1.49s (metadata only; not read by train_brainflow / evaluate_brainflow)
 # =====================================================================
 
@@ -74,8 +82,8 @@ sliding_window:
 
 # --- DataLoader ---
 dataloader:
-  batch_size: 256
-  val_batch_size: 256
+  batch_size: 128
+  val_batch_size: 128
   num_workers: 0
   pin_memory: true
 
@@ -87,22 +95,33 @@ model_version: v6
 
 brainflow:
   output_dim: 1000             # also used as velocity_net output_dim via default
-  reg_weight: 0.5              # Reg head: predict temporal-mean fMRI
+  reg_weight: 0.5              # Legacy key (unused): regression head đã loại bỏ
   cont_weight: 0.0             # InfoNCE off by default (less auxiliary noise)
   cont_dim: 256
   # InDI Flow Matching over 50-TR sequence
   indi_flow_matching: true
-  indi_train_time_sqrt: false
+  indi_train_time_sqrt: true
   indi_min_denom: 1.0e-3
+
+  # CSFM source prior (optional)
+  use_csfm: true
+  csfm_var_reg_weight: 0.1
+  csfm_align_weight: 0.1
+
+  # Tensor FM (optional). Keep null/absent to use standard OT/InDI path.
+  # tensor_fm:
+  #   warp_hidden_dim: 512
+  #   n_groups: null
+  #   gamma_reg_weight: 0.01
 
   velocity_net:
     hidden_dim: 1024
-    dit_num_blocks: 4
-    n_heads: 8
+    dit_num_blocks: 8
+    n_heads: 16
     dropout: 0.1
     context_trs: 101           # must match sliding_window.context_trs (slice centering)
     n_target_trs: 50           # must match sliding_window.n_target_trs
-    temporal_attn_layers: 2
+    temporal_attn_layers: 4
     gradient_checkpointing: true
     use_subject_head: true
     network_head: true
@@ -110,7 +129,7 @@ brainflow:
     latent_dim: 1024
     context_encoder: multitoken
     use_dit_decoder: true
-    decoder_type: ditx             # 'ditx' (DiT-X: cross-attn + 9-param AdaLN) or 'dit1d' (legacy: additive + 6-param AdaLN)
+    decoder_type: ditx             # 'ditx' (DiT-X + Full AttnRes depth fusion) or 'dit1d' (legacy: additive + 6-param AdaLN)
     zero_init_network_heads: true
     # --- multitoken fusion + optional legacy FiLM decoder path
     proj_dim: 256
@@ -136,7 +155,7 @@ solver_args:
 training:
   n_epochs: 200
   lr: 1.0e-4
-  weight_decay: 0.01
+  weight_decay: 0.05
   warmup_ratio: 0.05
   min_lr: 1.0e-6
   grad_clip: 1.0
@@ -144,10 +163,10 @@ training:
   log_every_n_steps: 20
   val_every_n_epochs: 10
   ema_decay: 0.999
-  gradient_accumulation_steps: 4   # effective batch = batch_size × 4 (e.g. 256×4 samples per optimizer step)
+  gradient_accumulation_steps: 8   # effective batch = batch_size × grad_accum_steps
   ema_on_cpu: true
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
 # --- Output ---
-output_dir: outputs/brainflow_seq2seq_v6_ditx
+output_dir: outputs/brainflow_medium

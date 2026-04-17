@@ -549,7 +549,8 @@ def train(args):
         indi_min_denom=bf_cfg.get("indi_min_denom", 1e-3),
         use_csfm=bf_cfg.get("use_csfm", False),
         csfm_var_reg_weight=bf_cfg.get("csfm_var_reg_weight", 0.1),
-        csfm_align_weight=bf_cfg.get("csfm_align_weight", 0.1),
+        csfm_pcc_weight=bf_cfg.get("csfm_pcc_weight", 1.0),
+        flow_loss_weight=bf_cfg.get("flow_loss_weight", 1.0),
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -692,7 +693,7 @@ def train(args):
                     postfix = {
                         "loss": f"{np.mean(train_losses[-50:]):.4f}",
                         "flow": f"{losses['flow_loss'].item():.4f}",
-                        "align": f"{losses['align_loss'].item():.4f}",
+                        "pcc": f"{losses['pcc_loss'].item():.4f}",
                         "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                     }
                     if model.use_tensor_fm:

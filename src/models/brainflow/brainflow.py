@@ -522,6 +522,19 @@ class CrossAttention(nn.Module):
         return attn_out
 
 
+class RMSNormLastDim(nn.Module):
+    """RMSNorm over the last dimension for tensors with arbitrary leading dims."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
+
+
 class DiTXBlock(nn.Module):
     """DiT-X block: AdaLN-Zero on Self-Attention + Cross-Attention + FFN.
 
@@ -547,6 +560,12 @@ class DiTXBlock(nn.Module):
         self.head_dim = d_model // nhead
         self.rotary_emb = rotary_emb
         self.attn_dropout_p = dropout
+
+        # Full Attention Residuals over decoder depth.
+        # Zero-init ensures near-uniform depth attention at initialization.
+        self.attn_res_proj = nn.Linear(d_model, 1, bias=False)
+        nn.init.zeros_(self.attn_res_proj.weight)
+        self.attn_res_norm = RMSNormLastDim(d_model)
 
         # Layer norms (no affine — modulated by AdaLN)
         self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False)  # self-attn
@@ -585,20 +604,35 @@ class DiTXBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x_history: torch.Tensor,
         t_emb: torch.Tensor,
         context: torch.Tensor,
-    ) -> torch.Tensor:
-        """DiT-X forward: Self-Attn → Cross-Attn → FFN, all with AdaLN-Zero.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """DiT-X forward with Full Attention Residuals over depth.
 
         Args:
-            x:       (B, T, D) target tokens (fMRI states).
+            x_history: (L, B, T, D) history of values over decoder depth.
+                       Contains initial token state and prior block values.
             t_emb:   (B, D) time embedding.
             context: (B, T_ctx, D) encoded context tokens.
 
         Returns:
-            (B, T, D) updated tokens.
+            h_out:      (B, T, D) updated hidden state after this block.
+            block_value:(B, T, D) gated block contribution to append to history.
         """
+        if x_history.dim() == 3:
+            x_history = x_history.unsqueeze(0)
+
+        if x_history.dim() != 4:
+            raise ValueError(f"x_history must be (L,B,T,D), got shape {tuple(x_history.shape)}")
+
+        # 1) Full Attention Residuals across depth.
+        # Keys are RMS-normalized to prevent magnitude bias to late layers.
+        k_res = self.attn_res_norm(x_history)                            # (L,B,T,D)
+        logits = self.attn_res_proj(k_res).squeeze(-1)                   # (L,B,T)
+        alpha = torch.softmax(logits, dim=0)                             # depth-softmax
+        x = torch.einsum("lbt,lbtd->btd", alpha, x_history)             # (B,T,D)
+
         B, T, D = x.shape
 
         # Generate 9 modulation parameters from time embedding
@@ -624,18 +658,23 @@ class DiTXBlock(nn.Module):
         )
         attn_out = attn_out.transpose(1, 2).reshape(B, T, D)
         attn_out = self.out_proj(self.attn_drop(attn_out))
-        x = x + gate_msa.unsqueeze(1) * attn_out
+        msa_value = gate_msa.unsqueeze(1) * attn_out
+        x = x + msa_value
 
         # 2. Cross-Attention with AdaLN-Zero
         x_norm_cross = modulate(self.norm2(x), shift_cross, scale_cross)
         cross_out = self.cross_attn(x_norm_cross, context)
-        x = x + gate_cross.unsqueeze(1) * cross_out
+        cross_value = gate_cross.unsqueeze(1) * cross_out
+        x = x + cross_value
 
         # 3. FFN with AdaLN-Zero
         x_norm_mlp = modulate(self.norm3(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp.unsqueeze(1) * self.ffn(x_norm_mlp)
+        mlp_value = gate_mlp.unsqueeze(1) * self.ffn(x_norm_mlp)
+        x = x + mlp_value
 
-        return x
+        block_value = msa_value + cross_value + mlp_value
+
+        return x, block_value
 
 
 
@@ -1083,19 +1122,23 @@ class VelocityNet(nn.Module):
 
         if self._use_dit:
             if self._decoder_type == "ditx":
-                # DiT-X: additive context shortcut (baseline) + cross-attn (refinement)
-                # The additive path provides context from epoch 0 (identical to dit1d).
-                # Cross-attention gates start at 0 (AdaLN-Zero) and gradually open,
-                # adding per-layer, per-position context refinement on top.
+                # DiT-X with Full Attention Residuals over depth.
+                # History starts from context-conditioned tokens and appends gated
+                # block contributions from each depth step.
                 h = h + context_encoded
                 if self.target_pos_emb is not None:
                     T_h = h.shape[1]
                     h = h + self.target_pos_emb[:, :T_h, :]
+
+                history = h.unsqueeze(0)  # (1, B, T, D)
                 for block in self.dit_blocks:
                     if self.gradient_checkpointing and self.training:
-                        h = checkpoint(block, h, t_emb, context_encoded, use_reentrant=False)
+                        h, block_value = checkpoint(
+                            block, history, t_emb, context_encoded, use_reentrant=False
+                        )
                     else:
-                        h = block(h, t_emb, context_encoded)
+                        h, block_value = block(history, t_emb, context_encoded)
+                    history = torch.cat([history, block_value.unsqueeze(0)], dim=0)
             else:
                 # DiT-1D legacy: additive context fusion, self-attn only
                 h = h + context_encoded
@@ -1212,7 +1255,8 @@ class BrainFlow(nn.Module):
         indi_min_denom: float = 1e-3,
         use_csfm: bool = False,
         csfm_var_reg_weight: float = 0.1,
-        csfm_align_weight: float = 0.1,
+        csfm_pcc_weight: float = 1.0,
+        flow_loss_weight: float = 1.0,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -1221,7 +1265,8 @@ class BrainFlow(nn.Module):
         self.indi_min_denom = indi_min_denom
         self.use_csfm = use_csfm
         self.csfm_var_reg_weight = csfm_var_reg_weight
-        self.csfm_align_weight = csfm_align_weight
+        self.csfm_pcc_weight = csfm_pcc_weight
+        self.flow_loss_weight = flow_loss_weight
 
         vn_cfg = dict(velocity_net_params or {})
         vn_cfg.setdefault("output_dim", output_dim)
@@ -1303,7 +1348,7 @@ class BrainFlow(nn.Module):
         # .detach() prevents regression from pulling the shared encoder
         _zero = torch.tensor(0.0, device=target.device)
         csfm_var_reg_loss = _zero
-        csfm_align_loss = _zero
+        csfm_pcc_loss = _zero
         x_0_csfm = None
 
         if skip_aux:
@@ -1330,9 +1375,14 @@ class BrainFlow(nn.Module):
                 # CSFM Losses
                 csfm_var_reg_loss = torch.mean(sigma_phi**2 - torch.log(sigma_phi**2 + 1e-8) - 1.0)
                 
-                # Cosine alignment between the clean base distribution (mu_phi) and target
-                cos_sim = F.cosine_similarity(fmri_pred.flatten(1), target.flatten(1), dim=1)
-                csfm_align_loss = torch.mean(1.0 - cos_sim)
+                # PCC loss between the clean base distribution (mu_phi) and target
+                _pred_flat = fmri_pred.flatten(1)  # (B, T*V)
+                _tgt_flat = target.flatten(1)
+                _pred_c = _pred_flat - _pred_flat.mean(dim=1, keepdim=True)
+                _tgt_c = _tgt_flat - _tgt_flat.mean(dim=1, keepdim=True)
+                _cov = (_pred_c * _tgt_c).sum(dim=1)
+                _std = torch.sqrt((_pred_c ** 2).sum(dim=1) * (_tgt_c ** 2).sum(dim=1) + 1e-8)
+                csfm_pcc_loss = (1.0 - _cov / _std).mean()
 
         # 4. Flow matching source distribution (x_0)
         x_1 = target
@@ -1389,17 +1439,17 @@ class BrainFlow(nn.Module):
             flow_loss = F.mse_loss(v_pred, target_velocity)
 
         # 6. Total loss
-        total_loss = flow_loss
+        total_loss = self.flow_loss_weight * flow_loss
         if self.use_csfm:
             total_loss = total_loss + self.csfm_var_reg_weight * csfm_var_reg_loss
-            total_loss = total_loss + self.csfm_align_weight * csfm_align_loss
+            total_loss = total_loss + self.csfm_pcc_weight * csfm_pcc_loss
             
         total_loss = total_loss + self.gamma_reg_weight * gamma_reg
 
         return {
             "total_loss": total_loss,
             "flow_loss": flow_loss,
-            "align_loss": csfm_align_loss if self.use_csfm else _zero,
+            "pcc_loss": csfm_pcc_loss if self.use_csfm else _zero,
             "var_reg_loss": csfm_var_reg_loss if self.use_csfm else _zero,
             "gamma_reg": gamma_reg,
         }
