@@ -66,15 +66,14 @@ model_version: v6
 
 brainflow:
   output_dim: 1000
-  reg_weight: 0.0
-  cont_weight: 0.0
-  cont_dim: 256
+
   indi_flow_matching: true
   indi_train_time_sqrt: false
   indi_min_denom: 1.0e-3
   use_csfm: true
+  flow_loss_weight: 1.0
   csfm_var_reg_weight: 0.1
-  csfm_align_weight: 0.1
+  csfm_pcc_weight: 0.5
 
   velocity_net:
     hidden_dim: 2048
