@@ -1170,7 +1170,7 @@ class VelocityNet(nn.Module):
 # BrainFlow — Top-level Model with Auxiliary Regression + CFG
 # =============================================================================
 
-def info_nce_loss(z_pred, z_target, temperature=0.07):
+def info_nce_loss(z_pred, z_target, temperature=0.07, symmetric: bool = True):
     """Bidirectional InfoNCE loss in projected space.
 
     Args:
@@ -1184,8 +1184,10 @@ def info_nce_loss(z_pred, z_target, temperature=0.07):
     logits = z_pred @ z_target.T / temperature  # (B, B)
     labels = torch.arange(logits.shape[0], device=logits.device)
     loss_p2t = F.cross_entropy(logits, labels)
-    loss_t2p = F.cross_entropy(logits.T, labels)
-    return (loss_p2t + loss_t2p) / 2
+    if symmetric:
+        loss_t2p = F.cross_entropy(logits.T, labels)
+        return (loss_p2t + loss_t2p) / 2
+    return loss_p2t
 
 
 class AECNN_HRF_Source(nn.Module):
@@ -1194,24 +1196,41 @@ class AECNN_HRF_Source(nn.Module):
     Compresses temporal context into neural events and filters through an HRF conv layer
     to create a biological base distribution (mu_phi) and variance (sigma_phi).
     """
-    def __init__(self, context_dim: int, latent_dim: int, hrf_kernel_size: int = 12):
+    def __init__(
+        self,
+        context_dim: int,
+        latent_dim: int,
+        hrf_kernel_size: int = 12,
+        mixflow_cfg: dict | None = None,
+    ):
         super().__init__()
+        mixflow_cfg = dict(mixflow_cfg or {})
+        self.mixflow_enabled = bool(mixflow_cfg.get("enabled", False))
+        self.n_modes = int(mixflow_cfg.get("n_modes", 4))
+        self.gumbel_tau = float(mixflow_cfg.get("gumbel_tau", 0.1))
+        self.gumbel_hard = bool(mixflow_cfg.get("gumbel_hard", False))
+
         # Step 1: Neural Event Extractor
+        neural_out_dim = latent_dim * self.n_modes if self.mixflow_enabled else latent_dim
         self.neural_event_net = nn.Sequential(
             nn.Conv1d(context_dim, 512, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv1d(512, latent_dim, kernel_size=3, padding=1),
+            nn.Conv1d(512, neural_out_dim, kernel_size=3, padding=1),
             nn.Sigmoid()  # Soft binarization to simulate neural firing
         )
         
         # Step 2: HRF Convolutional Filter
         # Linear Conv1D without activation simulating hemodynamic convolution
         self.hrf_filter = nn.Conv1d(
-            latent_dim, latent_dim, 
+            neural_out_dim, neural_out_dim,
             kernel_size=hrf_kernel_size, 
             padding='same', 
-            groups=latent_dim
+            groups=neural_out_dim
         )
+
+        self.mixture_logits_net = None
+        if self.mixflow_enabled:
+            self.mixture_logits_net = nn.Linear(context_dim, self.n_modes)
         
         # Sigma Predictor (Variance)
         self.sigma_net = nn.Sequential(
@@ -1221,17 +1240,45 @@ class AECNN_HRF_Source(nn.Module):
             nn.Softplus()  # Ensure strictly positive variance
         )
 
-    def forward(self, context_sequence: torch.Tensor, context_pooled: torch.Tensor):
+    def forward(
+        self,
+        context_sequence: torch.Tensor,
+        context_pooled: torch.Tensor,
+        sample_mode: bool = True,
+    ):
         # context_sequence: [B, C, T]
         # context_pooled: [B, C]
         
-        neural_events = self.neural_event_net(context_sequence) # [B, latent_dim, T]
-        mu_phi = self.hrf_filter(neural_events)                # [B, latent_dim, T]
-        mu_phi = mu_phi.transpose(1, 2)                        # [B, T, latent_dim]
+        neural_events = self.neural_event_net(context_sequence)
+        mu_phi = self.hrf_filter(neural_events)
+
+        mix_logits = None
+        mix_probs = None
+        if self.mixflow_enabled:
+            B, _, T = mu_phi.shape
+            mu_phi = mu_phi.view(B, self.n_modes, -1, T).permute(0, 3, 1, 2)  # [B, T, K, D]
+            mix_logits = self.mixture_logits_net(context_pooled)               # [B, K]
+            if sample_mode:
+                mix_probs = F.gumbel_softmax(
+                    mix_logits,
+                    tau=self.gumbel_tau,
+                    hard=self.gumbel_hard,
+                    dim=-1,
+                )
+            else:
+                mix_probs = torch.softmax(mix_logits, dim=-1)
+            mu_phi = torch.einsum("bk,btkd->btd", mix_probs, mu_phi)          # [B, T, D]
+        else:
+            mu_phi = mu_phi.transpose(1, 2)                                     # [B, T, D]
         
         sigma_phi = self.sigma_net(context_pooled).unsqueeze(1) # [B, 1, 1]
         
-        return mu_phi, sigma_phi
+        return {
+            "mu_phi": mu_phi,
+            "sigma_phi": sigma_phi,
+            "mix_logits": mix_logits,
+            "mix_probs": mix_probs,
+        }
 
 
 
@@ -1254,9 +1301,13 @@ class BrainFlow(nn.Module):
         indi_train_time_sqrt: bool = False,
         indi_min_denom: float = 1e-3,
         use_csfm: bool = False,
+        csfm_mixflow_params: dict | None = None,
         csfm_var_reg_weight: float = 0.1,
         csfm_pcc_weight: float = 1.0,
         flow_loss_weight: float = 1.0,
+        cont_weight: float = 0.0,
+        cont_dim: int = 256,
+        contrastive_params: dict | None = None,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -1267,6 +1318,15 @@ class BrainFlow(nn.Module):
         self.csfm_var_reg_weight = csfm_var_reg_weight
         self.csfm_pcc_weight = csfm_pcc_weight
         self.flow_loss_weight = flow_loss_weight
+        self.cont_weight = float(cont_weight)
+
+        cont_cfg = dict(contrastive_params or {})
+        self.contrastive_enabled = bool(cont_cfg.get("enabled", self.cont_weight > 0.0))
+        self.cont_symmetric = bool(cont_cfg.get("symmetric", True))
+        self.cont_normalize = bool(cont_cfg.get("normalize_embeddings", True))
+        self.cont_learnable_temperature = bool(cont_cfg.get("learnable_temperature", True))
+        temp_init = float(cont_cfg.get("temperature_init", 0.07))
+        temp_init = max(temp_init, 1e-4)
 
         vn_cfg = dict(velocity_net_params or {})
         vn_cfg.setdefault("output_dim", output_dim)
@@ -1302,8 +1362,32 @@ class BrainFlow(nn.Module):
             self.hrf_source = AECNN_HRF_Source(
                 context_dim=hidden_dim,
                 latent_dim=latent_dim,
-                hrf_kernel_size=vn_cfg.get("hrf_kernel_size", 12)
+                hrf_kernel_size=vn_cfg.get("hrf_kernel_size", 12),
+                mixflow_cfg=csfm_mixflow_params,
             )
+
+        self.contrastive_proj = None
+        self.target_proj = None
+        if self.contrastive_enabled and self.cont_weight > 0.0:
+            self.contrastive_proj = nn.Sequential(
+                nn.Linear(hidden_dim, cont_dim),
+                nn.GELU(),
+                nn.Linear(cont_dim, cont_dim),
+            )
+            self.target_proj = nn.Sequential(
+                nn.Linear(output_dim, cont_dim),
+                nn.GELU(),
+                nn.Linear(cont_dim, cont_dim),
+            )
+            if self.cont_learnable_temperature:
+                self.log_cont_temperature = nn.Parameter(
+                    torch.tensor(math.log(temp_init), dtype=torch.float32)
+                )
+            else:
+                self.register_buffer(
+                    "log_cont_temperature",
+                    torch.tensor(math.log(temp_init), dtype=torch.float32),
+                )
 
         # Log parameters
         vn_params = sum(p.numel() for p in self.velocity_net.parameters())
@@ -1325,7 +1409,7 @@ class BrainFlow(nn.Module):
         starting_distribution: torch.Tensor = None,
         skip_aux: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Compute flow + regression + contrastive loss.
+        """Compute flow + CSFM/MixFlow + optional contrastive losses.
 
         NSD-style gradient isolation:
           - Flow branch: gradient flows through encoder (updates fusion + DiT)
@@ -1339,7 +1423,8 @@ class BrainFlow(nn.Module):
                       context is zeroed out for CFG unconditional training).
 
         Returns:
-            dict with keys: total_loss, flow_loss, align_loss, cont_loss, gamma_reg.
+            dict with keys: total_loss, flow_loss, pcc_loss, var_reg_loss,
+            cont_loss, gamma_reg.
         """
         # 1. Encode context once (shared)
         context_encoded = self.velocity_net.encode_context_from_cond(context)
@@ -1349,18 +1434,20 @@ class BrainFlow(nn.Module):
         _zero = torch.tensor(0.0, device=target.device)
         csfm_var_reg_loss = _zero
         csfm_pcc_loss = _zero
+        cont_loss = _zero
         x_0_csfm = None
 
         if skip_aux:
-            reg_loss = _zero
             cont_loss = _zero
         else:
             if self.use_csfm:
                 ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
                 ctx_transposed = ctx_detached.transpose(1, 2)
                 ctx_pooled_reg = ctx_detached.mean(dim=1)
-                
-                mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled_reg)
+
+                source_out = self.hrf_source(ctx_transposed, ctx_pooled_reg, sample_mode=True)
+                mu_phi_latent = source_out["mu_phi"]
+                sigma_phi = source_out["sigma_phi"]
                 
                 if self.velocity_net.use_subject_head:
                     if subject_ids is None:
@@ -1383,6 +1470,22 @@ class BrainFlow(nn.Module):
                 _cov = (_pred_c * _tgt_c).sum(dim=1)
                 _std = torch.sqrt((_pred_c ** 2).sum(dim=1) * (_tgt_c ** 2).sum(dim=1) + 1e-8)
                 csfm_pcc_loss = (1.0 - _cov / _std).mean()
+
+            if self.contrastive_proj is not None and self.target_proj is not None:
+                ctx_pooled = context_encoded.mean(dim=1)
+                tgt_pooled = target.mean(dim=1) if target.dim() == 3 else target
+                z_ctx = self.contrastive_proj(ctx_pooled)
+                z_tgt = self.target_proj(tgt_pooled)
+                if self.cont_normalize:
+                    z_ctx = F.normalize(z_ctx, dim=-1)
+                    z_tgt = F.normalize(z_tgt, dim=-1)
+                cont_temperature = torch.exp(self.log_cont_temperature).clamp(min=1e-4, max=1.0)
+                cont_loss = info_nce_loss(
+                    z_ctx,
+                    z_tgt,
+                    temperature=cont_temperature,
+                    symmetric=self.cont_symmetric,
+                )
 
         # 4. Flow matching source distribution (x_0)
         x_1 = target
@@ -1443,6 +1546,8 @@ class BrainFlow(nn.Module):
         if self.use_csfm:
             total_loss = total_loss + self.csfm_var_reg_weight * csfm_var_reg_loss
             total_loss = total_loss + self.csfm_pcc_weight * csfm_pcc_loss
+        if self.contrastive_enabled and self.cont_weight > 0.0:
+            total_loss = total_loss + self.cont_weight * cont_loss
             
         total_loss = total_loss + self.gamma_reg_weight * gamma_reg
 
@@ -1451,6 +1556,7 @@ class BrainFlow(nn.Module):
             "flow_loss": flow_loss,
             "pcc_loss": csfm_pcc_loss if self.use_csfm else _zero,
             "var_reg_loss": csfm_var_reg_loss if self.use_csfm else _zero,
+            "cont_loss": cont_loss,
             "gamma_reg": gamma_reg,
         }
 
@@ -1530,7 +1636,8 @@ class BrainFlow(nn.Module):
         if self.use_csfm:
             ctx_transposed = context_encoded.transpose(1, 2)
             ctx_pooled = context_encoded.mean(dim=1)
-            mu_phi_latent, _ = self.hrf_source(ctx_transposed, ctx_pooled)
+            source_out = self.hrf_source(ctx_transposed, ctx_pooled, sample_mode=False)
+            mu_phi_latent = source_out["mu_phi"]
             
             if self.velocity_net.use_subject_head:
                 if subject_ids is None:

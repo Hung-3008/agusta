@@ -538,6 +538,11 @@ def train(args):
     if modality_dims:
         vn_params["modality_dims"] = modality_dims
 
+    cont_cfg = dict(bf_cfg.get("contrastive", {}))
+    cont_weight = float(cont_cfg.get("weight", bf_cfg.get("cont_weight", 0.0)))
+    cont_dim = int(bf_cfg.get("cont_dim", cont_cfg.get("dim", 256)))
+    csfm_mixflow_cfg = bf_cfg.get("csfm_mixflow", None)
+
     model = BrainFlow(
         output_dim=output_dim,
         velocity_net_params=vn_params,
@@ -548,9 +553,13 @@ def train(args):
         indi_train_time_sqrt=bf_cfg.get("indi_train_time_sqrt", False),
         indi_min_denom=bf_cfg.get("indi_min_denom", 1e-3),
         use_csfm=bf_cfg.get("use_csfm", False),
+        csfm_mixflow_params=csfm_mixflow_cfg,
         csfm_var_reg_weight=bf_cfg.get("csfm_var_reg_weight", 0.1),
         csfm_pcc_weight=bf_cfg.get("csfm_pcc_weight", 1.0),
         flow_loss_weight=bf_cfg.get("flow_loss_weight", 1.0),
+        cont_weight=cont_weight,
+        cont_dim=cont_dim,
+        contrastive_params=cont_cfg,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -633,7 +642,7 @@ def train(args):
 
     history_file = out_dir / "history.csv"
     if start_epoch == 1:
-        history_file.write_text("epoch,train_loss,val_fmri_pcc,lr\n")
+        history_file.write_text("epoch,train_loss,cfm_loss,pcc_loss,val_fmri_pcc,lr\n")
 
     solver_cfg = cfg.get("solver_args", {})
     val_n_timesteps = solver_cfg.get("time_points", 50)
@@ -648,6 +657,8 @@ def train(args):
     for epoch in range(start_epoch, tr_cfg["n_epochs"] + 1):
         model.train()
         train_losses = []
+        cfm_losses = []
+        pcc_losses = []
         micro_accum = 0
         optimizer.zero_grad(set_to_none=True)
 
@@ -678,6 +689,10 @@ def train(args):
 
             loss.backward()
             train_losses.append(float(raw_loss.detach()))
+            if "flow_loss" in losses:
+                cfm_losses.append(float(losses["flow_loss"].detach()))
+            if "pcc_loss" in losses:
+                pcc_losses.append(float(losses["pcc_loss"].detach()))
 
             micro_accum += 1
             if micro_accum >= accum_steps:
@@ -800,8 +815,10 @@ def train(args):
                 torch.save(model.state_dict(), out_dir / "best.pt")
                 logger.info("Saved new best EMA model (PCC=%.4f)", best_val_corr)
 
+            mean_cfm = np.mean(cfm_losses) if cfm_losses else 0.0
+            mean_pcc = np.mean(pcc_losses) if pcc_losses else 0.0
             with open(history_file, "a") as f:
-                f.write(f"{epoch},{np.mean(train_losses):.6f},{mean_fmri_corr:.6f},"
+                f.write(f"{epoch},{np.mean(train_losses):.6f},{mean_cfm:.6f},{mean_pcc:.6f},{mean_fmri_corr:.6f},"
                         f"{scheduler.get_last_lr()[0]:.2e}\n")
 
             ema.restore(model)
