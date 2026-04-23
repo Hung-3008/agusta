@@ -912,10 +912,13 @@ def main():
     p.add_argument("--resume",         action="store_true", default=True,
                    help="[S7] Skip already-completed subjects")
     p.add_argument("--no_resume",      dest="resume", action="store_false")
+    p.add_argument("--output_dir",     default=None, help="Override output directory")
     args = p.parse_args()
 
     device = torch.device(args.device)
     cfg = load_config(args.config)
+    if args.output_dir:
+        cfg["output_dir"] = args.output_dir
     cfg["_fmri_dir"] = str(PROJECT_ROOT / cfg["data_root"] / cfg["fmri"]["dir"])
 
     context_dirs = [PROJECT_ROOT / d for d in cfg.get("context_latent_dirs", [cfg.get("context_latent_dir")])]
