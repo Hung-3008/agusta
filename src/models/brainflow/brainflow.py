@@ -1190,6 +1190,146 @@ def info_nce_loss(z_pred, z_target, temperature=0.07, symmetric: bool = True):
     return loss_p2t
 
 
+# =============================================================================
+# Temporal Optimal Transport — Sinkhorn + asymmetric cost matrix
+# =============================================================================
+
+@torch.no_grad()
+def sinkhorn_log_stabilized(
+    cost: torch.Tensor,
+    reg: float = 0.1,
+    n_iters: int = 20,
+) -> torch.Tensor:
+    """Log-domain Sinkhorn algorithm for entropic OT on a (T, T) cost matrix.
+
+    Returns a transport plan π with uniform marginals (each row/col sums to 1/T).
+    Runs under torch.no_grad() — the plan is used as a fixed weighting target.
+
+    Args:
+        cost: (T, T) cost matrix. Entries may be +inf for forbidden pairings.
+        reg:  Entropic regularisation ε (smaller = sharper plan, closer to true OT).
+        n_iters: Number of Sinkhorn iterations.
+
+    Returns:
+        pi: (T, T) doubly-stochastic transport plan (marginals ≈ 1/T).
+    """
+    T = cost.shape[0]
+    # Log-domain kernel: M = -C / ε
+    M = -cost / max(reg, 1e-8)
+    # Clamp -inf entries so exp doesn't produce NaN
+    M = M.clamp(min=-1e9)
+
+    # Sinkhorn iterations in log domain
+    log_u = torch.zeros(T, device=cost.device, dtype=cost.dtype)
+    log_v = torch.zeros(T, device=cost.device, dtype=cost.dtype)
+
+    for _ in range(n_iters):
+        # Row normalisation
+        log_u = -torch.logsumexp(M + log_v.unsqueeze(0), dim=1)
+        # Column normalisation
+        log_v = -torch.logsumexp(M + log_u.unsqueeze(1), dim=0)
+
+    # Recover plan: π[i,j] = exp(log_u[i] + M[i,j] + log_v[j])
+    log_pi = log_u.unsqueeze(1) + M + log_v.unsqueeze(0)
+    pi = torch.exp(log_pi)
+    # Ensure non-negative and clamp numerical noise
+    pi = pi.clamp(min=0.0)
+    return pi
+
+
+def build_temporal_cost_matrix(
+    x_0: torch.Tensor,
+    x_1: torch.Tensor,
+    temporal_penalty: float = 1.0,
+    past_window: int = 1,
+    future_window: int = 6,
+) -> torch.Tensor:
+    """Build (T, T) cost matrix with asymmetric temporal window for fMRI OT.
+
+    Cost = ||x_0[i] - x_1[j]||² / V  +  λ·(i-j)²    if  -past_window ≤ j-i ≤ future_window
+    Cost = +∞                                          otherwise
+
+    The asymmetric window respects HRF causality: brain responds *after* stimulus,
+    so source TR i should primarily match to target TRs at or after i.
+
+    Args:
+        x_0: (T, V) source points.
+        x_1: (T, V) target points.
+        temporal_penalty: λ scaling for quadratic temporal displacement.
+        past_window:   How many TRs *before* i are allowed (default 1).
+        future_window: How many TRs *after*  i are allowed (default 6).
+
+    Returns:
+        cost: (T, T) cost matrix with +inf outside the allowed window.
+    """
+    T, V = x_0.shape
+    # Pairwise squared L2, normalised by dimensionality
+    # ||x_0[i] - x_1[j]||² / V
+    diff = x_0.unsqueeze(1) - x_1.unsqueeze(0)        # (T, T, V)
+    l2_cost = (diff * diff).sum(dim=-1) / V            # (T, T)
+
+    # Temporal displacement penalty: λ·(i-j)²
+    idx = torch.arange(T, device=x_0.device, dtype=x_0.dtype)
+    displacement = idx.unsqueeze(1) - idx.unsqueeze(0)  # (T, T)  displacement[i,j] = i-j
+    temporal_cost = temporal_penalty * displacement.pow(2)
+
+    cost = l2_cost + temporal_cost
+
+    # Asymmetric hard mask: allow j in [i - past_window, i + future_window]
+    # displacement[i,j] = i - j, so j - i = -displacement
+    # Condition: -past_window ≤ (j - i) ≤ future_window
+    #          = -past_window ≤ -displacement ≤ future_window
+    #          = -future_window ≤ displacement ≤ past_window
+    mask = (displacement >= -future_window) & (displacement <= past_window)
+    cost = cost.masked_fill(~mask, float('inf'))
+
+    return cost
+
+
+def compute_geo_loss_differentiable(
+    x_0: torch.Tensor,
+    x_1: torch.Tensor,
+    transport_plans: torch.Tensor,
+) -> torch.Tensor:
+    """Compute geodesic loss WITH gradients flowing through x_0.
+
+    Uses the marginalized transport cost to avoid materializing (B, T, T, V):
+        L_geo = Σ_i ||x_0[i] - Σ_j π[i,j] * x_1[j]||² / V
+
+    This is equivalent to Σ_{i,j} π[i,j] * ||x_0[i] - x_1[j]||² when the
+    transport plan is concentrated (small entropic regularisation ε), which
+    is the case with ε=0.1 and the asymmetric temporal window.
+
+    The transport plan π is treated as a FIXED target (detached from the
+    computation graph) — only x_0 carries gradients, which flow back to
+    the source distribution network (AECNN_HRF_Source / MixFlow GMM).
+
+    Args:
+        x_0: (B, T, V) source samples WITH gradient graph intact.
+        x_1: (B, T, V) target fMRI (ground truth, no gradient needed).
+        transport_plans: (B, T, T) detached Sinkhorn plan (rows sum to ~1/T).
+
+    Returns:
+        geo_loss: scalar, mean geodesic cost across batch.
+    """
+    # π is fixed (E-step result) — ensure no gradient flows through it
+    pi = transport_plans.detach()
+    x_1_det = x_1.detach()
+
+    # Marginalized matched target: x_1_matched[b,i,:] = Σ_j π[b,i,j] * x_1[b,j,:]
+    # Shape: (B, T, V) — no T×T×V blowup
+    x_1_matched = torch.bmm(pi, x_1_det)  # (B, T, V)
+
+    # Squared L2 distance, gradient flows through x_0 → source network
+    V = x_0.shape[-1]
+    diff = x_0 - x_1_matched  # (B, T, V), gradient attached via x_0
+    per_tr_cost = (diff * diff).sum(dim=-1) / V  # (B, T)
+
+    # Mean over time and batch
+    geo_loss = per_tr_cost.mean()
+    return geo_loss
+
+
 class AECNN_HRF_Source(nn.Module):
     """
     Condition-dependent Source Generator using Biological HRF Prior.
@@ -1308,6 +1448,7 @@ class BrainFlow(nn.Module):
         cont_weight: float = 0.0,
         cont_dim: int = 256,
         contrastive_params: dict | None = None,
+        temporal_ot_params: dict | None = None,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -1327,6 +1468,16 @@ class BrainFlow(nn.Module):
         self.cont_learnable_temperature = bool(cont_cfg.get("learnable_temperature", True))
         temp_init = float(cont_cfg.get("temperature_init", 0.07))
         temp_init = max(temp_init, 1e-4)
+
+        # --- Temporal OT config ---
+        tot_cfg = dict(temporal_ot_params or {})
+        self.use_temporal_ot = bool(tot_cfg.get("enabled", False))
+        self.temporal_ot_past_window = int(tot_cfg.get("past_window", 1))
+        self.temporal_ot_future_window = int(tot_cfg.get("future_window", 6))
+        self.temporal_ot_penalty = float(tot_cfg.get("temporal_penalty", 1.0))
+        self.sinkhorn_reg = float(tot_cfg.get("sinkhorn_reg", 0.1))
+        self.sinkhorn_iters = int(tot_cfg.get("sinkhorn_iters", 20))
+        self.geo_loss_weight = float(tot_cfg.get("geo_loss_weight", 0.1))
 
         vn_cfg = dict(velocity_net_params or {})
         vn_cfg.setdefault("output_dim", output_dim)
@@ -1399,6 +1550,7 @@ class BrainFlow(nn.Module):
             print(f"  + HRF Source: {csfm_params:,} params")
         print(f"Total params: {vn_params + csfm_params:,} "
               f"(csfm={self.use_csfm}, tensor_fm={self.use_tensor_fm}, "
+              f"temporal_ot={self.use_temporal_ot}, "
               f"modality_dims={vn_cfg.get('modality_dims')})")
 
     def compute_loss(
@@ -1494,8 +1646,49 @@ class BrainFlow(nn.Module):
         else:
             x_0 = torch.randn_like(x_1)
 
-        # 5. Flow matching (gradient flows to encoder)
+        # 4b. Temporal OT: build soft transport plan for seq2seq mode
+        geo_loss = _zero
+        use_ot_this_step = (
+            self.use_temporal_ot
+            and x_1.dim() == 3       # seq2seq mode only (B, T, V)
+            and not skip_aux         # skip when context is zeroed (CFG)
+        )
+        transport_plans = None
+        if use_ot_this_step:
+            B_ot, T_ot, V_ot = x_1.shape
+            # E-step: Compute per-sample transport plan (no gradient needed)
+            # The plan π is a fixed matching target — Sinkhorn is non-differentiable.
+            with torch.no_grad():
+                pi_list = []
+                # Cast to float32 for Sinkhorn numerical stability
+                x_0_f32 = x_0.detach().float()
+                x_1_f32 = x_1.detach().float()
+                for b in range(B_ot):
+                    C_b = build_temporal_cost_matrix(
+                        x_0_f32[b], x_1_f32[b],
+                        temporal_penalty=self.temporal_ot_penalty,
+                        past_window=self.temporal_ot_past_window,
+                        future_window=self.temporal_ot_future_window,
+                    )
+                    pi_b = sinkhorn_log_stabilized(
+                        C_b,
+                        reg=self.sinkhorn_reg,
+                        n_iters=self.sinkhorn_iters,
+                    )
+                    pi_list.append(pi_b)
+                # (B, T, T) — cast back to working dtype
+                transport_plans = torch.stack(pi_list).to(dtype=x_1.dtype)
+
+            # M-step: Geodesic loss WITH gradient flowing through x_0 → source network
+            # This is the SP-FM design: geo_loss optimizes the source distribution
+            # predictors (AECNN_HRF_Source) to shorten transport geodesics.
+            geo_loss = compute_geo_loss_differentiable(x_0, x_1, transport_plans)
+
+        # 5. Flow matching (gradient flows to encoder, NOT to source network)
+        # SP-FM: L_OT only updates velocity net. Detach x_0 to prevent
+        # flow_loss gradients from leaking back to AECNN_HRF_Source.
         gamma_reg = _zero
+        x_0_flow = x_0.detach()  # ⛔ cut gradient from flow_loss → source network
 
         if self.use_tensor_fm:
             t = torch.rand(x_1.shape[0], device=x_1.device, dtype=x_1.dtype)
@@ -1504,8 +1697,8 @@ class BrainFlow(nn.Module):
             gamma = self.time_warp_net(ctx_pooled_flow)     # (B, D)
             lambda_t, d_lambda_t = tensor_warp_schedule(gamma, t)
 
-            x_t = lambda_t * x_1 + (1.0 - lambda_t) * x_0
-            target_velocity = d_lambda_t * (x_1 - x_0)
+            x_t = lambda_t * x_1 + (1.0 - lambda_t) * x_0_flow
+            target_velocity = d_lambda_t * (x_1 - x_0_flow)
 
             v_pred = self.velocity_net(
                 x=x_t, t=t,
@@ -1526,12 +1719,24 @@ class BrainFlow(nn.Module):
             t_bc = t
             while t_bc.dim() < x_1.dim():
                 t_bc = t_bc.unsqueeze(-1)          # (B, 1, 1) for seq mode
-            x_t = t_bc * x_1 + (1.0 - t_bc) * x_0
+            x_t = t_bc * x_1 + (1.0 - t_bc) * x_0_flow
 
             if self._indi_effective:
-                target_velocity = x_1 - x_t       # InDI: residual = (1-t)*(x_1-x_0)
+                # InDI: residual = (1-t)*(x_1-x_0)
+                if use_ot_this_step:
+                    # Soft temporal OT: x_1_matched[b,i,:] = Σ_j π[b,i,j] * x_1[b,j,:]
+                    # Sinkhorn plan is doubly-stochastic (rows sum to 1) → direct weighted avg
+                    x_1_matched = torch.einsum("bij,bjv->biv", transport_plans, x_1)
+                    target_velocity = x_1_matched - x_t
+                else:
+                    target_velocity = x_1 - x_t
             else:
-                target_velocity = x_1 - x_0       # OT-CFM: constant velocity
+                # OT-CFM: constant velocity
+                if use_ot_this_step:
+                    x_1_matched = torch.einsum("bij,bjv->biv", transport_plans, x_1)
+                    target_velocity = x_1_matched - x_0_flow
+                else:
+                    target_velocity = x_1 - x_0_flow
 
             v_pred = self.velocity_net(
                 x=x_t,
@@ -1548,6 +1753,8 @@ class BrainFlow(nn.Module):
             total_loss = total_loss + self.csfm_pcc_weight * csfm_pcc_loss
         if self.contrastive_enabled and self.cont_weight > 0.0:
             total_loss = total_loss + self.cont_weight * cont_loss
+        if self.use_temporal_ot:
+            total_loss = total_loss + self.geo_loss_weight * geo_loss
             
         total_loss = total_loss + self.gamma_reg_weight * gamma_reg
 
@@ -1556,6 +1763,7 @@ class BrainFlow(nn.Module):
             "flow_loss": flow_loss,
             "pcc_loss": csfm_pcc_loss if self.use_csfm else _zero,
             "var_reg_loss": csfm_var_reg_loss if self.use_csfm else _zero,
+            "geo_loss": geo_loss,
             "cont_loss": cont_loss,
             "gamma_reg": gamma_reg,
         }

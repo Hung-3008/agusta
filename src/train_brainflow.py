@@ -542,6 +542,7 @@ def train(args):
     cont_weight = float(cont_cfg.get("weight", bf_cfg.get("cont_weight", 0.0)))
     cont_dim = int(bf_cfg.get("cont_dim", cont_cfg.get("dim", 256)))
     csfm_mixflow_cfg = bf_cfg.get("csfm_mixflow", None)
+    temporal_ot_cfg = bf_cfg.get("temporal_ot", None)
 
     model = BrainFlow(
         output_dim=output_dim,
@@ -560,6 +561,7 @@ def train(args):
         cont_weight=cont_weight,
         cont_dim=cont_dim,
         contrastive_params=cont_cfg,
+        temporal_ot_params=temporal_ot_cfg,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -642,7 +644,7 @@ def train(args):
 
     history_file = out_dir / "history.csv"
     if start_epoch == 1:
-        history_file.write_text("epoch,train_loss,cfm_loss,pcc_loss,val_fmri_pcc,lr\n")
+        history_file.write_text("epoch,train_loss,cfm_loss,pcc_loss,geo_loss,val_fmri_pcc,lr\n")
 
     solver_cfg = cfg.get("solver_args", {})
     val_n_timesteps = solver_cfg.get("time_points", 50)
@@ -659,6 +661,7 @@ def train(args):
         train_losses = []
         cfm_losses = []
         pcc_losses = []
+        geo_losses = []
         micro_accum = 0
         optimizer.zero_grad(set_to_none=True)
 
@@ -693,6 +696,8 @@ def train(args):
                 cfm_losses.append(float(losses["flow_loss"].detach()))
             if "pcc_loss" in losses:
                 pcc_losses.append(float(losses["pcc_loss"].detach()))
+            if "geo_loss" in losses:
+                geo_losses.append(float(losses["geo_loss"].detach()))
 
             micro_accum += 1
             if micro_accum >= accum_steps:
@@ -711,6 +716,8 @@ def train(args):
                         "pcc": f"{losses['pcc_loss'].item():.4f}",
                         "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                     }
+                    if model.use_temporal_ot:
+                        postfix["geo"] = f"{losses['geo_loss'].item():.4f}"
                     if model.use_tensor_fm:
                         postfix["g_reg"] = f"{losses['gamma_reg'].item():.4f}"
                     pbar.set_postfix(postfix)
@@ -817,8 +824,9 @@ def train(args):
 
             mean_cfm = np.mean(cfm_losses) if cfm_losses else 0.0
             mean_pcc = np.mean(pcc_losses) if pcc_losses else 0.0
+            mean_geo = np.mean(geo_losses) if geo_losses else 0.0
             with open(history_file, "a") as f:
-                f.write(f"{epoch},{np.mean(train_losses):.6f},{mean_cfm:.6f},{mean_pcc:.6f},{mean_fmri_corr:.6f},"
+                f.write(f"{epoch},{np.mean(train_losses):.6f},{mean_cfm:.6f},{mean_pcc:.6f},{mean_geo:.6f},{mean_fmri_corr:.6f},"
                         f"{scheduler.get_last_lr()[0]:.2e}\n")
 
             ema.restore(model)

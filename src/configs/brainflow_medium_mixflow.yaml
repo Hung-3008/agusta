@@ -74,7 +74,7 @@ brainflow:
   use_csfm: true
   flow_loss_weight: 1.0
   csfm_var_reg_weight: 0.1
-  csfm_pcc_weight: 0.5
+  csfm_pcc_weight: 1.0
 
   # Legacy contrastive keys kept explicit as disabled in this variant.
   cont_weight: 0.0
@@ -85,10 +85,10 @@ brainflow:
   # updated AECNN_HRF_Source + compute_loss implementation.
   csfm_mixflow:
     enabled: true
-    n_modes: 4
+    n_modes: 7
     mixture_logits_from_context: true
     sample_mode: gumbel_softmax
-    gumbel_tau: 0.1
+    gumbel_tau: 0.2
     gumbel_hard: false
     init_sigma: 0.05
     pcc_on_selected_mode: true
@@ -101,6 +101,17 @@ brainflow:
     learnable_temperature: true
     symmetric: true
     normalize_embeddings: true
+
+  # Improvement 3: Temporal Optimal Transport — soft velocity targets
+  # via Sinkhorn OT with asymmetric causal window.
+  temporal_ot:
+    enabled: true
+    past_window: 6          # allow matching 6 TRs into the past
+    future_window: 1        # allow matching 1 TR into the future
+    temporal_penalty: 0.01   # λ for quadratic displacement penalty
+    sinkhorn_reg: 0.1       # entropic regularisation ε
+    sinkhorn_iters: 20      # Sinkhorn iterations
+    geo_loss_weight: 0.5    # weight for geodesic (L2 transport cost) loss
 
   velocity_net:
     hidden_dim: 1024
@@ -149,4 +160,5 @@ training:
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
-output_dir: outputs/brainflow_medium_mixflow
+# v3 geo loss contribute to optimize the aecnn hrf source 
+output_dir: outputs/brainflow_medium_mixflow_7_temporal_ot_newlossratio
