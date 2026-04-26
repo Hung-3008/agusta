@@ -1,23 +1,5 @@
 # =====================================================================
-# BrainFlow Seq2Seq v6 — DiT-X decoder (ManiFlow-style cross-attention)
-# =====================================================================
-# Encoder:  Per-modality MultiTokenFusion → RoPE Transformer (no mask) → (B,101,H)
-#           Temporal slice [T_past:T_past+50] with T_past=(101-50)//2 → (B,50,H)
-# Decoder (decoder_type):
-#   'ditx':  DiT-X blocks (AdaLN-Zero on SelfAttn+CrossAttn+FFN, 9 params, RoPE Q/K)
-#            Context queried at every block via cross-attn (NOT additive)
-#            + Full Attention Residuals theo depth (x_history) trong code hiện tại.
-#   'dit1d': Legacy DiT blocks (AdaLN-Zero on SelfAttn+FFN, 6 params, additive context)
-# Regression head đã được loại bỏ ở nhánh hiện tại.
-# (Nếu còn `reg_weight` bên dưới thì chỉ là legacy key, model không dùng.)
-# Legacy decoder: set use_dit_decoder: false (FiLM + cross-attn)
-# Mode matrix hỗ trợ:
-#   - DiT-X + InDI (mặc định)
-#   - DiT-1D + InDI (set decoder_type: dit1d)
-#   - FiLM legacy (set use_dit_decoder: false)
-#   - + CSFM source prior (set use_csfm: true)
-#   - + Tensor FM schedule (set brainflow.tensor_fm: {...}; khi đó InDI sẽ bị bỏ qua)
-# fMRI acquisition TR ~1.49s (metadata only; not read by train_brainflow / evaluate_brainflow)
+# BrainFlow Medium Capacity Config
 # =====================================================================
 
 data_root: Data
@@ -30,39 +12,36 @@ fmri:
   hrf_delay: 2
   use_global_stats: true
 
-# --- Pre-extracted encoder context latents (10 modalities) ---
 context_latent_dirs:
-  - Data/features_npy_pooled/vjepa2_avg_feat        # Visual (V-JEPA 2)
-  - Data/features_npy_pooled/whisper                # Audio (Whisper)
-  - Data/features_npy_pooled/Llama-3.2-1B           # Text (LLaMA-1B)
-  - Data/features_npy_pooled/Llama-3.2-3B           # Text (LLaMA-3B)
-  - Data/features_npy_pooled/qwen2-5_3B             # Text (Qwen2.5-3B)
-  - Data/features_npy_pooled/qwen-2-5-omni-7b       # Multimodal (Qwen-Omni)
-  - Data/features_npy_pooled/internvl3_8b_8bit      # Vision-Language (InternVL3-8B)
-  - Data/features_npy_pooled/InternVL3_14B          # Vision-Language (InternVL3-14B)
-  - Data/features_npy_pooled/dinov2_giant           # Visual (DINOv2-giant)
-  - Data/features_npy_pooled/vlm2vec_7b             # Vision-Language (VLM2Vec-7B)
+  - Data/features_npy_pooled/vjepa2_avg_feat
+  - Data/features_npy_pooled/whisper
+  - Data/features_npy_pooled/Llama-3.2-1B
+  - Data/features_npy_pooled/Llama-3.2-3B
+  - Data/features_npy_pooled/qwen2-5_3B
+  - Data/features_npy_pooled/qwen-2-5-omni-7b
+  - Data/features_npy_pooled/internvl3_8b_8bit
+  - Data/features_npy_pooled/InternVL3_14B
+  - Data/features_npy_pooled/dinov2_giant
+  - Data/features_npy_pooled/vlm2vec_7b
 
 modality_dims:
-  - 1408   # [0] vjepa2_avg_feat
-  - 1280   # [1] whisper
-  - 2048   # [2] Llama-3.2-1B
-  - 3072   # [3] Llama-3.2-3B
-  - 2048   # [4] qwen2-5_3B
-  - 3584   # [5] qwen-2-5-omni-7b
-  - 3584   # [6] internvl3_8b_8bit
-  - 5120   # [7] InternVL3_14B
-  - 6144   # [8] dinov2_giant (4 × 1536)
-  - 3584   # [9] vlm2vec_7b
+  - 1408
+  - 1280
+  - 2048
+  - 3072
+  - 2048
+  - 3584
+  - 3584
+  - 5120
+  - 6144
+  - 3584
 
-# --- Multi-subject training ---
 subjects:
   - sub-01
   - sub-02
   - sub-03
   - sub-05
 
-# --- Splits ---
 splits:
   friends:
     train: [s1, s2, s3, s4, s5]
@@ -71,56 +50,38 @@ splits:
     train: [bourne, figures, life, wolf]
     val: []
 
-# --- Seq2Seq sliding window ---
-# Context: 101 TRs = 25 past-buffer + 50 target + 26 future-buffer (+ HRF shift)
-# Each sample: context (101, D) → fMRI sequence (50, V)
 sliding_window:
-  context_trs: 101         # total context window length fed to encoder
-  n_target_trs: 50         # simultaneous fMRI TRs predicted (decoder output)
-  stride: 10               # step between target window starts (10 TR → 80% overlap)
-  temporal_jitter: 2       # ±2 TR jitter for context (train only)
+  context_trs: 101
+  n_target_trs: 50
+  stride: 10
+  temporal_jitter: 2
 
-# --- DataLoader ---
 dataloader:
   batch_size: 128
   val_batch_size: 128
   num_workers: 0
   pin_memory: true
 
-# =====================================================================
-# Model config — Seq2Seq v5 (1D-DiT + temporal slicing)
-# model_version: used by evaluate_brainflow.py
-# =====================================================================
 model_version: v6
 
 brainflow:
-  output_dim: 1000             # also used as velocity_net output_dim via default
-  reg_weight: 0.5              # Legacy key (unused): regression head đã loại bỏ
-  cont_weight: 0.0             # InfoNCE off by default (less auxiliary noise)
-  cont_dim: 256
-  # InDI Flow Matching over 50-TR sequence
+  output_dim: 1000
+
   indi_flow_matching: true
-  indi_train_time_sqrt: true
+  indi_train_time_sqrt: false
   indi_min_denom: 1.0e-3
-
-  # CSFM source prior (optional)
   use_csfm: true
+  flow_loss_weight: 1.0
   csfm_var_reg_weight: 0.1
-  csfm_align_weight: 0.1
-
-  # Tensor FM (optional). Keep null/absent to use standard OT/InDI path.
-  # tensor_fm:
-  #   warp_hidden_dim: 512
-  #   n_groups: null
-  #   gamma_reg_weight: 0.01
+  csfm_pcc_weight: 0.5
 
   velocity_net:
     hidden_dim: 1024
     dit_num_blocks: 8
     n_heads: 16
     dropout: 0.1
-    context_trs: 101           # must match sliding_window.context_trs (slice centering)
-    n_target_trs: 50           # must match sliding_window.n_target_trs
+    context_trs: 101
+    n_target_trs: 50
     temporal_attn_layers: 4
     gradient_checkpointing: true
     use_subject_head: true
@@ -129,9 +90,8 @@ brainflow:
     latent_dim: 1024
     context_encoder: multitoken
     use_dit_decoder: true
-    decoder_type: ditx             # 'ditx' (DiT-X + Full AttnRes depth fusion) or 'dit1d' (legacy: additive + 6-param AdaLN)
+    decoder_type: ditx
     zero_init_network_heads: true
-    # --- multitoken fusion + optional legacy FiLM decoder path
     proj_dim: 256
     n_blocks: 4
     modality_dropout: 0.0
@@ -139,9 +99,6 @@ brainflow:
     fusion_mode: concat
     fusion_proj_dim: 384
 
-# =====================================================================
-# Solver args (validation inference)
-# =====================================================================
 solver_args:
   method: midpoint
   time_points: 30
@@ -149,9 +106,6 @@ solver_args:
   temperature: 0.05
   time_grid_warp: sqrt
 
-# =====================================================================
-# Training
-# =====================================================================
 training:
   n_epochs: 200
   lr: 1.0e-4
@@ -163,10 +117,9 @@ training:
   log_every_n_steps: 20
   val_every_n_epochs: 10
   ema_decay: 0.999
-  gradient_accumulation_steps: 8   # effective batch = batch_size × grad_accum_steps
+  gradient_accumulation_steps: 8
   ema_on_cpu: true
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
-# --- Output ---
-output_dir: outputs/brainflow_medium
+output_dir: outputs/brainflow_medium_new_loss

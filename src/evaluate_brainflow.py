@@ -44,7 +44,7 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.dataset import load_config, _get_fmri_filepath
+from src.datasets.directflow_dataset import load_config, _get_fmri_filepath
 from src.models.brainflow.brainflow import BrainFlow
 from src.utils.utils import (
     InferenceStrategyConfig,
