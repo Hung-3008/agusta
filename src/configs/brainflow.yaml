@@ -122,4 +122,4 @@ training:
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
-output_dir: outputs/brainflow_medium_new_loss
+output_dir: outputs/brainflow_dit_test
