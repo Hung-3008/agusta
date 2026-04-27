@@ -1,5 +1,8 @@
+import logging
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger(__name__)
 
 class SubjectLayers(nn.Module):
     """Per-subject linear output head (from TRIBE/Brain-Diffuser)."""
@@ -67,9 +70,12 @@ class NetworkSubjectLayers(nn.Module):
                 if head.bias is not None:
                     nn.init.zeros_(head.bias)
 
-        print(f"  [NetworkSubjectLayers] {self.n_networks} heads: "
-              f"{list(zip(self.NETWORK_NAMES[:self.n_networks], network_counts))} "
-              f"= {self.total_output_dim} total voxels")
+        logger.info(
+            "NetworkSubjectLayers: %d heads: %s = %d total voxels",
+            self.n_networks,
+            list(zip(self.NETWORK_NAMES[:self.n_networks], network_counts)),
+            self.total_output_dim,
+        )
 
     def forward(self, x: torch.Tensor, subject_ids: torch.Tensor) -> torch.Tensor:
         """Run all network heads and concatenate outputs.

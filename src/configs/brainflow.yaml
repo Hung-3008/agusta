@@ -73,7 +73,7 @@ brainflow:
   use_csfm: true
   flow_loss_weight: 1.0
   csfm_var_reg_weight: 0.1
-  csfm_pcc_weight: 0.5
+  csfm_pcc_weight: 1.0
 
   velocity_net:
     hidden_dim: 1024
@@ -122,4 +122,4 @@ training:
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
-output_dir: outputs/brainflow_dit_test
+output_dir: outputs/brainflow_dit_test_test

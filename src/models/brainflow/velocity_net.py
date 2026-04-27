@@ -1,3 +1,4 @@
+import logging
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
@@ -6,6 +7,8 @@ from .components import SinusoidalPosEmb, RotaryEmbedding, RoPETransformerEncode
 from .subject_layers import SubjectLayers, NetworkSubjectLayers
 from .fusion import MultiTokenFusion
 from .backbones import DiTXBackbone, DiT1DBackbone
+
+logger = logging.getLogger(__name__)
 
 
 class VelocityNet(nn.Module):
@@ -150,14 +153,14 @@ class VelocityNet(nn.Module):
                 dropout=dropout, time_dim=hidden_dim, rotary_emb=self.rotary_emb_decoder,
                 dit_depth=dit_depth
             )
-            print(f"  [VelocityNet] Backbone: DiTXBackbone ({dit_depth} blocks)")
+            logger.info("Backbone: DiTXBackbone (%d blocks)", dit_depth)
         else:
             self.backbone = DiT1DBackbone(
                 d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
                 dropout=dropout, time_dim=hidden_dim, rotary_emb=self.rotary_emb_decoder,
                 dit_depth=dit_depth
             )
-            print(f"  [VelocityNet] Backbone: DiT1DBackbone ({dit_depth} blocks)")
+            logger.info("Backbone: DiT1DBackbone (%d blocks)", dit_depth)
         self.backbone.gradient_checkpointing = self.gradient_checkpointing
 
         # Output Layer
@@ -221,6 +224,8 @@ class VelocityNet(nn.Module):
             context_encoded = pre_encoded_context
         elif cond is not None:
             context_encoded = self.encode_context_from_cond(cond)
+        else:
+            # Unconditional fallback (e.g. CFG with zeroed context)
             tlen = self.n_target_trs
             context_encoded = torch.zeros(
                 x.shape[0], tlen, self.hidden_dim, device=x.device, dtype=x.dtype

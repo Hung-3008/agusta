@@ -19,10 +19,13 @@ Usage:
         python src/train_brainflow.py --config src/configs/brainflow.yaml
 """
 
+import logging
 import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 from .utils import recover_velocity_indi, IndiVelocityCallable, flow_train_time_sample, info_nce_loss
 from .time_warp import TimeWarpNet, tensor_warp_schedule
@@ -104,12 +107,16 @@ class BrainFlow(nn.Module):
         csfm_params = sum(p.numel() for p in self.hrf_source.parameters()) if self.use_csfm else 0
         warp_params = sum(p.numel() for p in self.time_warp_net.parameters()) if self.use_tensor_fm else 0
         
-        print(f"[BrainFlow] VelocityNet: {vn_params:,} params")
+        logger.info("VelocityNet: %s params", f"{vn_params:,}")
         if self.use_csfm:
-            print(f"  + HRF Source: {csfm_params:,} params")
-        print(f"Total params: {vn_params + csfm_params:,} "
-              f"(csfm={self.use_csfm}, tensor_fm={self.use_tensor_fm}, "
-              f"modality_dims={vn_cfg.get('modality_dims')})")
+            logger.info("  + HRF Source: %s params", f"{csfm_params:,}")
+        logger.info(
+            "Total params: %s (csfm=%s, tensor_fm=%s, modality_dims=%s)",
+            f"{vn_params + csfm_params:,}",
+            self.use_csfm,
+            self.use_tensor_fm,
+            vn_cfg.get('modality_dims'),
+        )
 
     def compute_loss(
         self,
