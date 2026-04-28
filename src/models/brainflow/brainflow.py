@@ -99,6 +99,7 @@ class BrainFlow(nn.Module):
             self.hrf_source = AECNN_HRF_Source(
                 context_dim=hidden_dim,
                 latent_dim=latent_dim,
+                output_dim=output_dim,
                 hrf_kernel_size=vn_cfg.get("hrf_kernel_size", 12)
             )
 

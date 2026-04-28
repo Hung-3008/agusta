@@ -76,9 +76,9 @@ brainflow:
   csfm_pcc_weight: 1.0
 
   velocity_net:
-    hidden_dim: 1024
-    dit_num_blocks: 8
-    n_heads: 16
+    hidden_dim: 768
+    dit_num_blocks: 12
+    n_heads: 12
     dropout: 0.1
     context_trs: 101
     n_target_trs: 50
@@ -87,7 +87,7 @@ brainflow:
     use_subject_head: true
     network_head: true
     use_rope: true
-    latent_dim: 1024
+    latent_dim: 768
     context_encoder: multitoken
     use_dit_decoder: true
     decoder_type: ditx
@@ -122,4 +122,4 @@ training:
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
-output_dir: outputs/brainflow_dit_test_test
+output_dir: outputs/brainflow_dit_base
