@@ -197,14 +197,24 @@ class BrainFlow(nn.Module):
                 # CSFM Losses
                 csfm_var_reg_loss = torch.mean(sigma_phi**2 - torch.log(sigma_phi**2 + 1e-8) - 1.0)
                 
-                # PCC loss between the clean base distribution (mu_phi) and target
-                _pred_flat = fmri_pred.flatten(1)  # (B, T*V)
-                _tgt_flat = target.flatten(1)
-                _pred_c = _pred_flat - _pred_flat.mean(dim=1, keepdim=True)
-                _tgt_c = _tgt_flat - _tgt_flat.mean(dim=1, keepdim=True)
-                _cov = (_pred_c * _tgt_c).sum(dim=1)
-                _std = torch.sqrt((_pred_c ** 2).sum(dim=1) * (_tgt_c ** 2).sum(dim=1) + 1e-8)
-                csfm_pcc_loss = (1.0 - _cov / _std).mean()
+                # PCC loss: per-voxel temporal correlation (matches Algonauts eval metric)
+                # For seq2seq (B, T, V): PCC along time dim for each voxel, then mean over voxels
+                # For single-TR (B, V): falls back to per-sample correlation across voxels
+                if fmri_pred.dim() == 3 and fmri_pred.shape[1] > 1:
+                    # (B, T, V) — per-voxel temporal PCC
+                    _pred_c = fmri_pred - fmri_pred.mean(dim=1, keepdim=True)
+                    _tgt_c = target - target.mean(dim=1, keepdim=True)
+                    _cov = (_pred_c * _tgt_c).sum(dim=1)          # (B, V)
+                    _std = torch.sqrt((_pred_c ** 2).sum(dim=1) * (_tgt_c ** 2).sum(dim=1) + 1e-8)  # (B, V)
+                    _pcc_per_voxel = _cov / _std                   # (B, V)
+                    csfm_pcc_loss = (1.0 - _pcc_per_voxel.mean(dim=1)).mean()  # mean over voxels, then batch
+                else:
+                    # (B, V) single-TR fallback — correlation across voxel dim
+                    _pred_c = fmri_pred - fmri_pred.mean(dim=-1, keepdim=True)
+                    _tgt_c = target - target.mean(dim=-1, keepdim=True)
+                    _cov = (_pred_c * _tgt_c).sum(dim=-1)
+                    _std = torch.sqrt((_pred_c ** 2).sum(dim=-1) * (_tgt_c ** 2).sum(dim=-1) + 1e-8)
+                    csfm_pcc_loss = (1.0 - _cov / _std).mean()
 
         # 4. Flow matching source distribution (x_0)
         x_1 = target
@@ -324,7 +334,7 @@ class BrainFlow(nn.Module):
         Args:
             context:               (B, T_ctx, total_dim) concatenated context.
             n_timesteps:           Number of ODE steps.
-            solver_method:         ``'midpoint'`` (default) or ``'euler'``.
+            solver_method:         ``'midpoint'`` (default), ``'euler'``, or ``'rk4'``.
             subject_ids:           (B,) subject indices.
             cfg_scale:             CFG guidance scale (0 = disabled).
             temperature:           Std-dev of starting noise (0 = zero init).
@@ -402,7 +412,22 @@ class BrainFlow(nn.Module):
             t_i = T_grid[i]
             dt = T_grid[i + 1] - T_grid[i]
 
-            if solver_method == "midpoint":
+            if solver_method == "rk4":
+                # Classic Runge-Kutta 4th order (4 NFE per step, O(h^5) error)
+                def _guided_vel(x_in, t_in):
+                    v = _vel(x_in, t_in, context_encoded)
+                    if cfg_scale > 0:
+                        v_unc = _vel(x_in, t_in, uncond_encoded)
+                        v = v_unc + cfg_scale * (v - v_unc)
+                    return v
+
+                k1 = _guided_vel(x, t_i)
+                k2 = _guided_vel(x + 0.5 * dt * k1, t_i + 0.5 * dt)
+                k3 = _guided_vel(x + 0.5 * dt * k2, t_i + 0.5 * dt)
+                k4 = _guided_vel(x + dt * k3, t_i + dt)
+                x = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+            elif solver_method == "midpoint":
                 # Stage 1: velocity at t_i
                 v1 = _vel(x, t_i, context_encoded)
                 if cfg_scale > 0:

@@ -143,10 +143,12 @@ class VelocityNet(nn.Module):
                 head_type=subject_head_type,
                 hidden_mult=subject_head_hidden_mult,
             )
-            self.subject_emb = None
         else:
             self.subject_layers = None
-            self.subject_emb = nn.Embedding(n_subjects, hidden_dim)
+
+        # Always create subject embedding so DiT backbone gets subject
+        # conditioning via AdaLN-Zero (shift/scale/gate become subject-aware).
+        self.subject_emb = nn.Embedding(n_subjects, hidden_dim)
 
         # Modular Backbone
         dec_max = max(n_target_trs, 64)
@@ -238,7 +240,7 @@ class VelocityNet(nn.Module):
 
         t_emb = self.time_mlp(self.time_embed(t))
 
-        if not self.use_subject_head and self.subject_emb is not None and subject_ids is not None:
+        if subject_ids is not None:
             t_emb = t_emb + self.subject_emb(subject_ids)
 
         h = self.input_proj(x)
