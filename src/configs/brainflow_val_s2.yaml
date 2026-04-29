@@ -44,8 +44,8 @@ subjects:
 
 splits:
   friends:
-    train: [s1, s2, s3, s4, s5]
-    val: [s6]
+    train: [s1, s3, s4, s5, s6]
+    val: [s2]
   movie10:
     train: [bourne, figures, life, wolf]
     val: []
@@ -124,4 +124,4 @@ training:
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
-output_dir: outputs/brainflow_dit_base_new_subjlayer
+output_dir: outputs/brainflow_dit_base_new_subjlayer_val_s2

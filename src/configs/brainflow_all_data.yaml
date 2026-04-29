@@ -1,5 +1,5 @@
 # =====================================================================
-# BrainFlow Medium Capacity Config
+# BrainFlow Medium Capacity Config - Train on ALL DATA
 # =====================================================================
 
 data_root: Data
@@ -44,8 +44,8 @@ subjects:
 
 splits:
   friends:
-    train: [s1, s2, s3, s4, s5]
-    val: [s6]
+    train: [s1, s2, s3, s4, s5, s6]
+    val: []
   movie10:
     train: [bourne, figures, life, wolf]
     val: []
@@ -117,11 +117,11 @@ training:
   grad_clip: 1.0
   use_amp: true
   log_every_n_steps: 20
-  val_every_n_epochs: 10
+  val_every_n_epochs: 999     # Disable validation
   ema_decay: 0.999
   gradient_accumulation_steps: 8
   ema_on_cpu: true
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
-output_dir: outputs/brainflow_dit_base_new_subjlayer
+output_dir: outputs/brainflow_dit_base_new_subjlayer_all_data
