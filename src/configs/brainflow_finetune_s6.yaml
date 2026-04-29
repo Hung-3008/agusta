@@ -1,5 +1,6 @@
 # =====================================================================
-# BrainFlow Medium Capacity Config
+# BrainFlow Finetune on S6 — No Validation
+# Based on brainflow.yaml, only splits and training schedule changed.
 # =====================================================================
 
 data_root: Data
@@ -42,12 +43,15 @@ subjects:
   - sub-03
   - sub-05
 
+# =====================================================================
+# KEY CHANGE: s6 moves from val → train, no validation split
+# =====================================================================
 splits:
   friends:
-    train: [s1, s2, s3, s4, s5]
-    val: [s6]
+    train: [s6]
+    val: []
   movie10:
-    train: [bourne, figures, life, wolf]
+    train: []
     val: []
 
 sliding_window:
@@ -92,8 +96,8 @@ brainflow:
     use_dit_decoder: true
     decoder_type: ditx
     zero_init_network_heads: true
-    subject_head_type: mlp          # 'linear' or 'mlp' (Plan B)
-    subject_head_hidden_mult: 0.5   # MLP hidden = latent_dim * mult = 512
+    subject_head_type: mlp
+    subject_head_hidden_mult: 0.5
     proj_dim: 256
     n_blocks: 4
     modality_dropout: 0.0
@@ -109,19 +113,20 @@ solver_args:
   time_grid_warp: sqrt
 
 training:
-  n_epochs: 200
-  lr: 1.0e-4
+  n_epochs: 50
+  lr: 5.0e-5
   weight_decay: 0.05
   warmup_ratio: 0.05
   min_lr: 1.0e-6
   grad_clip: 1.0
   use_amp: true
   log_every_n_steps: 20
-  val_every_n_epochs: 10
+  val_every_n_epochs: 999    # effectively disable validation
   ema_decay: 0.999
   gradient_accumulation_steps: 8
   ema_on_cpu: true
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
+  save_every: 5              # save EMA checkpoint every N epochs
 
-output_dir: outputs/brainflow_dit_base_new_subjlayer
+output_dir: outputs/brainflow_dit_base_new_subjlayer/finetune_s6

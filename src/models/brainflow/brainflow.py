@@ -31,6 +31,7 @@ from .utils import recover_velocity_indi, IndiVelocityCallable, flow_train_time_
 from .time_warp import TimeWarpNet, tensor_warp_schedule
 from .hrf_source import AECNN_HRF_Source
 from .velocity_net import VelocityNet
+from .subject_layers import build_subject_head
 
 class BrainFlow(nn.Module):
     """Flow matching with auxiliary regression, optional contrastive loss, and CFG.
@@ -101,18 +102,33 @@ class BrainFlow(nn.Module):
                 latent_dim=latent_dim,
                 hrf_kernel_size=vn_cfg.get("hrf_kernel_size", 12)
             )
+            # Plan A: Dedicated source head for CSFM (no gradient conflict with flow head)
+            if use_subject_head:
+                self.subject_layers_source = build_subject_head(
+                    in_channels=latent_dim,
+                    output_dim=output_dim,
+                    n_subjects=n_subjects,
+                    network_head=vn_cfg.get('network_head', False),
+                    zero_init=vn_cfg.get('zero_init_network_heads', False),
+                    head_type=vn_cfg.get('subject_head_type', 'linear'),
+                    hidden_mult=vn_cfg.get('subject_head_hidden_mult', 1.0),
+                )
+            else:
+                self.subject_layers_source = None
 
         # Log parameters
         vn_params = sum(p.numel() for p in self.velocity_net.parameters())
         csfm_params = sum(p.numel() for p in self.hrf_source.parameters()) if self.use_csfm else 0
+        source_head_params = sum(p.numel() for p in self.subject_layers_source.parameters()) if (self.use_csfm and hasattr(self, 'subject_layers_source') and self.subject_layers_source is not None) else 0
         warp_params = sum(p.numel() for p in self.time_warp_net.parameters()) if self.use_tensor_fm else 0
         
         logger.info("VelocityNet: %s params", f"{vn_params:,}")
         if self.use_csfm:
             logger.info("  + HRF Source: %s params", f"{csfm_params:,}")
+            logger.info("  + Source Subject Head: %s params (separate from flow head)", f"{source_head_params:,}")
         logger.info(
             "Total params: %s (csfm=%s, tensor_fm=%s, modality_dims=%s)",
-            f"{vn_params + csfm_params:,}",
+            f"{vn_params + csfm_params + source_head_params:,}",
             self.use_csfm,
             self.use_tensor_fm,
             vn_cfg.get('modality_dims'),
@@ -163,7 +179,12 @@ class BrainFlow(nn.Module):
                 
                 mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled_reg)
                 
-                if self.velocity_net.use_subject_head:
+                # Plan A: Use dedicated source head (no gradient conflict with flow head)
+                if self.subject_layers_source is not None:
+                    if subject_ids is None:
+                        subject_ids = torch.zeros(target.shape[0], dtype=torch.long, device=target.device)
+                    fmri_pred = self.subject_layers_source(mu_phi_latent, subject_ids)
+                elif self.velocity_net.use_subject_head:
                     if subject_ids is None:
                         subject_ids = torch.zeros(target.shape[0], dtype=torch.long, device=target.device)
                     fmri_pred = self.velocity_net.subject_layers(mu_phi_latent, subject_ids)
@@ -333,7 +354,12 @@ class BrainFlow(nn.Module):
             ctx_pooled = context_encoded.mean(dim=1)
             mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled)
             
-            if self.velocity_net.use_subject_head:
+            # Plan A: Use dedicated source head for CSFM synthesis
+            if self.subject_layers_source is not None:
+                if subject_ids is None:
+                    subject_ids = torch.zeros(B, dtype=torch.long, device=device)
+                mu_phi_fmri = self.subject_layers_source(mu_phi_latent, subject_ids)
+            elif self.velocity_net.use_subject_head:
                 if subject_ids is None:
                     subject_ids = torch.zeros(B, dtype=torch.long, device=device)
                 mu_phi_fmri = self.velocity_net.subject_layers(mu_phi_latent, subject_ids)

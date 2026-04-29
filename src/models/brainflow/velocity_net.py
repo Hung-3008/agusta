@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from .components import SinusoidalPosEmb, RotaryEmbedding, RoPETransformerEncoderLayer
-from .subject_layers import SubjectLayers, NetworkSubjectLayers
+from .subject_layers import build_subject_head
 from .fusion import MultiTokenFusion
 from .backbones import DiTXBackbone, DiT1DBackbone
 
@@ -41,6 +41,8 @@ class VelocityNet(nn.Module):
         dit_num_blocks: int | None = None,
         decoder_type: str = "ditx",
         zero_init_network_heads: bool = False,
+        subject_head_type: str = "linear",
+        subject_head_hidden_mult: float = 1.0,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -51,6 +53,8 @@ class VelocityNet(nn.Module):
         self.gradient_checkpointing = gradient_checkpointing
         self.use_rope = use_rope
         self.network_head = network_head and use_subject_head
+        self.subject_head_type = subject_head_type
+        self.subject_head_hidden_mult = subject_head_hidden_mult
         self.n_target_trs = n_target_trs
         self.context_encoder = context_encoder
         self.context_trs = int(context_trs) if context_trs is not None else int(max_seq_len)
@@ -130,14 +134,15 @@ class VelocityNet(nn.Module):
 
         # Subject Heads
         if use_subject_head:
-            if self.network_head:
-                self.subject_layers = NetworkSubjectLayers(
-                    self.latent_dim,
-                    n_subjects,
-                    zero_init=zero_init_network_heads,
-                )
-            else:
-                self.subject_layers = SubjectLayers(self.latent_dim, output_dim, n_subjects)
+            self.subject_layers = build_subject_head(
+                in_channels=self.latent_dim,
+                output_dim=output_dim,
+                n_subjects=n_subjects,
+                network_head=self.network_head,
+                zero_init=zero_init_network_heads,
+                head_type=subject_head_type,
+                hidden_mult=subject_head_hidden_mult,
+            )
             self.subject_emb = None
         else:
             self.subject_layers = None
