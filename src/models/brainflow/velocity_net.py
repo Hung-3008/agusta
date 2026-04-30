@@ -7,6 +7,7 @@ from .components import SinusoidalPosEmb, RotaryEmbedding, RoPETransformerEncode
 from .subject_layers import build_subject_head
 from .fusion import MultiTokenFusion
 from .backbones import DiTXBackbone, DiT1DBackbone
+from .mamba_backbone import MambaFlowBackbone
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,9 @@ class VelocityNet(nn.Module):
         zero_init_network_heads: bool = False,
         subject_head_type: str = "linear",
         subject_head_hidden_mult: float = 1.0,
+        mamba_d_state: int = 16,
+        mamba_d_conv: int = 4,
+        mamba_expand: int = 2,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -161,6 +165,16 @@ class VelocityNet(nn.Module):
                 dit_depth=dit_depth
             )
             logger.info("Backbone: DiTXBackbone (%d blocks)", dit_depth)
+        elif decoder_type == "mamba":
+            self.backbone = MambaFlowBackbone(
+                d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
+                dropout=dropout, time_dim=hidden_dim, rotary_emb=self.rotary_emb_decoder,
+                dit_depth=dit_depth,
+                d_state=mamba_d_state, d_conv=mamba_d_conv,
+                expand_factor=mamba_expand,
+            )
+            logger.info("Backbone: MambaFlowBackbone (%d blocks, d_state=%d, expand=%d)",
+                        dit_depth, mamba_d_state, mamba_expand)
         else:
             self.backbone = DiT1DBackbone(
                 d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,

@@ -646,7 +646,7 @@ def run_s7(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
     use_stats = cfg["fmri"].get("use_global_stats", False)
     stats = load_fmri_stats(fmri_dir, runner.subjects) if use_stats else {}
 
-    run_name = Path(cfg.get("output_dir", "outputs/brainflow")).name
+    run_name = args.sub_name if args.sub_name else Path(cfg.get("output_dir", "outputs/brainflow")).name
     out_dir = PROJECT_ROOT / "outputs" / "submissions" / run_name / "s7"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -763,7 +763,7 @@ def run_ood(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
     use_stats = cfg["fmri"].get("use_global_stats", False)
     stats = load_fmri_stats(fmri_dir, runner.subjects) if use_stats else {}
 
-    run_name = Path(cfg.get("output_dir", "outputs/brainflow")).name
+    run_name = args.sub_name if args.sub_name else Path(cfg.get("output_dir", "outputs/brainflow")).name
     out_dir = PROJECT_ROOT / "outputs" / "submissions" / run_name / "ood"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -912,6 +912,7 @@ def main():
     p.add_argument("--resume",         action="store_true", default=True,
                    help="[S7] Skip already-completed subjects")
     p.add_argument("--no_resume",      dest="resume", action="store_false")
+    p.add_argument("--sub_name",       default=None, help="Custom memorable name for the submission directory")
     p.add_argument("--output_dir",     default=None, help="Override output directory")
     args = p.parse_args()
 
