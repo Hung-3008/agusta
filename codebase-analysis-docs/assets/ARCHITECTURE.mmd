@@ -1,0 +1,70 @@
+%% BrainFlow repo architecture (generated)
+flowchart TD
+  subgraph EntryPoints[CLI Entry Points]
+    TB[src/train_brainflow.py]
+    EV[src/evaluate_brainflow.py]
+    FT[src/finetune_s6.py]
+    EN[src/ensemble_weights.py]
+  end
+
+  subgraph Configs[Configs]
+    C1[src/configs/brainflow.yaml]
+    C2[src/configs/brainflow_mamba.yaml]
+    C3[src/configs/brainflow_finetune_s6.yaml]
+  end
+
+  subgraph Data[Data Layout]
+    D0[Data/]
+    D1[Data/algonauts_2025.competitors/fmri/.../*.h5]
+    D2[Data/features_npy_pooled/<modality>/**/*.npy]
+    D3[outputs/<run_name>/]
+  end
+
+  subgraph Dataset[Dataset]
+    DS[src/datasets/directflow_dataset.py
+    DirectFlowDataset + get_dataloaders]
+  end
+
+  subgraph Model[Model]
+    BF[src/models/brainflow/brainflow.py
+    BrainFlow]
+    VN[src/models/brainflow/velocity_net.py
+    VelocityNet]
+    FU[src/models/brainflow/fusion.py
+    MultiTokenFusion]
+    BK[src/models/brainflow/backbones.py
+    DiTXBackbone / DiT1DBackbone]
+    MB[src/models/brainflow/mamba_backbone.py
+    MambaFlowBackbone]
+    SL[src/models/brainflow/subject_layers.py]
+    CS[src/models/brainflow/hrf_source.py]
+    TW[src/models/brainflow/time_warp.py]
+    MU[src/models/brainflow/utils.py]
+  end
+
+  subgraph InferUtils[Inference Utilities]
+    IU[src/utils/utils.py
+    multi-seed + parcel calibration]
+  end
+
+  TB -->|loads YAML| C1
+  EV -->|loads YAML| C1
+  FT -->|loads YAML| C3
+  TB --> DS
+  FT --> DS
+  DS -->|context .npy| D2
+  DS -->|fMRI .h5| D1
+  TB --> BF
+  EV --> BF
+  FT --> BF
+  BF --> VN
+  VN --> FU
+  VN --> BK
+  VN --> MB
+  VN --> SL
+  BF --> CS
+  BF --> TW
+  BF --> MU
+  EV --> IU
+  TB --> D3
+  EV --> D3

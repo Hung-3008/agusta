@@ -1,0 +1,38 @@
+%% BrainFlow model flow (seq2seq) (generated)
+flowchart LR
+  C[Context: (B,T_ctx,D_total)
+concatenated modalities] --> E[VelocityNet.encode_context_from_cond]
+  subgraph Encode[Context Encoding]
+    E --> F[MultiTokenFusion: per-modality proj + concat/mean]
+    F --> TEnc[Temporal encoder
+(RoPE Transformer layers or nn.TransformerEncoder)]
+    TEnc --> Slice[Center slice to n_target_trs tokens]
+  end
+
+  subgraph Flow[Flow Matching Branch]
+    X0[x0: start (noise or CSFM source)] --> XT[x_t: interpolate with t]
+    XT --> VPred[VelocityNet.forward
+(backbone + subject head)]
+    VPred --> Lflow[flow_loss = MSE(v_pred, target_velocity)]
+  end
+
+  subgraph CSFM[Optional CSFM Source]
+    TEnc --> HRF[AECNN_HRF_Source
+(mu_phi, sigma_phi)]
+    HRF --> X0
+    HRF --> Lpcc[PCC loss]
+    HRF --> Lvar[Variance reg]
+  end
+
+  subgraph TensorFM[Optional Tensor-FM]
+    TEnc --> Gamma[TimeWarpNet predicts gamma]
+    Gamma --> Sched[tensor_warp_schedule
+(lambda_t, d_lambda_t)]
+    Sched --> XT
+  end
+
+  E -->|context_encoded| XT
+  E -->|context_encoded| VPred
+  Lflow --> Ltot[total_loss]
+  Lpcc --> Ltot
+  Lvar --> Ltot
