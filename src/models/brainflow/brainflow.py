@@ -54,6 +54,7 @@ class BrainFlow(nn.Module):
         use_csfm: bool = False,
         csfm_var_reg_weight: float = 0.1,
         csfm_pcc_weight: float = 1.0,
+        csfm_align_weight: float = 1.0,
         flow_loss_weight: float = 1.0,
     ):
         super().__init__()
@@ -64,6 +65,7 @@ class BrainFlow(nn.Module):
         self.use_csfm = use_csfm
         self.csfm_var_reg_weight = csfm_var_reg_weight
         self.csfm_pcc_weight = csfm_pcc_weight
+        self.csfm_align_weight = csfm_align_weight
         self.flow_loss_weight = flow_loss_weight
 
         vn_cfg = dict(velocity_net_params or {})
@@ -166,6 +168,7 @@ class BrainFlow(nn.Module):
         _zero = torch.tensor(0.0, device=target.device)
         csfm_var_reg_loss = _zero
         csfm_pcc_loss = _zero
+        csfm_align_loss = _zero
         x_0_csfm = None
 
         if skip_aux:
@@ -177,8 +180,8 @@ class BrainFlow(nn.Module):
                 ctx_transposed = ctx_detached.transpose(1, 2)
                 ctx_pooled_reg = ctx_detached.mean(dim=1)
                 
-                mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled_reg)
-                
+                mu_phi_latent, log_var_phi = self.hrf_source(ctx_transposed, ctx_pooled_reg)
+
                 # Plan A: Use dedicated source head (no gradient conflict with flow head)
                 if self.subject_layers_source is not None:
                     if subject_ids is None:
@@ -191,15 +194,34 @@ class BrainFlow(nn.Module):
                 else:
                     fmri_pred = mu_phi_latent
 
+                # Reparameterize: x_0 = mu + std * eps, std = exp(0.5 * log_var)
+                # log_var_phi: (B, T, latent_dim) — average over latent dim to get
+                # per-TR scalar log-variance, then broadcast to output_dim.
+                log_var_phi = torch.clamp(log_var_phi, min=-10.0, max=4.0)
+                log_var_scalar = log_var_phi.mean(dim=-1, keepdim=True)  # (B, T, 1)
+                std_phi = torch.exp(0.5 * log_var_scalar)                # (B, T, 1) → broadcasts
                 epsilon = torch.randn_like(target)
-                x_0_csfm = fmri_pred + sigma_phi * epsilon
-                
-                # CSFM Losses
-                csfm_var_reg_loss = torch.mean(sigma_phi**2 - torch.log(sigma_phi**2 + 1e-8) - 1.0)
-                
-                # PCC loss: per-voxel temporal correlation (matches Algonauts eval metric)
-                # For seq2seq (B, T, V): PCC along time dim for each voxel, then mean over voxels
-                # For single-TR (B, V): falls back to per-sample correlation across voxels
+                x_0_csfm = fmri_pred + std_phi * epsilon
+
+                # --- CSFM Loss 1: Variance Regularization (var_only_kld) ---
+                # KL(N(mu, sigma^2) || N(mu, I)) — only penalises variance,
+                # mu is FREE to move toward x_1 (matches CSFM paper Sec. 3.2).
+                # Formula: -0.5 * mean(1 + log_var - exp(log_var))
+                # Apply on per-TR log_var (B, T, latent_dim) — mean over all dims.
+                csfm_var_reg_loss = -0.5 * torch.mean(1.0 + log_var_phi - log_var_phi.exp())
+
+                # --- CSFM Loss 2: Directional Alignment Loss (L_align) ---
+                # Normalised L2 between mu_phi (projected to fMRI space) and x_1.
+                # Ensures source mean points in the correct direction toward the target,
+                # preventing crossed trajectories and providing clean supervision signal.
+                pred_flat = fmri_pred.reshape(fmri_pred.shape[0], -1)
+                tgt_flat  = target.reshape(target.shape[0], -1)
+                pred_norm = F.normalize(pred_flat, dim=-1)
+                tgt_norm  = F.normalize(tgt_flat,  dim=-1)
+                csfm_align_loss = F.mse_loss(pred_norm, tgt_norm)
+
+                # --- CSFM Loss 3: PCC loss ---
+                # Per-voxel temporal correlation (matches Algonauts eval metric)
                 if fmri_pred.dim() == 3 and fmri_pred.shape[1] > 1:
                     # (B, T, V) — per-voxel temporal PCC
                     _pred_c = fmri_pred - fmri_pred.mean(dim=1, keepdim=True)
@@ -207,7 +229,7 @@ class BrainFlow(nn.Module):
                     _cov = (_pred_c * _tgt_c).sum(dim=1)          # (B, V)
                     _std = torch.sqrt((_pred_c ** 2).sum(dim=1) * (_tgt_c ** 2).sum(dim=1) + 1e-8)  # (B, V)
                     _pcc_per_voxel = _cov / _std                   # (B, V)
-                    csfm_pcc_loss = (1.0 - _pcc_per_voxel.mean(dim=1)).mean()  # mean over voxels, then batch
+                    csfm_pcc_loss = (1.0 - _pcc_per_voxel.mean(dim=1)).mean()
                 else:
                     # (B, V) single-TR fallback — correlation across voxel dim
                     _pred_c = fmri_pred - fmri_pred.mean(dim=-1, keepdim=True)
@@ -275,7 +297,8 @@ class BrainFlow(nn.Module):
         if self.use_csfm:
             total_loss = total_loss + self.csfm_var_reg_weight * csfm_var_reg_loss
             total_loss = total_loss + self.csfm_pcc_weight * csfm_pcc_loss
-            
+            total_loss = total_loss + self.csfm_align_weight * csfm_align_loss
+
         total_loss = total_loss + self.gamma_reg_weight * gamma_reg
 
         return {
@@ -283,6 +306,7 @@ class BrainFlow(nn.Module):
             "flow_loss": flow_loss,
             "pcc_loss": csfm_pcc_loss if self.use_csfm else _zero,
             "var_reg_loss": csfm_var_reg_loss if self.use_csfm else _zero,
+            "align_loss": csfm_align_loss if self.use_csfm else _zero,
             "gamma_reg": gamma_reg,
         }
 
@@ -375,8 +399,8 @@ class BrainFlow(nn.Module):
         elif self.use_csfm:
             ctx_transposed = context_encoded.transpose(1, 2)
             ctx_pooled = context_encoded.mean(dim=1)
-            mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled)
-            
+            mu_phi_latent, log_var_phi = self.hrf_source(ctx_transposed, ctx_pooled)
+
             # Plan A: Use dedicated source head for CSFM synthesis
             if self.subject_layers_source is not None:
                 if subject_ids is None:
@@ -390,8 +414,13 @@ class BrainFlow(nn.Module):
                 mu_phi_fmri = mu_phi_latent
             x = mu_phi_fmri.to(device=device, dtype=dtype)
             if temperature > 0:
+                # Reparameterize: x = mu + temperature * std * eps
+                # log_var_phi: (B, T, latent_dim) → mean over latent_dim → (B, T, 1) scalar std
+                log_var_phi = torch.clamp(log_var_phi, min=-10.0, max=4.0)
+                log_var_scalar = log_var_phi.mean(dim=-1, keepdim=True)          # (B, T, 1)
+                std_phi = torch.exp(0.5 * log_var_scalar).to(device=device, dtype=dtype)
                 epsilon = torch.randn_like(x)
-                x = x + temperature * sigma_phi * epsilon
+                x = x + temperature * std_phi * epsilon
         elif temperature > 0:
             shape = (B, n_target, self.output_dim) if n_target > 1 else (B, self.output_dim)
             x = temperature * torch.randn(*shape, device=device, dtype=dtype)
