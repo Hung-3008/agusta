@@ -325,6 +325,8 @@ class BrainFlow(nn.Module):
         time_grid_warp: str | None = None,
         time_grid_max: float = 1.0,
         final_jump: bool = False,
+        pre_encoded_context: torch.Tensor | None = None,
+        starting_distribution: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate fMRI by solving ODE. Supports single-TR and seq2seq modes.
 
@@ -338,9 +340,14 @@ class BrainFlow(nn.Module):
             subject_ids:           (B,) subject indices.
             cfg_scale:             CFG guidance scale (0 = disabled).
             temperature:           Std-dev of starting noise (0 = zero init).
-            time_grid_warp:        ``'sqrt'`` = finer steps near t→1.
+            time_grid_warp:        ``'sqrt'`` = finer steps near t→ 1.
             time_grid_max:         Upper integration bound in [0,1] to avoid t→1 singularity.
             final_jump:            If True and time_grid_max<1, perform a final residual jump.
+            pre_encoded_context:   Optional pre-computed context encoding (B, T, D).
+                                   Skips encode_context_from_cond() when provided.
+                                   Use to avoid redundant encoding across multiple seeds.
+            starting_distribution: Optional explicit x0 tensor (B, ...) that overrides
+                                   temperature-based noise initialization.
 
         Returns:
             fmri_pred: (B, output_dim) or (B, n_target_trs, output_dim).
@@ -350,8 +357,11 @@ class BrainFlow(nn.Module):
         dtype = context.dtype
         n_target = getattr(self.velocity_net, 'n_target_trs', 1)
 
-        # --- Encode context ---
-        context_encoded = self.velocity_net.encode_context_from_cond(context)
+        # --- Encode context (skip if pre-computed) ---
+        if pre_encoded_context is not None:
+            context_encoded = pre_encoded_context
+        else:
+            context_encoded = self.velocity_net.encode_context_from_cond(context)
         uncond_encoded = None
         if cfg_scale > 0:
             uncond_encoded = self.velocity_net.encode_context_from_cond(
@@ -359,7 +369,10 @@ class BrainFlow(nn.Module):
             )
 
         # --- Initialise x_0 ---
-        if self.use_csfm:
+        if starting_distribution is not None:
+            # Use caller-provided starting point (enables batched multi-seed)
+            x = starting_distribution.to(device=device, dtype=dtype)
+        elif self.use_csfm:
             ctx_transposed = context_encoded.transpose(1, 2)
             ctx_pooled = context_encoded.mean(dim=1)
             mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled)

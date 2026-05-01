@@ -696,46 +696,150 @@ def run_s7(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
         samples = _load_s7_samples(subject)
         subj_dict = {}
 
-        for epi, n_trs in tqdm(samples.items(), desc=subject):
-            clip = f"friends_{epi}"
-            ctx = load_context_clip(context_dirs, "friends", "s7", clip, expected_dims=cfg.get("modality_dims"))
+        # ── Build all windows upfront for all episodes ─────────────────────
+        # Then process them in large cross-episode batches to maximize GPU util.
+        episode_list = list(samples.items())
+        chunk_size = getattr(args, "chunk_episodes", 4)  # episodes per mega-batch
 
-            if ctx is None or ctx.shape[0] == 0:
-                log.warning("  No context: %s — emitting zeros", clip)
-                subj_dict[epi] = np.zeros((n_trs, n_voxels), dtype=np.float32)
+        for chunk_start in tqdm(
+            range(0, len(episode_list), chunk_size),
+            desc=subject,
+            total=(len(episode_list) + chunk_size - 1) // chunk_size,
+        ):
+            chunk = episode_list[chunk_start: chunk_start + chunk_size]
+
+            # ── Collect windows for all episodes in this chunk ──
+            chunk_windows: list[dict] = []    # flat list of all windows
+            episode_meta: list[dict] = []     # per-episode metadata
+
+            for epi, n_trs in chunk:
+                clip = f"friends_{epi}"
+                ctx = load_context_clip(
+                    context_dirs, "friends", "s7", clip,
+                    expected_dims=cfg.get("modality_dims"),
+                )
+                if ctx is None or ctx.shape[0] == 0:
+                    log.warning("  No context: %s — emitting zeros", clip)
+                    subj_dict[epi] = np.zeros((n_trs, n_voxels), dtype=np.float32)
+                    episode_meta.append(None)
+                    continue
+
+                windows = build_s7_windows(
+                    ctx, n_trs, context_trs, n_target_trs, hrf_delay, stride,
+                )
+                if not windows:
+                    subj_dict[epi] = np.zeros((n_trs, n_voxels), dtype=np.float32)
+                    episode_meta.append(None)
+                    del ctx
+                    continue
+
+                w_start = len(chunk_windows)
+                chunk_windows.extend(windows)
+                w_end = len(chunk_windows)
+
+                episode_meta.append({
+                    "epi": epi,
+                    "n_trs": n_trs,
+                    "w_start": w_start,
+                    "w_end": w_end,
+                    "windows": windows,
+                })
+                del ctx
+
+            if not chunk_windows:
                 continue
 
-            windows = build_s7_windows(ctx, n_trs, context_trs, n_target_trs, hrf_delay, stride)
-            if not windows:
-                subj_dict[epi] = np.zeros((n_trs, n_voxels), dtype=np.float32)
-                continue
+            # ── Batched GPU inference across all windows in this chunk ──
+            all_ctx_np = np.stack([w["context"] for w in chunk_windows])
+            starts_flat = [w["target_start"] for w in chunk_windows]
+            synth_kw = solver.as_synth_kwargs()
+            strategy = solver.as_strategy_config()
 
-            pred_avg, valid = runner.run_windows(
-                windows,
-                sid,
-                n_trs,
-                n_target_trs,
-                args.batch_size,
-                solver,
-                parcel_seed_map=subject_seed_map,
-                return_seed_preds=False,
-            )
+            # Per-episode accumulators
+            epi_pred_sums: dict[str, np.ndarray] = {}
+            epi_pred_counts: dict[str, np.ndarray] = {}
+            for meta in episode_meta:
+                if meta is None:
+                    continue
+                epi_pred_sums[meta["epi"]] = np.zeros(
+                    (meta["n_trs"], n_voxels), dtype=np.float64
+                )
+                epi_pred_counts[meta["epi"]] = np.zeros(meta["n_trs"], dtype=np.float64)
 
-            # Denormalize if trained with z-score
-            if use_stats and subject in stats:
-                s = stats[subject]
-                pred_avg = pred_avg * s["std"] + s["mean"]
+            # Index: window position → (episode_key, n_trs)
+            window_to_epi: list[tuple[str, int]] = []
+            for meta in episode_meta:
+                if meta is None:
+                    continue
+                n_t = meta["n_trs"]
+                for _ in range(meta["w_end"] - meta["w_start"]):
+                    window_to_epi.append((meta["epi"], n_t))
 
-            pred_avg = np.nan_to_num(pred_avg, nan=0.0)
-            subj_dict[epi] = pred_avg.astype(np.float32)
-            log.info("  %s: %d/%d TRs predicted", epi, int(valid.sum()), n_trs)
-            del ctx, windows, pred_avg
+            # ── Process windows in large batches ──
+            # Pre-encode context for all windows at once if no CSFM
+            for bi in range(0, len(chunk_windows), args.batch_size):
+                be = min(bi + args.batch_size, len(chunk_windows))
+                B = be - bi
+
+                ctx_t = torch.from_numpy(all_ctx_np[bi:be]).to(runner.device)
+                subj_t = torch.full((B,), sid, dtype=torch.long, device=runner.device)
+
+                pred_agg, _ = run_multiseed_synthesis(
+                    model=runner.model,
+                    context=ctx_t,
+                    subject_ids=subj_t,
+                    synth_kwargs=synth_kw,
+                    strategy=strategy,
+                    parcel_seed_map=subject_seed_map,
+                )
+                pred_np = pred_agg.float().cpu().numpy()  # (B, T, V) or (B, V)
+
+                for j in range(B):
+                    win_idx = bi + j
+                    epi_key, n_t = window_to_epi[win_idx]
+                    ts = starts_flat[win_idx]
+                    for off in range(n_target_trs):
+                        tr = ts + off
+                        if tr >= n_t:
+                            break
+                        epi_pred_sums[epi_key][tr] += pred_np[j, off]
+                        epi_pred_counts[epi_key][tr] += 1
+
+                del ctx_t, subj_t, pred_agg
+                torch.cuda.empty_cache()
+
+            # ── Finalise per-episode predictions ──
+            for meta in episode_meta:
+                if meta is None:
+                    continue
+                epi = meta["epi"]
+                n_t = meta["n_trs"]
+                pred_sum = epi_pred_sums[epi]
+                pred_count = epi_pred_counts[epi]
+                valid = pred_count > 0
+
+                pred_avg = np.zeros((n_t, n_voxels), dtype=np.float32)
+                pred_avg[valid] = (
+                    pred_sum[valid] / pred_count[valid, None]
+                ).astype(np.float32)
+
+                if use_stats and subject in stats:
+                    s = stats[subject]
+                    pred_avg = pred_avg * s["std"] + s["mean"]
+
+                pred_avg = np.nan_to_num(pred_avg, nan=0.0)
+                subj_dict[epi] = pred_avg.astype(np.float32)
+                log.info("  %s: %d/%d TRs predicted", epi, int(valid.sum()), n_t)
+
+            del chunk_windows, all_ctx_np
+            gc.collect()
 
         np.save(out_path, subj_dict)
         subj_paths[subject] = out_path
         log.info("  Saved %s (%.1f MB)", out_path.name, out_path.stat().st_size / 1e6)
         del subj_dict
         gc.collect(); torch.cuda.empty_cache()
+
 
     _save_submission(subj_paths, out_dir, tag="s7")
 
@@ -913,6 +1017,9 @@ def main():
                    help="[S7] Skip already-completed subjects")
     p.add_argument("--no_resume",      dest="resume", action="store_false")
     p.add_argument("--output_dir",     default=None, help="Override output directory")
+    p.add_argument("--chunk_episodes", type=int, default=4,
+                   help="[S7] Number of episodes merged into one GPU mega-batch. "
+                        "Higher = more GPU utilization but more RAM. Default: 4.")
     args = p.parse_args()
 
     device = torch.device(args.device)

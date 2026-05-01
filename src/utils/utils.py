@@ -124,16 +124,77 @@ def run_multiseed_synthesis(
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
 	"""Run multi-seed synthesis and aggregate prediction per strategy mode.
 
+	Key optimizations:
+	  1. Context is encoded ONCE and reused across all seeds (avoids N×encoder cost).
+	  2. When pruned_sampling is disabled, all seeds are batched into a single
+	     forward pass (S×B batch) so the GPU processes everything in parallel.
+
 	Returns:
-		pred_agg: aggregated prediction tensor.
-		preds_by_seed: list of per-seed prediction tensors.
+		pred_agg: aggregated prediction tensor (B, T, V) or (B, V).
+		preds_by_seed: list of per-seed tensors, each (B, T, V) or (B, V).
 	"""
 	mode = (strategy.ensemble_mode or "none").lower()
 	seeds = max(1, int(strategy.n_seeds))
 	if mode in ("none", "single"):
 		seeds = 1
+
+	# ── Optimization 1: encode context once, reuse for all seeds ──────────────
+	with torch.inference_mode():
+		context_encoded = model.velocity_net.encode_context_from_cond(context)
+
 	preds_by_seed: list[torch.Tensor] = []
 
+	# ── Optimization 2: batch all seeds into one forward pass ─────────────────
+	# Only valid when pruned_sampling is disabled (no anchor dependency per seed)
+	if seeds > 1 and not strategy.use_pruned_sampling and mode not in ("none", "single"):
+		B = context.shape[0]
+		# Replicate context_encoded and subject_ids S times
+		ctx_enc_rep = context_encoded.repeat(seeds, 1, 1)   # (S*B, T, D)
+		subj_rep    = subject_ids.repeat(seeds)              # (S*B,)
+
+		# Build S different noise starts with different seeds
+		noise_list = []
+		for seed_offset in range(seeds):
+			seed = int(strategy.base_seed + seed_offset)
+			g = _to_device_generator(context.device, seed)
+			if model.use_csfm:
+				# CSFM: use mu_phi + sigma * noise — compute per seed
+				# Fall back to sequential for CSFM (state-dependent start)
+				noise_list = None
+				break
+			n_target = getattr(model.velocity_net, 'n_target_trs', 1)
+			temp = float(synth_kwargs.get("temperature", 0.05))
+			shape = (B, n_target, model.output_dim) if n_target > 1 else (B, model.output_dim)
+			noise_list.append(temp * torch.randn(*shape, generator=g,
+			                                    device=context.device, dtype=context.dtype))
+
+		if noise_list is not None:
+			# Stack noise: (S*B, ...) and run ONE batched ODE solve
+			x0_batch = torch.cat(noise_list, dim=0)  # (S*B, T, V)
+			kw = dict(synth_kwargs)
+			kw["starting_distribution"] = x0_batch
+			kw["temperature"] = 0.0  # noise already baked in
+			pred_batch = model.synthesise(
+				context.repeat(seeds, 1, 1),
+				subject_ids=subj_rep,
+				pre_encoded_context=ctx_enc_rep,
+				**kw,
+			)
+			# Split back into per-seed predictions
+			for s in range(seeds):
+				preds_by_seed.append(pred_batch[s * B:(s + 1) * B])
+
+			if mode == "mean":
+				return torch.stack(preds_by_seed, dim=0).mean(dim=0), preds_by_seed
+			if mode == "max":
+				return torch.stack(preds_by_seed, dim=0).max(dim=0)[0], preds_by_seed
+			if mode == "parcel_stitch":
+				if parcel_seed_map is None:
+					return torch.stack(preds_by_seed, dim=0).mean(dim=0), preds_by_seed
+				return stitch_predictions_by_seed_map(preds_by_seed, parcel_seed_map), preds_by_seed
+
+	# ── Fallback: sequential seeds (CSFM mode or pruned sampling) ────────────
+	# Still benefits from Optimization 1 (context_encoded cached above)
 	for seed_offset in range(seeds):
 		seed = int(strategy.base_seed + seed_offset)
 		if strategy.use_pruned_sampling:
@@ -148,12 +209,20 @@ def run_multiseed_synthesis(
 			kw = dict(synth_kwargs)
 			kw["starting_distribution"] = start
 			kw["temperature"] = 0.0
-			pred = model.synthesise(context, subject_ids=subject_ids, **kw)
+			pred = model.synthesise(
+				context, subject_ids=subject_ids,
+				pre_encoded_context=context_encoded,
+				**kw,
+			)
 		else:
 			torch.manual_seed(seed)
 			if context.device.type == "cuda":
 				torch.cuda.manual_seed_all(seed)
-			pred = model.synthesise(context, subject_ids=subject_ids, **synth_kwargs)
+			pred = model.synthesise(
+				context, subject_ids=subject_ids,
+				pre_encoded_context=context_encoded,  # ← reuse cached encoding
+				**synth_kwargs,
+			)
 		preds_by_seed.append(pred)
 
 	if seeds == 1 or mode in ("none", "single"):
@@ -167,7 +236,6 @@ def run_multiseed_synthesis(
 
 	if mode == "parcel_stitch":
 		if parcel_seed_map is None:
-			# Fallback to mean to avoid hard failure in blind sessions.
 			return torch.stack(preds_by_seed, dim=0).mean(dim=0), preds_by_seed
 		stitched = stitch_predictions_by_seed_map(preds_by_seed, parcel_seed_map)
 		return stitched, preds_by_seed

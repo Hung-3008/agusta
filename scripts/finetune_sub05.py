@@ -30,7 +30,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.datasets.directflow_dataset import load_config, DirectFlowDataset
 from src.models.brainflow.brainflow import BrainFlow
-from scripts.train_brainflow import EMAModel, pearson_corr_per_dim
+from src.train_brainflow import EMAModel, pearson_corr_per_dim
 from torch.utils.data import DataLoader
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
