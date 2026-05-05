@@ -219,6 +219,89 @@ class DiTXBlock(nn.Module):
 
 
 # =============================================================================
+# Context Refinement (FLUX.1 double-stream inspired)
+# =============================================================================
+
+class ContextRefineLayer(nn.Module):
+    """Lightweight per-depth context refinement.
+
+    Self-attention + FFN on context tokens with zero-init gated residuals.
+    Context evolves across decoder depth while starting as identity at init.
+    Inspired by FLUX.1 double-stream blocks where condition tokens refine
+    alongside target tokens through the decoder stack.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        rotary_emb: RotaryEmbedding,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.rotary_emb = rotary_emb
+        self.attn_dropout_p = dropout
+
+        # Pre-norm self-attention
+        self.norm1 = nn.LayerNorm(d_model)
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_drop = nn.Dropout(dropout)
+
+        # FFN
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+
+        # Zero-init gates — identity at initialization for training stability
+        self.gate_attn = nn.Parameter(torch.zeros(1))
+        self.gate_ffn = nn.Parameter(torch.zeros(1))
+
+    def forward(self, context: torch.Tensor) -> torch.Tensor:
+        """Refine context tokens via gated self-attention + FFN.
+
+        Args:
+            context: (B, T_ctx, D) context tokens.
+        Returns:
+            (B, T_ctx, D) refined context.
+        """
+        B, T, D = context.shape
+
+        # Self-attention with RoPE
+        x_norm = self.norm1(context)
+        qkv = self.qkv_proj(x_norm).reshape(B, T, 3, self.nhead, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        if self.rotary_emb is not None:
+            cos, sin = self.rotary_emb(T)
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(B, T, D)
+        attn_out = self.out_proj(self.attn_drop(attn_out))
+        context = context + self.gate_attn * attn_out
+
+        # FFN
+        context = context + self.gate_ffn * self.ffn(self.norm2(context))
+
+        return context
+
+
+# =============================================================================
 # High-level Backbone Wrappers
 # =============================================================================
 
@@ -237,16 +320,34 @@ class DiTXBackbone(nn.Module):
             )
             for _ in range(dit_depth)
         ])
+        # Per-depth context refinement (FLUX.1 double-stream inspired).
+        # Each layer refines context before the *next* block sees it,
+        # so block[0] uses the original context and block[-1] uses
+        # the most refined version.  Zero-init gates ensure the initial
+        # behaviour is identical to the unrefined baseline.
+        self.ctx_refine = nn.ModuleList([
+            ContextRefineLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                rotary_emb=rotary_emb,
+            )
+            for _ in range(dit_depth)
+        ])
 
     def forward(self, h, t_emb, context_encoded):
         history = h.unsqueeze(0)  # (1, B, T, D)
-        for block in self.blocks:
+        ctx = context_encoded
+        for block, refine in zip(self.blocks, self.ctx_refine):
             if self.gradient_checkpointing and self.training:
                 h, block_value = checkpoint(
-                    block, history, t_emb, context_encoded, use_reentrant=False
+                    block, history, t_emb, ctx, use_reentrant=False
                 )
+                ctx = checkpoint(refine, ctx, use_reentrant=False)
             else:
-                h, block_value = block(history, t_emb, context_encoded)
+                h, block_value = block(history, t_emb, ctx)
+                ctx = refine(ctx)
             history = torch.cat([history, block_value.unsqueeze(0)], dim=0)
         return h
 

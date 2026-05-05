@@ -89,14 +89,12 @@ class BrainFlow(nn.Module):
 
         if self.use_tensor_fm:
             tfm = dict(tensor_fm_params)
-            self.gamma_reg_weight = tfm.pop("gamma_reg_weight", 0.01)
+            tfm.pop("gamma_reg_weight", None)
             self.time_warp_net = TimeWarpNet(
                 context_dim=hidden_dim,
                 output_dim=output_dim,
                 **tfm,
             )
-        else:
-            self.gamma_reg_weight = 0.0
 
         if self.use_csfm:
             self.hrf_source = AECNN_HRF_Source(
@@ -158,7 +156,7 @@ class BrainFlow(nn.Module):
                       context is zeroed out for CFG unconditional training).
 
         Returns:
-            dict with keys: total_loss, flow_loss, align_loss, cont_loss, gamma_reg.
+            dict with keys: total_loss, flow_loss, align_loss, cont_loss.
         """
         # 1. Encode context once (shared)
         context_encoded = self.velocity_net.encode_context_from_cond(context)
@@ -246,7 +244,6 @@ class BrainFlow(nn.Module):
             x_0 = torch.randn_like(x_1)
 
         # 5. Flow matching (gradient flows to encoder)
-        gamma_reg = _zero
 
         if self.use_tensor_fm:
             t = torch.rand(x_1.shape[0], device=x_1.device, dtype=x_1.dtype)
@@ -264,8 +261,6 @@ class BrainFlow(nn.Module):
                 subject_ids=subject_ids,
             )
             flow_loss = F.mse_loss(v_pred, target_velocity)
-
-            gamma_reg = gamma.pow(2).mean()
         else:
             t = flow_train_time_sample(
                 x_1.shape[0],
@@ -299,15 +294,12 @@ class BrainFlow(nn.Module):
             total_loss = total_loss + self.csfm_pcc_weight * csfm_pcc_loss
             total_loss = total_loss + self.csfm_align_weight * csfm_align_loss
 
-        total_loss = total_loss + self.gamma_reg_weight * gamma_reg
-
         return {
             "total_loss": total_loss,
             "flow_loss": flow_loss,
             "pcc_loss": csfm_pcc_loss if self.use_csfm else _zero,
             "var_reg_loss": csfm_var_reg_loss if self.use_csfm else _zero,
             "align_loss": csfm_align_loss if self.use_csfm else _zero,
-            "gamma_reg": gamma_reg,
         }
 
     def _build_time_grid(

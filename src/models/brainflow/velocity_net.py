@@ -150,6 +150,11 @@ class VelocityNet(nn.Module):
         # conditioning via AdaLN-Zero (shift/scale/gate become subject-aware).
         self.subject_emb = nn.Embedding(n_subjects, hidden_dim)
 
+        # Separate projection for timestep + subject conditioning.
+        # Avoids destructive interference from direct addition (t_emb + subj_emb).
+        # concat(t_emb, subj_emb) → Linear → hidden_dim preserves both signals.
+        self.cond_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+
         # Modular Backbone
         dec_max = max(n_target_trs, 64)
         head_dim_d = hidden_dim // n_heads
@@ -240,19 +245,24 @@ class VelocityNet(nn.Module):
 
         t_emb = self.time_mlp(self.time_embed(t))
 
+        # Separate timestep and subject conditioning (avoid additive interference)
         if subject_ids is not None:
-            t_emb = t_emb + self.subject_emb(subject_ids)
+            subj_emb = self.subject_emb(subject_ids)
+        else:
+            subj_emb = torch.zeros_like(t_emb)
+        cond_emb = self.cond_proj(torch.cat([t_emb, subj_emb], dim=-1))
 
         h = self.input_proj(x)
 
-        # Prepare tokens for backbone
-        h = h + context_encoded
+        # NOTE: Additive context injection disabled — context enters exclusively
+        # via cross-attention at every DiTX block (ablation experiment).
+        # h = h + context_encoded
         if self.target_pos_emb is not None:
             T_h = h.shape[1]
             h = h + self.target_pos_emb[:, :T_h, :]
 
         # Delegate to plug-and-play Backbone
-        h = self.backbone(h, t_emb, context_encoded)
+        h = self.backbone(h, cond_emb, context_encoded)
 
         h = self.final_norm(h)
         if self.use_subject_head:

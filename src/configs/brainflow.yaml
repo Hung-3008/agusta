@@ -124,4 +124,4 @@ training:
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
-output_dir: outputs/brainflow_dit_base_s6_only
+output_dir: outputs/brainflow

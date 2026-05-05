@@ -284,8 +284,6 @@ def finetune(args):
                         "pcc": f"{losses['pcc_loss'].item():.4f}",
                         "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                     }
-                    if model.use_tensor_fm:
-                        postfix["g_reg"] = f"{losses['gamma_reg'].item():.4f}"
                     pbar.set_postfix(postfix)
 
         # Handle leftover micro-batch
