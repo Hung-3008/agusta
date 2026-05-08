@@ -245,15 +245,18 @@ class BrainFlow(nn.Module):
             total_loss = total_loss + self.csfm_var_reg_weight * csfm_var_reg_loss
             total_loss = total_loss + self.csfm_pcc_weight * csfm_pcc_loss
             
-        total_loss = total_loss + self.gamma_reg_weight * gamma_reg
+        if self.use_tensor_fm:
+            total_loss = total_loss + self.gamma_reg_weight * gamma_reg
 
-        return {
+        result = {
             "total_loss": total_loss,
             "flow_loss": flow_loss,
             "pcc_loss": csfm_pcc_loss if self.use_csfm else _zero,
             "var_reg_loss": csfm_var_reg_loss if self.use_csfm else _zero,
-            "gamma_reg": gamma_reg,
         }
+        if self.use_tensor_fm:
+            result["gamma_reg"] = gamma_reg
+        return result
 
     def _build_time_grid(
         self,

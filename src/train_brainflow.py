@@ -282,7 +282,8 @@ def train(args):
                 context = context.to(dtype=torch.bfloat16)
                 target = target.to(dtype=torch.bfloat16)
 
-            cfg_drop = random.random() < 0.1
+            cfg_drop_rate = tr_cfg.get("cfg_dropout", 0.0)
+            cfg_drop = cfg_drop_rate > 0 and random.random() < cfg_drop_rate
             if cfg_drop:
                 context = torch.zeros_like(context)
 
@@ -313,9 +314,11 @@ def train(args):
                     postfix = {
                         "loss": f"{np.mean(train_losses['total_loss'][-50:]):.4f}",
                         "flow": f"{losses['flow_loss'].item():.4f}",
-                        "pcc": f"{losses['pcc_loss'].item():.4f}",
                         "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                     }
+                    if model.use_csfm:
+                        postfix["pcc"] = f"{losses['pcc_loss'].item():.4f}"
+                        postfix["var"] = f"{losses['var_reg_loss'].item():.4f}"
                     if model.use_tensor_fm:
                         postfix["g_reg"] = f"{losses['gamma_reg'].item():.4f}"
                     pbar.set_postfix(postfix)

@@ -67,7 +67,7 @@ model_version: v6
 brainflow:
   output_dim: 1000
 
-  indi_flow_matching: true
+  indi_flow_matching: false
   indi_train_time_sqrt: false
   indi_min_denom: 1.0e-3
   use_csfm: true
@@ -92,8 +92,6 @@ brainflow:
     use_dit_decoder: true
     decoder_type: ditx
     zero_init_network_heads: true
-    proj_dim: 256
-    n_blocks: 4
     modality_dropout: 0.0
     max_seq_len: 101
     fusion_mode: concat
@@ -121,5 +119,6 @@ training:
   ema_on_cpu: true
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
+  cfg_dropout: 0.0
 
-output_dir: outputs/brainflow_dit_test_test
+output_dir: outputs/brainflow_dit
