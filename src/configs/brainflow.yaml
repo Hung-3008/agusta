@@ -101,7 +101,7 @@ solver_args:
   method: midpoint
   time_points: 30
   cfg_scale: 0.0
-  temperature: 0.05
+  temperature: 1.0
   time_grid_warp: sqrt
 
 training:
@@ -121,4 +121,5 @@ training:
   empty_cuda_cache_each_epoch: false
   cfg_dropout: 0.0
 
-output_dir: outputs/brainflow_dit
+output_dir: outputs/brainflow_dit_csfm_new
+

@@ -161,7 +161,7 @@ class BrainFlow(nn.Module):
                 ctx_transposed = ctx_detached.transpose(1, 2)
                 ctx_pooled_reg = ctx_detached.mean(dim=1)
                 
-                mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled_reg)
+                mu_phi_latent, log_var = self.hrf_source(ctx_transposed, ctx_pooled_reg)
                 
                 if self.velocity_net.use_subject_head:
                     if subject_ids is None:
@@ -170,19 +170,18 @@ class BrainFlow(nn.Module):
                 else:
                     fmri_pred = mu_phi_latent
 
+                std = torch.exp(0.5 * log_var)
                 epsilon = torch.randn_like(target)
-                x_0_csfm = fmri_pred + sigma_phi * epsilon
+                x_0_csfm = fmri_pred + std * epsilon
                 
-                # CSFM Losses
-                csfm_var_reg_loss = torch.mean(sigma_phi**2 - torch.log(sigma_phi**2 + 1e-8) - 1.0)
+                # CSFM Losses: Variance-only KLD to prevent collapse
+                csfm_var_reg_loss = -0.5 * torch.mean(1 + log_var - log_var.exp())
                 
-                # PCC loss between the clean base distribution (mu_phi) and target
-                _pred_flat = fmri_pred.flatten(1)  # (B, T*V)
-                _tgt_flat = target.flatten(1)
-                _pred_c = _pred_flat - _pred_flat.mean(dim=1, keepdim=True)
-                _tgt_c = _tgt_flat - _tgt_flat.mean(dim=1, keepdim=True)
-                _cov = (_pred_c * _tgt_c).sum(dim=1)
-                _std = torch.sqrt((_pred_c ** 2).sum(dim=1) * (_tgt_c ** 2).sum(dim=1) + 1e-8)
+                # PCC loss calculated per-TR to avoid 50K-dim concentration of measure
+                _pred_c = fmri_pred - fmri_pred.mean(dim=-1, keepdim=True)
+                _tgt_c = target - target.mean(dim=-1, keepdim=True)
+                _cov = (_pred_c * _tgt_c).sum(dim=-1)
+                _std = torch.sqrt((_pred_c ** 2).sum(dim=-1) * (_tgt_c ** 2).sum(dim=-1) + 1e-8)
                 csfm_pcc_loss = (1.0 - _cov / _std).mean()
 
         # 4. Flow matching source distribution (x_0)
@@ -334,7 +333,7 @@ class BrainFlow(nn.Module):
         if self.use_csfm:
             ctx_transposed = context_encoded.transpose(1, 2)
             ctx_pooled = context_encoded.mean(dim=1)
-            mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled)
+            mu_phi_latent, log_var = self.hrf_source(ctx_transposed, ctx_pooled)
             
             if self.velocity_net.use_subject_head:
                 if subject_ids is None:
@@ -344,8 +343,9 @@ class BrainFlow(nn.Module):
                 mu_phi_fmri = mu_phi_latent
             x = mu_phi_fmri.to(device=device, dtype=dtype)
             if temperature > 0:
+                std = torch.exp(0.5 * log_var)
                 epsilon = torch.randn_like(x)
-                x = x + temperature * sigma_phi * epsilon
+                x = x + temperature * std * epsilon
         elif temperature > 0:
             shape = (B, n_target, self.output_dim) if n_target > 1 else (B, self.output_dim)
             x = temperature * torch.randn(*shape, device=device, dtype=dtype)

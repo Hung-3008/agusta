@@ -26,13 +26,15 @@ class AECNN_HRF_Source(nn.Module):
             groups=latent_dim
         )
         
-        # Sigma Predictor (Variance)
-        self.sigma_net = nn.Sequential(
+        # Log-Var Predictor (Variance)
+        self.log_var_net = nn.Sequential(
             nn.Linear(context_dim, 256),
             nn.ReLU(),
-            nn.Linear(256, 1),
-            nn.Softplus()  # Ensure strictly positive variance
+            nn.Linear(256, 1)
         )
+        # Initialize log_var_net weights to small values as in CSFM
+        nn.init.normal_(self.log_var_net[-1].weight, std=1e-4)
+        nn.init.constant_(self.log_var_net[-1].bias, 0.0)
 
     def forward(self, context_sequence: torch.Tensor, context_pooled: torch.Tensor):
         # context_sequence: [B, C, T]
@@ -42,6 +44,7 @@ class AECNN_HRF_Source(nn.Module):
         mu_phi = self.hrf_filter(neural_events)                # [B, latent_dim, T]
         mu_phi = mu_phi.transpose(1, 2)                        # [B, T, latent_dim]
         
-        sigma_phi = self.sigma_net(context_pooled).unsqueeze(1) # [B, 1, 1]
+        log_var = self.log_var_net(context_pooled).unsqueeze(1) # [B, 1, 1]
         
-        return mu_phi, sigma_phi
+        return mu_phi, log_var
+
