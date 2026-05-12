@@ -1,28 +1,43 @@
+"""VelocityNet — Standard DiT backbone for 1D flow matching.
+
+Architecture follows facebookresearch/DiT with these BrainFlow adaptations:
+- Input: 1D fMRI voxels (no patch embedding) → Linear + GELU projection
+- Context: multimodal temporal tokens via cross-attention at every DiT block
+- Output: per-subject network heads (Schaefer 7-network) or single linear
+- Positional encoding: RoPE on context encoder, learned pos_embed on target tokens
+"""
+
 import logging
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
-from .components import SinusoidalPosEmb, RotaryEmbedding, RoPETransformerEncoderLayer
+from .components import TimestepEmbedder, RotaryEmbedding, RoPETransformerEncoderLayer
 from .subject_layers import SubjectLayers, NetworkSubjectLayers
 from .fusion import MultiTokenFusion
-from .backbones import DiTXBackbone, DiT1DBackbone
+from .backbones import DiTBackbone, FinalLayer
 
 logger = logging.getLogger(__name__)
 
 
 class VelocityNet(nn.Module):
-    """Velocity network with multitoken context encoder, optional temporal slice, and plug-and-play backbone."""
+    """Velocity network: multitoken context encoder + standard DiT decoder.
+
+    Weight initialization follows the reference DiT exactly:
+    - All nn.Linear: xavier_uniform_ with zero bias
+    - TimestepEmbedder MLP: normal_(std=0.02)
+    - adaLN modulation layers: zero-init (weight and bias)
+    - FinalLayer: zero-init (adaLN modulation, linear weight, linear bias)
+    """
 
     def __init__(
         self,
         output_dim: int = 1000,
-        hidden_dim: int = 1024,
+        hidden_dim: int = 768,
         modality_dims: list[int] = None,
         proj_dim: int = 256,
         n_blocks: int = 4,
-        n_heads: int = 8,
-        dropout: float = 0.1,
+        n_heads: int = 12,
+        dropout: float = 0.0,
         modality_dropout: float = 0.3,
         max_seq_len: int = 31,
         context_trs: int | None = None,
@@ -61,14 +76,11 @@ class VelocityNet(nn.Module):
                 f"Got {context_encoder!r}. Flat encoder was removed in this version."
             )
 
-        self._decoder_type = decoder_type
         dit_depth = dit_num_blocks if dit_num_blocks is not None else n_blocks
 
-        # Learned positional embeddings on target tokens
-        if decoder_type == "ditx":
-            self.target_pos_emb = nn.Parameter(torch.randn(1, n_target_trs, hidden_dim) * 0.02)
-        else:
-            self.target_pos_emb = None
+        # =====================================================================
+        # Context Encoder (unchanged from previous version)
+        # =====================================================================
 
         # Context Fusion
         self.fusion_block = MultiTokenFusion(
@@ -115,20 +127,49 @@ class VelocityNet(nn.Module):
             )
         self.temporal_norm = nn.LayerNorm(hidden_dim)
 
+        # =====================================================================
+        # DiT Decoder (standard architecture)
+        # =====================================================================
+
+        # Input projection: fMRI voxels → hidden_dim
         self.input_proj = nn.Sequential(
             nn.Linear(output_dim, hidden_dim),
             nn.GELU(),
         )
 
-        # Time Embeddings
-        self.time_embed = SinusoidalPosEmb(hidden_dim)
-        self.time_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
+        # Learned positional embeddings on target tokens
+        self.target_pos_emb = nn.Parameter(torch.randn(1, n_target_trs, hidden_dim) * 0.02)
 
-        # Subject Heads
+        # Timestep embedding (standard DiT: sinusoidal(256) → SiLU MLP → hidden_dim)
+        self.t_embedder = TimestepEmbedder(hidden_dim)
+
+        # Subject embedding (summed with timestep, like class label in DiT)
+        if not use_subject_head:
+            self.subject_emb = nn.Embedding(n_subjects, hidden_dim)
+        else:
+            self.subject_emb = None
+
+        # DiT backbone (stack of DiTCrossBlock)
+        dec_max = max(n_target_trs, 64)
+        head_dim_d = hidden_dim // n_heads
+        self.rotary_emb_decoder = RotaryEmbedding(head_dim_d, max_seq_len=dec_max)
+        self.backbone = DiTBackbone(
+            hidden_size=hidden_dim,
+            num_heads=n_heads,
+            depth=dit_depth,
+            mlp_ratio=4.0,
+            rotary_emb=self.rotary_emb_decoder,
+        )
+        self.backbone.gradient_checkpointing = self.gradient_checkpointing
+        logger.info("Backbone: DiTBackbone (%d blocks, hidden=%d, heads=%d)", dit_depth, hidden_dim, n_heads)
+
+        # FinalLayer (standard DiT: adaLN + zero-init linear)
+        if use_subject_head:
+            self.final_layer = FinalLayer(hidden_dim, self.latent_dim)
+        else:
+            self.final_layer = FinalLayer(hidden_dim, output_dim)
+
+        # Subject Heads (per-subject output projection)
         if use_subject_head:
             if self.network_head:
                 self.subject_layers = NetworkSubjectLayers(
@@ -138,41 +179,41 @@ class VelocityNet(nn.Module):
                 )
             else:
                 self.subject_layers = SubjectLayers(self.latent_dim, output_dim, n_subjects)
-            self.subject_emb = None
         else:
             self.subject_layers = None
-            self.subject_emb = nn.Embedding(n_subjects, hidden_dim)
 
-        # Modular Backbone
-        dec_max = max(n_target_trs, 64)
-        head_dim_d = hidden_dim // n_heads
-        self.rotary_emb_decoder = RotaryEmbedding(head_dim_d, max_seq_len=dec_max)
-        if decoder_type == "ditx":
-            self.backbone = DiTXBackbone(
-                d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
-                dropout=dropout, time_dim=hidden_dim, rotary_emb=self.rotary_emb_decoder,
-                dit_depth=dit_depth
-            )
-            logger.info("Backbone: DiTXBackbone (%d blocks)", dit_depth)
-        else:
-            self.backbone = DiT1DBackbone(
-                d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
-                dropout=dropout, time_dim=hidden_dim, rotary_emb=self.rotary_emb_decoder,
-                dit_depth=dit_depth
-            )
-            logger.info("Backbone: DiT1DBackbone (%d blocks)", dit_depth)
-        self.backbone.gradient_checkpointing = self.gradient_checkpointing
+        # Initialize weights following DiT reference
+        self.initialize_weights()
 
-        # Output Layer
-        self.final_norm = nn.LayerNorm(hidden_dim)
-        if use_subject_head:
-            self.latent_head = nn.Linear(hidden_dim, self.latent_dim)
-            self.output_layer = None
-        else:
-            self.latent_head = None
-            self.output_layer = nn.Linear(hidden_dim, output_dim)
-            nn.init.constant_(self.output_layer.weight, 0)
-            nn.init.constant_(self.output_layer.bias, 0)
+    def initialize_weights(self):
+        """Weight initialization following facebookresearch/DiT exactly."""
+
+        # 1. Global: xavier_uniform_ on all Linear layers
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # 2. TimestepEmbedder MLP: normal_(std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        # 3. Subject embedding (like label embedding in DiT): normal_(std=0.02)
+        if self.subject_emb is not None:
+            nn.init.normal_(self.subject_emb.weight, std=0.02)
+
+        # 4. Zero-init adaLN modulation layers in all DiT blocks
+        for block in self.backbone.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        # 5. Zero-init FinalLayer (adaLN modulation + output linear)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def encode_context_from_cond(self, cond: torch.Tensor) -> torch.Tensor:
         """Encode context: multitoken fusion → temporal encoder → optional slice to ``n_target_trs``."""
@@ -191,6 +232,7 @@ class VelocityNet(nn.Module):
             if self.use_rope:
                 for layer in self.temporal_attn:
                     if self.gradient_checkpointing and self.training:
+                        from torch.utils.checkpoint import checkpoint
                         context = checkpoint(layer, context, use_reentrant=False)
                     else:
                         context = layer(context)
@@ -201,6 +243,7 @@ class VelocityNet(nn.Module):
                     return self.temporal_norm(self.temporal_attn(x))
     
                 if self.gradient_checkpointing and self.training:
+                    from torch.utils.checkpoint import checkpoint
                     context = checkpoint(_temporal_fwd, context, use_reentrant=False)
                 else:
                     context = _temporal_fwd(context)
@@ -221,6 +264,7 @@ class VelocityNet(nn.Module):
         if t.dim() == 0:
             t = t.expand(x.shape[0])
 
+        # --- Context ---
         if pre_encoded_context is not None:
             context_encoded = pre_encoded_context
         elif cond is not None:
@@ -232,26 +276,28 @@ class VelocityNet(nn.Module):
                 x.shape[0], tlen, self.hidden_dim, device=x.device, dtype=x.dtype
             )
 
-        t_emb = self.time_mlp(self.time_embed(t))
+        # --- Conditioning vector c = t_emb + subject_emb (like DiT: c = t + y) ---
+        c = self.t_embedder(t)  # (B, D)
+        if self.subject_emb is not None and subject_ids is not None:
+            c = c + self.subject_emb(subject_ids)
 
-        if not self.use_subject_head and self.subject_emb is not None and subject_ids is not None:
-            t_emb = t_emb + self.subject_emb(subject_ids)
+        # --- Input tokens ---
+        h = self.input_proj(x)  # (B, T, D)
 
-        h = self.input_proj(x)
-
-        # Prepare tokens for backbone
+        # Add context (additive, like positional encoding) + positional embeddings
         h = h + context_encoded
-        if self.target_pos_emb is not None:
-            T_h = h.shape[1]
-            h = h + self.target_pos_emb[:, :T_h, :]
+        T_h = h.shape[1]
+        h = h + self.target_pos_emb[:, :T_h, :]
 
-        # Delegate to plug-and-play Backbone
-        h = self.backbone(h, t_emb, context_encoded)
+        # --- DiT backbone ---
+        h = self.backbone(h, c, context_encoded)  # (B, T, D)
 
-        h = self.final_norm(h)
+        # --- FinalLayer (adaLN + zero-init linear) ---
+        h = self.final_layer(h, c)  # (B, T, latent_dim or output_dim)
+
+        # --- Subject heads ---
         if self.use_subject_head:
-            z = self.latent_head(h)
             if subject_ids is None:
                 subject_ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
-            return self.subject_layers(z, subject_ids)
-        return self.output_layer(h)
+            return self.subject_layers(h, subject_ids)
+        return h

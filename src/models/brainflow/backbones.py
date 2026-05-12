@@ -1,276 +1,252 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+# Adapted from facebookresearch/DiT for 1D sequence flow matching.
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from .components import RotaryEmbedding, apply_rotary_emb, modulate, RMSNormLastDim, CrossAttention
+from .components import RotaryEmbedding, apply_rotary_emb, CrossAttention
 
-class DiT1DBlock(nn.Module):
-    """1D DiT block: AdaLN-Zero + RoPE self-attention + FFN (temporal consistency on T_target)."""
 
-    def __init__(
-        self,
-        d_model: int,
-        nhead: int,
-        dim_feedforward: int,
-        dropout: float,
-        time_dim: int,
-        rotary_emb: RotaryEmbedding,
-    ):
+def modulate(x, shift, scale):
+    """AdaLN modulation: x * (1 + scale) + shift.
+
+    Copied from facebookresearch/DiT.
+    """
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+#################################################################################
+#                             Core DiT Blocks                                   #
+#################################################################################
+
+
+class DiTBlock(nn.Module):
+    """Standard DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+
+    Faithfully adapted from facebookresearch/DiT. Uses inline attention
+    (no timm dependency) with qkv_bias=True and GELU(approximate='tanh').
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0):
         super().__init__()
-        self.d_model = d_model
-        self.nhead = nhead
-        self.head_dim = d_model // nhead
-        self.rotary_emb = rotary_emb
-        self.attn_dropout_p = dropout
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
 
-        self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False)
+        # Self-attention (inline, equivalent to timm.Attention with qkv_bias=True)
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+        self.attn_out_proj = nn.Linear(hidden_size, hidden_size, bias=True)
 
+        # FFN (inline, equivalent to timm.Mlp with approx GELU)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+        )
+
+        # adaLN-Zero: 6 modulation parameters (shift, scale, gate) × 2 sub-layers
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_dim, 6 * d_model, bias=True),
-        )
-        nn.init.zeros_(self.adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.adaLN_modulation[-1].bias)
-
-        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.attn_drop = nn.Dropout(dropout)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
-            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True),
         )
 
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, D) input tokens.
+            c: (B, D) conditioning vector (timestep + optional label).
+        Returns:
+            (B, T, D) output tokens.
+        """
         B, T, D = x.shape
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(t_emb).chunk(
-            6, dim=-1
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=1)
         )
 
+        # Self-Attention
         x_norm = modulate(self.norm1(x), shift_msa, scale_msa)
-        qkv = self.qkv_proj(x_norm).reshape(B, T, 3, self.nhead, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        qkv = self.qkv(x_norm).reshape(B, T, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, T, D_h)
+        q, k, v = qkv.unbind(0)
 
-        cos, sin = self.rotary_emb(T)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
-
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            dropout_p=self.attn_dropout_p if self.training else 0.0,
-        )
+        attn_out = F.scaled_dot_product_attention(q, k, v)
         attn_out = attn_out.transpose(1, 2).reshape(B, T, D)
-        attn_out = self.out_proj(self.attn_drop(attn_out))
+        attn_out = self.attn_out_proj(attn_out)
         x = x + gate_msa.unsqueeze(1) * attn_out
 
-        x_norm2 = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp.unsqueeze(1) * self.ffn(x_norm2)
+        # FFN
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
 
-class DiTXBlock(nn.Module):
-    """DiT-X block: AdaLN-Zero on Self-Attention + Cross-Attention + FFN.
+class DiTCrossBlock(nn.Module):
+    """DiT block with cross-attention for temporal context conditioning.
 
-    Adapted from ManiFlow. Key difference from DiT1DBlock:
-    - 9 modulation parameters (3×3) instead of 6 (3×2)
-    - Cross-attention at every block with AdaLN-Zero gating
-    - Context is queried every layer (not added once at start)
-    - RoPE on both Self-Attention and Cross-Attention Q/K
+    Extends the standard DiTBlock with a cross-attention sub-layer between
+    self-attention and FFN. adaLN-Zero uses 8 parameters:
+    - 6 from standard DiT (shift/scale/gate × SA + shift/scale/gate × FFN)
+    - 2 for cross-attention (shift/scale, no gate — cross-attention is always active)
+
+    The cross-attention uses RoPE on Q/K for temporal alignment between
+    target tokens and context tokens.
     """
 
     def __init__(
         self,
-        d_model: int,
-        nhead: int,
-        dim_feedforward: int,
-        dropout: float,
-        time_dim: int,
-        rotary_emb: RotaryEmbedding,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        rotary_emb: RotaryEmbedding = None,
     ):
         super().__init__()
-        self.d_model = d_model
-        self.nhead = nhead
-        self.head_dim = d_model // nhead
-        self.rotary_emb = rotary_emb
-        self.attn_dropout_p = dropout
-
-        # Full Attention Residuals over decoder depth.
-        # Zero-init ensures near-uniform depth attention at initialization.
-        self.attn_res_proj = nn.Linear(d_model, 1, bias=False)
-        nn.init.zeros_(self.attn_res_proj.weight)
-        self.attn_res_norm = RMSNormLastDim(d_model)
-
-        # Layer norms (no affine — modulated by AdaLN)
-        self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False)  # self-attn
-        self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False)  # cross-attn
-        self.norm3 = nn.LayerNorm(d_model, elementwise_affine=False)  # FFN
-
-        # AdaLN-Zero: 9 modulation params (shift, scale, gate) × 3 sub-layers
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(time_dim, 9 * d_model, bias=True),
-        )
-        nn.init.zeros_(self.adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
 
         # Self-attention
-        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.attn_drop = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+        self.attn_out_proj = nn.Linear(hidden_size, hidden_size, bias=True)
 
         # Cross-attention (Q from target, K/V from context)
+        self.norm_cross = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.cross_attn = CrossAttention(
-            d_model=d_model,
-            nhead=nhead,
-            dropout=dropout,
-            rotary_emb=rotary_emb,  # RoPE on Q/K for temporal alignment
+            d_model=hidden_size,
+            nhead=num_heads,
+            dropout=0.0,
+            rotary_emb=rotary_emb,
         )
 
         # FFN
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
-            nn.Dropout(dropout),
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+        )
+
+        # adaLN-Zero: 8 params = (shift, scale, gate) × SA + (shift, scale) × XA + (shift, scale, gate) × FFN
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 8 * hidden_size, bias=True),
         )
 
     def forward(
         self,
-        x_history: torch.Tensor,
-        t_emb: torch.Tensor,
+        x: torch.Tensor,
+        c: torch.Tensor,
         context: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """DiT-X forward with Full Attention Residuals over depth.
-
-        Args:
-            x_history: (L, B, T, D) history of values over decoder depth.
-                       Contains initial token state and prior block values.
-            t_emb:   (B, D) time embedding.
-            context: (B, T_ctx, D) encoded context tokens.
-
-        Returns:
-            h_out:      (B, T, D) updated hidden state after this block.
-            block_value:(B, T, D) gated block contribution to append to history.
+    ) -> torch.Tensor:
         """
-        if x_history.dim() == 3:
-            x_history = x_history.unsqueeze(0)
-
-        if x_history.dim() != 4:
-            raise ValueError(f"x_history must be (L,B,T,D), got shape {tuple(x_history.shape)}")
-
-        # 1) Full Attention Residuals across depth.
-        # Keys are RMS-normalized to prevent magnitude bias to late layers.
-        k_res = self.attn_res_norm(x_history)                            # (L,B,T,D)
-        logits = self.attn_res_proj(k_res).squeeze(-1)                   # (L,B,T)
-        alpha = torch.softmax(logits, dim=0)                             # depth-softmax
-        x = torch.einsum("lbt,lbtd->btd", alpha, x_history)             # (B,T,D)
-
+        Args:
+            x:       (B, T, D) target tokens.
+            c:       (B, D) conditioning vector (timestep).
+            context: (B, T_ctx, D) encoded context tokens.
+        Returns:
+            (B, T, D) output tokens.
+        """
         B, T, D = x.shape
 
-        # Generate 9 modulation parameters from time embedding
-        modulation = self.adaLN_modulation(t_emb)  # (B, 9*D)
-        chunks = modulation.chunk(9, dim=-1)
-        shift_msa, scale_msa, gate_msa = chunks[0], chunks[1], chunks[2]
-        shift_cross, scale_cross, gate_cross = chunks[3], chunks[4], chunks[5]
-        shift_mlp, scale_mlp, gate_mlp = chunks[6], chunks[7], chunks[8]
+        # Generate 8 modulation parameters
+        mods = self.adaLN_modulation(c).chunk(8, dim=1)
+        shift_msa, scale_msa, gate_msa = mods[0], mods[1], mods[2]
+        shift_cross, scale_cross = mods[3], mods[4]
+        shift_mlp, scale_mlp, gate_mlp = mods[5], mods[6], mods[7]
 
-        # 1. Self-Attention with AdaLN-Zero
+        # 1. Self-Attention with adaLN-Zero
         x_norm = modulate(self.norm1(x), shift_msa, scale_msa)
-        qkv = self.qkv_proj(x_norm).reshape(B, T, 3, self.nhead, self.head_dim)
+        qkv = self.qkv(x_norm).reshape(B, T, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = qkv.unbind(0)
 
-        cos, sin = self.rotary_emb(T)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
-
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=self.attn_dropout_p if self.training else 0.0,
-        )
+        attn_out = F.scaled_dot_product_attention(q, k, v)
         attn_out = attn_out.transpose(1, 2).reshape(B, T, D)
-        attn_out = self.out_proj(self.attn_drop(attn_out))
-        msa_value = gate_msa.unsqueeze(1) * attn_out
-        x = x + msa_value
+        attn_out = self.attn_out_proj(attn_out)
+        x = x + gate_msa.unsqueeze(1) * attn_out
 
-        # 2. Cross-Attention with AdaLN-Zero
-        x_norm_cross = modulate(self.norm2(x), shift_cross, scale_cross)
+        # 2. Cross-Attention with adaLN (no gate — always active)
+        x_norm_cross = modulate(self.norm_cross(x), shift_cross, scale_cross)
         cross_out = self.cross_attn(x_norm_cross, context)
-        cross_value = gate_cross.unsqueeze(1) * cross_out
-        x = x + cross_value
+        x = x + cross_out
 
-        # 3. FFN with AdaLN-Zero
-        x_norm_mlp = modulate(self.norm3(x), shift_mlp, scale_mlp)
-        mlp_value = gate_mlp.unsqueeze(1) * self.ffn(x_norm_mlp)
-        x = x + mlp_value
-
-        block_value = msa_value + cross_value + mlp_value
-
-        return x, block_value
+        # 3. FFN with adaLN-Zero
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
 
 
-# =============================================================================
-# High-level Backbone Wrappers
-# =============================================================================
+class FinalLayer(nn.Module):
+    """The final layer of DiT.
 
-class DiTXBackbone(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout, time_dim, rotary_emb, dit_depth):
+    Copied from facebookresearch/DiT. Adapted for 1D output (no unpatchify).
+    Uses adaLN (shift + scale, no gate) followed by a zero-initialized linear.
+    """
+
+    def __init__(self, hidden_size: int, out_dim: int):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, out_dim, bias=True)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+
+#################################################################################
+#                          High-level Backbone Wrapper                          #
+#################################################################################
+
+
+class DiTBackbone(nn.Module):
+    """Stack of DiTCrossBlock layers with gradient checkpointing support.
+
+    This is the decoder backbone for VelocityNet. Each block receives:
+    - x: target tokens (noisy fMRI)
+    - c: conditioning vector (timestep embedding)
+    - context: encoded multimodal context tokens
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        depth: int,
+        mlp_ratio: float = 4.0,
+        rotary_emb: RotaryEmbedding = None,
+    ):
         super().__init__()
         self.gradient_checkpointing = False
         self.blocks = nn.ModuleList([
-            DiTXBlock(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                time_dim=time_dim,
+            DiTCrossBlock(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
                 rotary_emb=rotary_emb,
             )
-            for _ in range(dit_depth)
+            for _ in range(depth)
         ])
 
-    def forward(self, h, t_emb, context_encoded):
-        history = h.unsqueeze(0)  # (1, B, T, D)
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
-                h, block_value = checkpoint(
-                    block, history, t_emb, context_encoded, use_reentrant=False
-                )
+                x = checkpoint(block, x, c, context, use_reentrant=False)
             else:
-                h, block_value = block(history, t_emb, context_encoded)
-            history = torch.cat([history, block_value.unsqueeze(0)], dim=0)
-        return h
-
-
-class DiT1DBackbone(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout, time_dim, rotary_emb, dit_depth):
-        super().__init__()
-        self.gradient_checkpointing = False
-        self.blocks = nn.ModuleList([
-            DiT1DBlock(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                time_dim=time_dim,
-                rotary_emb=rotary_emb,
-            )
-            for _ in range(dit_depth)
-        ])
-
-    def forward(self, h, t_emb, context_encoded):
-        for block in self.blocks:
-            if self.gradient_checkpointing and self.training:
-                h = checkpoint(block, h, t_emb, use_reentrant=False)
-            else:
-                h = block(h, t_emb)
-        return h
+                x = block(x, c, context)
+        return x

@@ -157,9 +157,10 @@ class BrainFlow(nn.Module):
             cont_loss = _zero
         else:
             if self.use_csfm:
-                ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
-                ctx_transposed = ctx_detached.transpose(1, 2)
-                ctx_pooled_reg = ctx_detached.mean(dim=1)
+                # End-to-end gradient flow (matches CSFM: detach_ut=false).
+                # KLD + PCC + flow losses all update the context encoder.
+                ctx_transposed = context_encoded.transpose(1, 2)
+                ctx_pooled_reg = context_encoded.mean(dim=1)
                 
                 mu_phi_latent, log_var = self.hrf_source(ctx_transposed, ctx_pooled_reg)
                 
