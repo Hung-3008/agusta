@@ -14,7 +14,7 @@ import torch.nn as nn
 from .components import TimestepEmbedder, RotaryEmbedding, RoPETransformerEncoderLayer
 from .subject_layers import SubjectLayers, NetworkSubjectLayers
 from .fusion import MultiTokenFusion
-from .backbones import DiTBackbone, FinalLayer
+from .backbones import DiTBackbone, TimeDiTBackbone, FinalLayer
 
 logger = logging.getLogger(__name__)
 
@@ -149,19 +149,32 @@ class VelocityNet(nn.Module):
         else:
             self.subject_emb = None
 
-        # DiT backbone (stack of DiTCrossBlock)
+        # Decoder backbone selection
+        self.decoder_type = decoder_type
         dec_max = max(n_target_trs, 64)
         head_dim_d = hidden_dim // n_heads
-        self.rotary_emb_decoder = RotaryEmbedding(head_dim_d, max_seq_len=dec_max)
-        self.backbone = DiTBackbone(
-            hidden_size=hidden_dim,
-            num_heads=n_heads,
-            depth=dit_depth,
-            mlp_ratio=4.0,
-            rotary_emb=self.rotary_emb_decoder,
-        )
+
+        if decoder_type == "timedit":
+            self.rotary_emb_decoder = None  # TimeDiT doesn't use RoPE in decoder
+            self.backbone = TimeDiTBackbone(
+                hidden_size=hidden_dim,
+                num_heads=n_heads,
+                depth=dit_depth,
+                mlp_ratio=4.0,
+            )
+            logger.info("Backbone: TimeDiTBackbone (%d blocks, hidden=%d, heads=%d)", dit_depth, hidden_dim, n_heads)
+        else:
+            # Default: DiTCrossBlock (ditx)
+            self.rotary_emb_decoder = RotaryEmbedding(head_dim_d, max_seq_len=dec_max)
+            self.backbone = DiTBackbone(
+                hidden_size=hidden_dim,
+                num_heads=n_heads,
+                depth=dit_depth,
+                mlp_ratio=4.0,
+                rotary_emb=self.rotary_emb_decoder,
+            )
+            logger.info("Backbone: DiTBackbone (%d blocks, hidden=%d, heads=%d)", dit_depth, hidden_dim, n_heads)
         self.backbone.gradient_checkpointing = self.gradient_checkpointing
-        logger.info("Backbone: DiTBackbone (%d blocks, hidden=%d, heads=%d)", dit_depth, hidden_dim, n_heads)
 
         # FinalLayer (standard DiT: adaLN + zero-init linear)
         if use_subject_head:
@@ -204,16 +217,28 @@ class VelocityNet(nn.Module):
         if self.subject_emb is not None:
             nn.init.normal_(self.subject_emb.weight, std=0.02)
 
-        # 4. Zero-init adaLN modulation layers in all DiT blocks
+        # 4. adaLN modulation layers in all backbone blocks
+        # adaLN-Zero (DiT): zero-init because gate mechanism provides gradient path
+        # plain AdaLN (TimeDiT): small normal init because no gate → zero-init = dead gradients
         for block in self.backbone.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            if self.decoder_type == "timedit":
+                nn.init.normal_(block.adaLN_modulation[-1].weight, std=0.02)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            else:
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # 5. Zero-init FinalLayer (adaLN modulation + output linear)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        if self.decoder_type == "timedit":
+            nn.init.normal_(self.final_layer.adaLN_modulation[-1].weight, std=0.02)
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+            nn.init.normal_(self.final_layer.linear.weight, std=0.02)
+            nn.init.constant_(self.final_layer.linear.bias, 0)
+        else:
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(self.final_layer.linear.weight, 0)
+            nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def encode_context_from_cond(self, cond: torch.Tensor) -> torch.Tensor:
         """Encode context: multitoken fusion → temporal encoder → optional slice to ``n_target_trs``."""
