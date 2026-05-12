@@ -176,37 +176,38 @@ class VelocityNet(nn.Module):
 
     def encode_context_from_cond(self, cond: torch.Tensor) -> torch.Tensor:
         """Encode context: multitoken fusion → temporal encoder → optional slice to ``n_target_trs``."""
-        splits = []
-        offset = 0
-        for dim in self.modality_dims:
-            splits.append(cond[:, :, offset:offset + dim])
-            offset += dim
-        context = self.fusion_block(splits)
-
-        if self.context_pos_emb is not None:
-            Tc = context.shape[1]
-            context = context + self.context_pos_emb[:, :Tc, :]
-
-        if self.use_rope:
-            for layer in self.temporal_attn:
-                if self.gradient_checkpointing and self.training:
-                    context = checkpoint(layer, context, use_reentrant=False)
-                else:
-                    context = layer(context)
-            context = self.temporal_norm(context)
-        else:
-
-            def _temporal_fwd(x):
-                return self.temporal_norm(self.temporal_attn(x))
-
-            if self.gradient_checkpointing and self.training:
-                context = checkpoint(_temporal_fwd, context, use_reentrant=False)
+        with torch.set_grad_enabled(torch.is_grad_enabled() and not getattr(self, "freeze_context", False)):
+            splits = []
+            offset = 0
+            for dim in self.modality_dims:
+                splits.append(cond[:, :, offset:offset + dim])
+                offset += dim
+            context = self.fusion_block(splits)
+    
+            if self.context_pos_emb is not None:
+                Tc = context.shape[1]
+                context = context + self.context_pos_emb[:, :Tc, :]
+    
+            if self.use_rope:
+                for layer in self.temporal_attn:
+                    if self.gradient_checkpointing and self.training:
+                        context = checkpoint(layer, context, use_reentrant=False)
+                    else:
+                        context = layer(context)
+                context = self.temporal_norm(context)
             else:
-                context = _temporal_fwd(context)
-
-        slice_start = (self.context_trs - self.n_target_trs) // 2
-        context = context[:, slice_start : slice_start + self.n_target_trs, :]
-        return context
+    
+                def _temporal_fwd(x):
+                    return self.temporal_norm(self.temporal_attn(x))
+    
+                if self.gradient_checkpointing and self.training:
+                    context = checkpoint(_temporal_fwd, context, use_reentrant=False)
+                else:
+                    context = _temporal_fwd(context)
+    
+            slice_start = (self.context_trs - self.n_target_trs) // 2
+            context = context[:, slice_start : slice_start + self.n_target_trs, :]
+            return context
 
     def forward(
         self,

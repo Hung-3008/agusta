@@ -426,3 +426,22 @@ class BrainFlow(nn.Module):
                 x = x + (1.0 - t_last) * u_last
 
         return x
+
+    def freeze_source_and_context(self):
+        """Freeze the HRF Source and Fusion/Context Encoders for Two-Stage Training."""
+        if self.use_csfm:
+            for p in self.hrf_source.parameters():
+                p.requires_grad = False
+                
+        # Freeze Context Encoder inside Velocity Net
+        self.velocity_net.freeze_context = True
+        for p in self.velocity_net.fusion_block.parameters():
+            p.requires_grad = False
+        if hasattr(self.velocity_net, "temporal_attn"):
+            for p in self.velocity_net.temporal_attn.parameters():
+                p.requires_grad = False
+        if hasattr(self.velocity_net, "temporal_norm"):
+            for p in self.velocity_net.temporal_norm.parameters():
+                p.requires_grad = False
+        if self.velocity_net.context_pos_emb is not None:
+            self.velocity_net.context_pos_emb.requires_grad = False

@@ -265,6 +265,12 @@ def train(args):
 
     # --- Training loop ---
     for epoch in range(start_epoch, tr_cfg["n_epochs"] + 1):
+        freeze_epoch = tr_cfg.get("freeze_modules_after_epoch", -1)
+        if freeze_epoch > 0 and epoch == freeze_epoch + 1:
+            logger.info(f"Epoch {epoch} > {freeze_epoch}. Freezing context encoder and HRF source!")
+            model.freeze_source_and_context()
+            torch.cuda.empty_cache()
+
         model.train()
         train_losses = defaultdict(list)
         micro_accum = 0
