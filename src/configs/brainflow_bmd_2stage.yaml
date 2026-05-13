@@ -1,0 +1,115 @@
+# =====================================================================
+# BrainFlow Two-Stage Training Config — BMD Dataset
+# Stage 1 (1-50):  Train HRF source + encoder (flow decoder frozen)
+# Stage 2 (51+):   Train flow decoder + encoder (HRF source frozen)
+# =====================================================================
+
+data_root: Data
+dataset: bmd
+
+bmd:
+  target_mode: roi_subset_grouped  # voxels ordered by 9 functional categories
+  rep_mode: per_rep  # "avg" = trial-averaged (1000 train), "per_rep" = each rep (3000 train)
+
+fmri:
+  n_voxels: 8335
+
+# BMD modalities (9 total, no whisper — silent videos)
+modality_dims:
+  - 1408    # vjepa2_avg_feat
+  - 2048    # Llama-3.2-1B
+  - 3072    # Llama-3.2-3B
+  - 2048    # qwen2-5_3B
+  - 3584    # qwen-2-5-omni-7b
+  - 3584    # internvl3_8b_8bit
+  - 5120    # InternVL3_14B
+  - 6144    # dinov2_giant
+  - 3584    # vlm2vec_7b
+
+subjects:
+  - sub-01
+  - sub-02
+  - sub-03
+  - sub-04
+  - sub-05
+  - sub-06
+  - sub-07
+  - sub-08
+  - sub-09
+  - sub-10
+
+sliding_window:
+  context_trs: 1
+  n_target_trs: 1
+  stride: 1
+  temporal_jitter: 0
+
+dataloader:
+  batch_size: 128
+  val_batch_size: 256
+  num_workers: 0
+  pin_memory: true
+
+model_version: bmd_2stage_v1
+
+brainflow:
+  output_dim: 8335
+
+  use_csfm: true
+  flow_loss_weight: 1.0
+  csfm_var_reg_weight: 0.1
+  csfm_pcc_weight: 1.0
+
+  velocity_net:
+    hidden_dim: 768
+    dit_num_blocks: 8
+    n_heads: 12
+    dropout: 0.0
+    context_trs: 1
+    n_target_trs: 1
+    temporal_attn_layers: 1
+    gradient_checkpointing: true
+    use_subject_head: true
+    # BMD 9-category network heads (replaces Algonauts Yeo 7-network)
+    # Categories: EarlyVisual, ScenePlace, Body, Face, Object, Motion, TemporalSTS, Parietal, Somatosensory
+    network_head: true
+    network_head_type: bmd
+    network_counts: [2398, 1002, 324, 489, 1613, 95, 761, 686, 967]  # sum = 8335
+    zero_init_network_heads: true
+    use_rope: false
+    latent_dim: 768
+    context_encoder: multitoken
+    use_dit_decoder: true
+    decoder_type: ditx
+    modality_dropout: 0.1
+    max_seq_len: 1
+    fusion_mode: concat
+    fusion_proj_dim: 384
+
+solver_args:
+  method: midpoint
+  time_points: 50
+  cfg_scale: 0.0
+  temperature: 0.0    # Dùng mu_phi trực tiếp (no noise) từ CSFM
+  time_grid_warp: sqrt
+
+training:
+  n_epochs: 300
+  warmup_hrf_epochs: 50      # Stage 1: 50 epochs HRF warmup
+  freeze_modules_after_epoch: -1  # Tắt (dùng two-stage thay thế)
+  lr: 1.0e-4
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  use_amp: true
+  log_every_n_steps: 10
+  val_every_n_epochs: 5
+  ema_decay: 0.999
+  gradient_accumulation_steps: 4
+  ema_on_cpu: true
+  context_bf16_when_amp: true
+  empty_cuda_cache_each_epoch: false
+  cfg_dropout: 0.0
+
+output_dir: outputs/brainflow_bmd_2stage

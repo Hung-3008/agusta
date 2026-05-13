@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 
 from .components import TimestepEmbedder, RotaryEmbedding, RoPETransformerEncoderLayer
-from .subject_layers import SubjectLayers, NetworkSubjectLayers
+from .subject_layers import SubjectLayers, NetworkSubjectLayers, BMDNetworkSubjectLayers
 from .fusion import MultiTokenFusion
 from .backbones import DiTBackbone, TimeDiTBackbone, FinalLayer
 
@@ -56,6 +56,8 @@ class VelocityNet(nn.Module):
         dit_num_blocks: int | None = None,
         decoder_type: str = "ditx",
         zero_init_network_heads: bool = False,
+        network_head_type: str = "schaefer",
+        network_counts: list[int] | None = None,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -66,6 +68,8 @@ class VelocityNet(nn.Module):
         self.gradient_checkpointing = gradient_checkpointing
         self.use_rope = use_rope
         self.network_head = network_head and use_subject_head
+        self.network_head_type = network_head_type
+        self.network_counts = network_counts
         self.n_target_trs = n_target_trs
         self.context_encoder = context_encoder
         self.context_trs = int(context_trs) if context_trs is not None else int(max_seq_len)
@@ -185,11 +189,20 @@ class VelocityNet(nn.Module):
         # Subject Heads (per-subject output projection)
         if use_subject_head:
             if self.network_head:
-                self.subject_layers = NetworkSubjectLayers(
-                    self.latent_dim,
-                    n_subjects,
-                    zero_init=zero_init_network_heads,
-                )
+                if self.network_head_type == "bmd":
+                    self.subject_layers = BMDNetworkSubjectLayers(
+                        self.latent_dim,
+                        n_subjects,
+                        network_counts=network_counts,
+                        zero_init=zero_init_network_heads,
+                    )
+                else:
+                    self.subject_layers = NetworkSubjectLayers(
+                        self.latent_dim,
+                        n_subjects,
+                        network_counts=network_counts,
+                        zero_init=zero_init_network_heads,
+                    )
             else:
                 self.subject_layers = SubjectLayers(self.latent_dim, output_dim, n_subjects)
         else:

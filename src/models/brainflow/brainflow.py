@@ -425,6 +425,43 @@ class BrainFlow(nn.Module):
 
         return x
 
+    @torch.inference_mode()
+    def synthesise_hrf_direct(
+        self,
+        context: torch.Tensor,
+        subject_ids: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """Return HRF source prediction directly (no ODE integration).
+
+        Used during Stage 1 validation when the DiT decoder is untrained.
+        Produces mu_phi → subject_head mapping without flow noise.
+
+        Args:
+            context:     (B, T_ctx, total_dim) concatenated context.
+            subject_ids: (B,) subject indices.
+
+        Returns:
+            fmri_pred: (B, n_target_trs, output_dim) or (B, output_dim).
+        """
+        if not self.use_csfm:
+            raise RuntimeError("synthesise_hrf_direct requires use_csfm=True")
+
+        context_encoded = self.velocity_net.encode_context_from_cond(context)
+        ctx_transposed = context_encoded.transpose(1, 2)
+        ctx_pooled = context_encoded.mean(dim=1)
+        mu_phi_latent, _ = self.hrf_source(ctx_transposed, ctx_pooled)
+
+        if self.velocity_net.use_subject_head:
+            B = context.shape[0]
+            device = context.device
+            if subject_ids is None:
+                subject_ids = torch.zeros(B, dtype=torch.long, device=device)
+            fmri_pred = self.velocity_net.subject_layers(mu_phi_latent, subject_ids)
+        else:
+            fmri_pred = mu_phi_latent
+
+        return fmri_pred
+
     def freeze_source_and_context(self):
         """Freeze the HRF Source and Fusion/Context Encoders for Two-Stage Training."""
         if self.use_csfm:

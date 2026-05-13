@@ -63,6 +63,7 @@ class BMDDataset(Dataset):
 
     TARGET_DIMS = {
         "roi_subset": 8335,
+        "roi_subset_grouped": 8335,  # same voxels, ordered by 9 categories
         "bmd_general": 14672,
     }
 

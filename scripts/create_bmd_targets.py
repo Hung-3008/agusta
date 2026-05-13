@@ -1,20 +1,26 @@
 """
-Create BMD target data with two atlas mappings:
-  1. ROI voxel subset  (~8,335-dim per subject, may vary)
-  2. BMDgeneral mask   (~14,672-dim per subject, may vary)
+Create BMD target data with three atlas mappings:
+  1. ROI voxel subset  (~8,335-dim, sorted by brain index)
+  2. BMDgeneral mask   (~14,672-dim)
+  3. ROI subset grouped (~8,335-dim, grouped by 9 functional categories)
 
-Betas are averaged across repetitions (train: 3 reps, test: 10 reps).
-Output: .npy files per subject per split.
+Betas are averaged across repetitions (train: 3 reps, test: 10 reps)
+and also saved per-repetition for data augmentation.
 
 Usage:
     python scripts/create_bmd_targets.py
 """
 
+import sys
 import pickle
 import numpy as np
 from pathlib import Path
 import time
 import json
+
+# Add project root to path for importing model code
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.models.brainflow.subject_layers import BMDNetworkSubjectLayers
 
 BMD_BASE = Path("Data/BOLDMomentsDataset")
 GLM_BASE = BMD_BASE / "derivatives/versionB/MNI152/GLM"
@@ -27,7 +33,7 @@ def load_pkl(path):
 
 
 def get_roi_indices(sub_dir):
-    """Extract flat indices for BMDgeneral and all specific ROIs."""
+    """Extract flat indices for BMDgeneral, ROI subset, and grouped ROI subset."""
     roi_dir = sub_dir / "ROIs"
     
     # BMDgeneral
@@ -35,32 +41,48 @@ def get_roi_indices(sub_dir):
     bmd_indices = gen_pkl[1].flatten()  # (N, 1) → (N,)
     
     # All specific ROIs (exclude BMDgeneral)
-    roi_indices_list = []
-    roi_names = []
+    roi_indices_dict = {}  # name → indices array
     for rf in sorted(roi_dir.glob("*.pkl")):
         name = rf.stem.replace("ROI-", "").replace("_indices", "")
         if name == "BMDgeneral":
             continue
         roi_pkl = load_pkl(rf)
         indices = roi_pkl[1].flatten()
-        roi_indices_list.append(indices)
-        roi_names.append(name)
+        roi_indices_dict[name] = indices
     
-    # Concatenate all ROI indices and deduplicate (preserve order)
-    all_roi_indices = np.concatenate(roi_indices_list)
-    # Use unique to remove duplicates (voxels shared between ROIs)
+    # ROI subset: sorted by brain index (original mode)
+    all_roi_indices = np.concatenate(list(roi_indices_dict.values()))
     roi_subset_indices = np.unique(all_roi_indices)
+    
+    # ROI subset grouped: ordered by 9 functional categories
+    # Uses canonical ROI_ORDER from BMDNetworkSubjectLayers
+    grouped_indices = []
+    grouped_category_counts = []  # voxel count per category
+    for cat_name, cat_rois in BMDNetworkSubjectLayers.CATEGORIES.items():
+        cat_count = 0
+        for roi in cat_rois:
+            for hemi in ['l', 'r']:
+                full_name = f"{hemi}{roi}"
+                if full_name in roi_indices_dict:
+                    idx = roi_indices_dict[full_name]
+                    grouped_indices.append(idx)
+                    cat_count += len(idx)
+        grouped_category_counts.append(cat_count)
+    
+    grouped_indices = np.concatenate(grouped_indices)
     
     return {
         "bmd_general": np.sort(bmd_indices),
         "roi_subset": roi_subset_indices,
-        "roi_names": roi_names,
-        "roi_per_region": {name: idx for name, idx in zip(roi_names, roi_indices_list)},
+        "roi_subset_grouped": grouped_indices,
+        "grouped_category_counts": grouped_category_counts,
+        "roi_names": list(roi_indices_dict.keys()),
+        "roi_per_region": roi_indices_dict,
     }
 
 
 def process_subject(sub_name, out_base):
-    """Process one subject: extract target data with both atlas mappings."""
+    """Process one subject: extract target data with all atlas mappings."""
     sub_dir = GLM_BASE / sub_name
     betas_dir = sub_dir / "prepared_betas"
     
@@ -72,9 +94,14 @@ def process_subject(sub_name, out_base):
     roi_info = get_roi_indices(sub_dir)
     bmd_idx = roi_info["bmd_general"]
     roi_idx = roi_info["roi_subset"]
+    grp_idx = roi_info["roi_subset_grouped"]
+    grp_counts = roi_info["grouped_category_counts"]
     print(f"  ROI indices loaded ({time.time()-t0:.1f}s)")
-    print(f"    BMDgeneral:  {len(bmd_idx):,} voxels (idx range: {bmd_idx.min()}-{bmd_idx.max()})")
-    print(f"    ROI subset:  {len(roi_idx):,} voxels (idx range: {roi_idx.min()}-{roi_idx.max()})")
+    print(f"    BMDgeneral:       {len(bmd_idx):,} voxels")
+    print(f"    ROI subset:       {len(roi_idx):,} voxels (sorted by brain idx)")
+    print(f"    ROI grouped:      {len(grp_idx):,} voxels (grouped by 9 categories)")
+    print(f"    Category counts:  {grp_counts}")
+    print(f"    Categories:       {BMDNetworkSubjectLayers.CATEGORY_NAMES}")
     
     # Verify ROI subset is a subset of BMDgeneral
     roi_in_bmd = np.isin(roi_idx, bmd_idx)
@@ -112,40 +139,40 @@ def process_subject(sub_name, out_base):
         # ── AVG targets ──
         bmd_target = betas_avg[:, bmd_idx].astype(np.float32)
         roi_target = betas_avg[:, roi_idx].astype(np.float32)
+        grp_target = betas_avg[:, grp_idx].astype(np.float32)
         
-        bmd_out = out_base / "bmd_general"
-        bmd_out.mkdir(parents=True, exist_ok=True)
-        np.save(bmd_out / f"{sub_name}_{split}.npy", bmd_target)
-        
-        roi_out = out_base / "roi_subset"
-        roi_out.mkdir(parents=True, exist_ok=True)
-        np.save(roi_out / f"{sub_name}_{split}.npy", roi_target)
+        for mode, arr in [("bmd_general", bmd_target), ("roi_subset", roi_target),
+                          ("roi_subset_grouped", grp_target)]:
+            d = out_base / mode
+            d.mkdir(parents=True, exist_ok=True)
+            np.save(d / f"{sub_name}_{split}.npy", arr)
         
         # ── PER-REP targets ──
-        # Reshape (N_vids, N_reps, full) → extract atlas → (N_vids*N_reps, atlas)
         bmd_per_rep = betas[:, :, bmd_idx].reshape(-1, len(bmd_idx)).astype(np.float32)
         roi_per_rep = betas[:, :, roi_idx].reshape(-1, len(roi_idx)).astype(np.float32)
+        grp_per_rep = betas[:, :, grp_idx].reshape(-1, len(grp_idx)).astype(np.float32)
         
-        bmd_rep_out = out_base / "bmd_general_per_rep"
-        bmd_rep_out.mkdir(parents=True, exist_ok=True)
-        np.save(bmd_rep_out / f"{sub_name}_{split}.npy", bmd_per_rep)
-        
-        roi_rep_out = out_base / "roi_subset_per_rep"
-        roi_rep_out.mkdir(parents=True, exist_ok=True)
-        np.save(roi_rep_out / f"{sub_name}_{split}.npy", roi_per_rep)
+        for mode, arr in [("bmd_general_per_rep", bmd_per_rep),
+                          ("roi_subset_per_rep", roi_per_rep),
+                          ("roi_subset_grouped_per_rep", grp_per_rep)]:
+            d = out_base / mode
+            d.mkdir(parents=True, exist_ok=True)
+            np.save(d / f"{sub_name}_{split}.npy", arr)
         
         print(f"  Saved:")
         print(f"    [avg] BMDgeneral: {bmd_target.shape}, {bmd_target.nbytes/1024/1024:.1f} MB")
         print(f"    [avg] ROI subset: {roi_target.shape}, {roi_target.nbytes/1024/1024:.1f} MB")
+        print(f"    [avg] ROI grouped: {grp_target.shape}, {grp_target.nbytes/1024/1024:.1f} MB")
         print(f"    [rep] BMDgeneral: {bmd_per_rep.shape}, {bmd_per_rep.nbytes/1024/1024:.1f} MB")
         print(f"    [rep] ROI subset: {roi_per_rep.shape}, {roi_per_rep.nbytes/1024/1024:.1f} MB")
+        print(f"    [rep] ROI grouped: {grp_per_rep.shape}, {grp_per_rep.nbytes/1024/1024:.1f} MB")
         
         # Stats
         print(f"  Stats (rep-averaged, {split}):")
         print(f"    BMDgeneral: range=[{bmd_target.min():.4f}, {bmd_target.max():.4f}], "
               f"mean={bmd_target.mean():.4f}, std={bmd_target.std():.4f}")
-        print(f"    ROI subset: range=[{roi_target.min():.4f}, {roi_target.max():.4f}], "
-              f"mean={roi_target.mean():.4f}, std={roi_target.std():.4f}")
+        print(f"    ROI grouped: range=[{grp_target.min():.4f}, {grp_target.max():.4f}], "
+              f"mean={grp_target.mean():.4f}, std={grp_target.std():.4f}")
         
         # Free memory
         del betas, betas_avg, data
@@ -154,6 +181,9 @@ def process_subject(sub_name, out_base):
     meta = {
         "bmd_general_n_voxels": len(bmd_idx),
         "roi_subset_n_voxels": len(roi_idx),
+        "roi_subset_grouped_n_voxels": len(grp_idx),
+        "grouped_category_counts": grp_counts,
+        "grouped_category_names": BMDNetworkSubjectLayers.CATEGORY_NAMES,
         "roi_names": roi_info["roi_names"],
         "roi_per_region_sizes": {name: len(idx) for name, idx in roi_info["roi_per_region"].items()},
     }
@@ -161,6 +191,7 @@ def process_subject(sub_name, out_base):
     # Save indices as numpy for later use
     np.save(out_base / "bmd_general" / f"{sub_name}_indices.npy", bmd_idx)
     np.save(out_base / "roi_subset" / f"{sub_name}_indices.npy", roi_idx)
+    np.save(out_base / "roi_subset_grouped" / f"{sub_name}_indices.npy", grp_idx)
     
     return meta
 

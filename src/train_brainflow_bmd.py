@@ -170,13 +170,39 @@ def train(args):
     context_bf16 = tr_cfg.get("context_bf16_when_amp", True)
     pin = cfg.get("dataloader", {}).get("pin_memory", False)
 
+    # --- Two-stage training ---
+    warmup_hrf_epochs = tr_cfg.get("warmup_hrf_epochs", 0)
+    if warmup_hrf_epochs > 0 and start_epoch <= warmup_hrf_epochs:
+        logger.info(
+            "Two-stage training enabled: Stage 1 (HRF warmup) epochs 1-%d, "
+            "Stage 2 (flow training) from epoch %d",
+            warmup_hrf_epochs, warmup_hrf_epochs + 1,
+        )
+        if start_epoch == 1:
+            model.freeze_flow_decoder()
+            n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            logger.info("Stage 1 trainable params: %s", f"{n_train:,}")
+
     # --- Training loop ---
     for epoch in range(start_epoch, tr_cfg["n_epochs"] + 1):
+        # --- Two-stage transition ---
+        if warmup_hrf_epochs > 0 and epoch == warmup_hrf_epochs + 1:
+            logger.info("=" * 60)
+            logger.info("STAGE 2: Unfreezing flow decoder, freezing HRF source")
+            logger.info("=" * 60)
+            model.unfreeze_flow_decoder()
+            model.freeze_hrf_source_only()
+            n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            logger.info("Stage 2 trainable params: %s", f"{n_train:,}")
+            torch.cuda.empty_cache()
+
         freeze_epoch = tr_cfg.get("freeze_modules_after_epoch", -1)
         if freeze_epoch > 0 and epoch == freeze_epoch + 1:
             logger.info(f"Epoch {epoch} > {freeze_epoch}. Freezing context encoder and HRF source!")
             model.freeze_source_and_context()
             torch.cuda.empty_cache()
+
+        is_hrf_warmup = warmup_hrf_epochs > 0 and epoch <= warmup_hrf_epochs
 
         model.train()
         train_losses = defaultdict(list)
@@ -212,6 +238,7 @@ def train(args):
                     context, target,
                     subject_ids=subject_ids,
                     skip_aux=cfg_drop,
+                    skip_flow=is_hrf_warmup,
                 )
                 raw_loss = losses["total_loss"]
                 loss = raw_loss / accum_steps
@@ -273,19 +300,25 @@ def train(args):
                     context = context.unsqueeze(1)
                     subject_ids = batch["subject_idx"].to(device)
 
-                    synth_kwargs = dict(
-                        n_timesteps=val_n_timesteps,
-                        solver_method=val_solver_method,
-                        subject_ids=subject_ids,
-                        temperature=val_temperature,
-                    )
-                    tw = solver_cfg.get("time_grid_warp")
-                    if tw:
-                        synth_kwargs["time_grid_warp"] = tw
-                    if val_cfg_scale > 0:
-                        synth_kwargs["cfg_scale"] = val_cfg_scale
+                    if is_hrf_warmup:
+                        # Stage 1: DiT decoder is untrained → use HRF source directly
+                        gen_fmri = model.synthesise_hrf_direct(
+                            context, subject_ids=subject_ids,
+                        )
+                    else:
+                        synth_kwargs = dict(
+                            n_timesteps=val_n_timesteps,
+                            solver_method=val_solver_method,
+                            subject_ids=subject_ids,
+                            temperature=val_temperature,
+                        )
+                        tw = solver_cfg.get("time_grid_warp")
+                        if tw:
+                            synth_kwargs["time_grid_warp"] = tw
+                        if val_cfg_scale > 0:
+                            synth_kwargs["cfg_scale"] = val_cfg_scale
 
-                    gen_fmri = model.synthesise(context, **synth_kwargs)
+                        gen_fmri = model.synthesise(context, **synth_kwargs)
 
                     fmri_target = batch["fmri"].to(device)
 
@@ -314,8 +347,9 @@ def train(args):
                 )
                 mean_sample_pcc = float(per_sample_pcc.mean().item())
 
-                logger.info("Epoch %d | Val per-voxel PCC: %.4f | per-sample PCC: %.4f",
-                            epoch, mean_fmri_corr, mean_sample_pcc)
+                val_tag = "[HRF-direct]" if is_hrf_warmup else "[ODE-synth]"
+                logger.info("Epoch %d %s | Val per-voxel PCC: %.4f | per-sample PCC: %.4f",
+                            epoch, val_tag, mean_fmri_corr, mean_sample_pcc)
             else:
                 logger.info("Epoch %d | Val: no predictions generated", epoch)
 

@@ -387,19 +387,25 @@ def train(args):
                     context = batch["context"].to(device)
                     subject_ids = batch["subject_idx"].to(device)
 
-                    synth_kwargs = dict(
-                        n_timesteps=val_n_timesteps,
-                        solver_method=val_solver_method,
-                        subject_ids=subject_ids,
-                        temperature=0.0 if is_hrf_warmup else val_temperature,
-                    )
-                    tw = solver_cfg.get("time_grid_warp")
-                    if tw:
-                        synth_kwargs["time_grid_warp"] = tw
-                    if val_cfg_scale > 0:
-                        synth_kwargs["cfg_scale"] = val_cfg_scale
+                    if is_hrf_warmup:
+                        # Stage 1: DiT decoder is untrained → use HRF source directly
+                        gen_fmri = model.synthesise_hrf_direct(
+                            context, subject_ids=subject_ids,
+                        )
+                    else:
+                        synth_kwargs = dict(
+                            n_timesteps=val_n_timesteps,
+                            solver_method=val_solver_method,
+                            subject_ids=subject_ids,
+                            temperature=val_temperature,
+                        )
+                        tw = solver_cfg.get("time_grid_warp")
+                        if tw:
+                            synth_kwargs["time_grid_warp"] = tw
+                        if val_cfg_scale > 0:
+                            synth_kwargs["cfg_scale"] = val_cfg_scale
 
-                    gen_fmri = model.synthesise(context, **synth_kwargs)
+                        gen_fmri = model.synthesise(context, **synth_kwargs)
 
                     clip_keys = batch["clip_key"]
                     target_tr_starts = batch["target_tr_start"]
@@ -452,7 +458,8 @@ def train(args):
                 pcc = pearson_corr_per_dim(all_gen.unsqueeze(0), all_tgt.unsqueeze(0))
                 mean_fmri_corr = float(pcc.mean().item())
 
-            logger.info("Epoch %d | Val fMRI PCC: %.4f", epoch, mean_fmri_corr)
+            val_tag = "[HRF-direct]" if is_hrf_warmup else "[ODE-synth]"
+            logger.info("Epoch %d %s | Val fMRI PCC: %.4f", epoch, val_tag, mean_fmri_corr)
 
             if mean_fmri_corr > best_val_corr:
                 best_val_corr = mean_fmri_corr
