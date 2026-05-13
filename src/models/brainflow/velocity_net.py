@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from .components import SinusoidalPosEmb, RotaryEmbedding, RoPETransformerEncoderLayer
-from .subject_layers import SubjectLayers, NetworkSubjectLayers
+from .subject_layers import SubjectLayers, NetworkSubjectLayers, BMDNetworkSubjectLayers
 from .fusion import MultiTokenFusion
 from .backbones import DiTXBackbone, DiT1DBackbone
 
@@ -41,6 +41,7 @@ class VelocityNet(nn.Module):
         dit_num_blocks: int | None = None,
         decoder_type: str = "ditx",
         zero_init_network_heads: bool = False,
+        bmd_mode: bool = False,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -54,6 +55,7 @@ class VelocityNet(nn.Module):
         self.n_target_trs = n_target_trs
         self.context_encoder = context_encoder
         self.context_trs = int(context_trs) if context_trs is not None else int(max_seq_len)
+        self.bmd_mode = bmd_mode
 
         if context_encoder != "multitoken":
             raise ValueError(
@@ -128,14 +130,32 @@ class VelocityNet(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
+        # BMD AdaLN context injection: pool context → project → add to t_emb
+        # so every decoder block gets context conditioning via AdaLN shift/scale/gate
+        if bmd_mode:
+            self.context_cond_proj = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        else:
+            self.context_cond_proj = None
+
         # Subject Heads
         if use_subject_head:
             if self.network_head:
-                self.subject_layers = NetworkSubjectLayers(
-                    self.latent_dim,
-                    n_subjects,
-                    zero_init=zero_init_network_heads,
-                )
+                if self.bmd_mode:
+                    self.subject_layers = BMDNetworkSubjectLayers(
+                        self.latent_dim,
+                        n_subjects,
+                        zero_init=zero_init_network_heads,
+                    )
+                else:
+                    self.subject_layers = NetworkSubjectLayers(
+                        self.latent_dim,
+                        n_subjects,
+                        zero_init=zero_init_network_heads,
+                    )
             else:
                 self.subject_layers = SubjectLayers(self.latent_dim, output_dim, n_subjects)
             self.subject_emb = None
@@ -176,12 +196,21 @@ class VelocityNet(nn.Module):
 
     def encode_context_from_cond(self, cond: torch.Tensor) -> torch.Tensor:
         """Encode context: multitoken fusion → temporal encoder → optional slice to ``n_target_trs``."""
+        if self.bmd_mode and cond.dim() == 2:
+            # Expand (B, D) -> (B, 1, D) for MultiTokenFusion
+            cond = cond.unsqueeze(1)
+            
         splits = []
         offset = 0
         for dim in self.modality_dims:
             splits.append(cond[:, :, offset:offset + dim])
             offset += dim
         context = self.fusion_block(splits)
+
+        if self.bmd_mode:
+            # T=1: attention is trivial but FFN still refines context
+            # Fall through to temporal encoder for inter-modality reasoning
+            pass
 
         if self.context_pos_emb is not None:
             Tc = context.shape[1]
@@ -233,10 +262,17 @@ class VelocityNet(nn.Module):
 
         t_emb = self.time_mlp(self.time_embed(t))
 
+        # BMD: inject context into conditioning signal for AdaLN modulation
+        if self.context_cond_proj is not None:
+            ctx_pool = context_encoded.squeeze(1) if context_encoded.dim() == 3 else context_encoded
+            t_emb = t_emb + self.context_cond_proj(ctx_pool)
+
         if not self.use_subject_head and self.subject_emb is not None and subject_ids is not None:
             t_emb = t_emb + self.subject_emb(subject_ids)
 
         h = self.input_proj(x)
+        if self.bmd_mode and h.dim() == 2:
+            h = h.unsqueeze(1)
 
         # Prepare tokens for backbone
         h = h + context_encoded
@@ -250,7 +286,13 @@ class VelocityNet(nn.Module):
         h = self.final_norm(h)
         if self.use_subject_head:
             z = self.latent_head(h)
+            if self.bmd_mode and z.dim() == 3 and z.size(1) == 1:
+                z = z.squeeze(1)
             if subject_ids is None:
                 subject_ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
             return self.subject_layers(z, subject_ids)
-        return self.output_layer(h)
+            
+        out = self.output_layer(h)
+        if self.bmd_mode and out.dim() == 3 and out.size(1) == 1:
+            out = out.squeeze(1)
+        return out

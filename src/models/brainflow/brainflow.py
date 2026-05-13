@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 from .utils import recover_velocity_indi, IndiVelocityCallable, flow_train_time_sample, info_nce_loss
 from .time_warp import TimeWarpNet, tensor_warp_schedule
 from .hrf_source import AECNN_HRF_Source
+from .bmd_hrf_source import BMD_HRF_Source
 from .velocity_net import VelocityNet
 
 class BrainFlow(nn.Module):
@@ -95,12 +96,20 @@ class BrainFlow(nn.Module):
         else:
             self.gamma_reg_weight = 0.0
 
+        self._bmd_mode = vn_cfg.get("bmd_mode", False)
         if self.use_csfm:
-            self.hrf_source = AECNN_HRF_Source(
-                context_dim=hidden_dim,
-                latent_dim=latent_dim,
-                hrf_kernel_size=vn_cfg.get("hrf_kernel_size", 12)
-            )
+            if self._bmd_mode:
+                self.hrf_source = BMD_HRF_Source(
+                    context_dim=hidden_dim,
+                    latent_dim=latent_dim,
+                    bottleneck_dim=vn_cfg.get("hrf_bottleneck_dim", 512),
+                )
+            else:
+                self.hrf_source = AECNN_HRF_Source(
+                    context_dim=hidden_dim,
+                    latent_dim=latent_dim,
+                    hrf_kernel_size=vn_cfg.get("hrf_kernel_size", 12)
+                )
 
         # Log parameters
         vn_params = sum(p.numel() for p in self.velocity_net.parameters())
@@ -158,10 +167,14 @@ class BrainFlow(nn.Module):
         else:
             if self.use_csfm:
                 ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
-                ctx_transposed = ctx_detached.transpose(1, 2)
-                ctx_pooled_reg = ctx_detached.mean(dim=1)
-                
-                mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled_reg)
+                if self._bmd_mode:
+                    # BMD: context_encoded is (B, 1, D) or (B, D)
+                    ctx_pooled_reg = ctx_detached.squeeze(1) if ctx_detached.dim() == 3 else ctx_detached
+                    mu_phi_latent, sigma_phi = self.hrf_source(ctx_pooled_reg)
+                else:
+                    ctx_transposed = ctx_detached.transpose(1, 2)
+                    ctx_pooled_reg = ctx_detached.mean(dim=1)
+                    mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled_reg)
                 
                 if self.velocity_net.use_subject_head:
                     if subject_ids is None:
@@ -332,9 +345,13 @@ class BrainFlow(nn.Module):
 
         # --- Initialise x_0 ---
         if self.use_csfm:
-            ctx_transposed = context_encoded.transpose(1, 2)
-            ctx_pooled = context_encoded.mean(dim=1)
-            mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled)
+            if self._bmd_mode:
+                ctx_pooled = context_encoded.squeeze(1) if context_encoded.dim() == 3 else context_encoded
+                mu_phi_latent, sigma_phi = self.hrf_source(ctx_pooled)
+            else:
+                ctx_transposed = context_encoded.transpose(1, 2)
+                ctx_pooled = context_encoded.mean(dim=1)
+                mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled)
             
             if self.velocity_net.use_subject_head:
                 if subject_ids is None:
