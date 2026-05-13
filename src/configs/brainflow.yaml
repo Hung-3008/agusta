@@ -105,7 +105,7 @@ solver_args:
   time_grid_warp: sqrt
 
 training:
-  n_epochs: 200
+  n_epochs: 150
   lr: 1.0e-4
   weight_decay: 0.05
   warmup_ratio: 0.05
@@ -120,5 +120,6 @@ training:
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
   cfg_dropout: 0.0
+  freeze_epoch: 100
 
 output_dir: outputs/brainflow_dit_testttt

@@ -18,6 +18,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
@@ -127,9 +128,19 @@ def train(args):
     if args.val_batch_size is not None:
         cfg.setdefault("dataloader", {})["val_batch_size"] = int(args.val_batch_size)
 
-    logger.info("Loaded config: %s", cfg_path)
+    # --- Seed ---
+    seed = args.seed
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    torch.manual_seed(42)
+    # --- Output dir override ---
+    if args.output_dir is not None:
+        cfg["output_dir"] = args.output_dir
+
+    logger.info("Loaded config: %s (seed=%d)", cfg_path, seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_loader, val_loader = get_dataloaders(cfg)
@@ -247,7 +258,8 @@ def train(args):
                 ema.load_state_dict(ckpt["ema"])
             start_epoch = ckpt["epoch"] + 1
             global_step = ckpt.get("global_step", 0)
-            logger.info("Resumed from epoch %d (step=%d)", ckpt["epoch"], global_step)
+            _frozen = ckpt.get("frozen", False)
+            logger.info("Resumed from epoch %d (step=%d, frozen=%s)", ckpt["epoch"], global_step, _frozen)
             del ckpt
         else:
             logger.warning("--resume but no last.pt found.")
@@ -263,8 +275,81 @@ def train(args):
     context_bf16 = tr_cfg.get("context_bf16_when_amp", True)
     pin = cfg.get("dataloader", {}).get("pin_memory", False)
 
+    # --- Freeze config ---
+    freeze_epoch = tr_cfg.get("freeze_epoch", 0)
+    _frozen = False
+
+    def freeze_source_and_encoder(model):
+        """Freeze HRF source + context encoder, keep velocity decoder trainable."""
+        frozen_names = []
+
+        # 1. Freeze HRF source (CSFM)
+        if hasattr(model, 'hrf_source'):
+            for name, param in model.hrf_source.named_parameters():
+                param.requires_grad = False
+                frozen_names.append(f"hrf_source.{name}")
+
+        # 2. Freeze context encoder inside VelocityNet
+        vn = model.velocity_net
+        encoder_modules = ['fusion_block', 'temporal_attn', 'temporal_norm']
+        if vn.rotary_emb is not None:
+            encoder_modules.append('rotary_emb')
+        if vn.context_pos_emb is not None:
+            frozen_names.append('velocity_net.context_pos_emb')
+            vn.context_pos_emb.requires_grad = False
+
+        for mod_name in encoder_modules:
+            mod = getattr(vn, mod_name, None)
+            if mod is None:
+                continue
+            if isinstance(mod, nn.Parameter):
+                mod.requires_grad = False
+                frozen_names.append(f"velocity_net.{mod_name}")
+            else:
+                for pname, param in mod.named_parameters():
+                    param.requires_grad = False
+                    frozen_names.append(f"velocity_net.{mod_name}.{pname}")
+
+        n_frozen = len(frozen_names)
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(
+            "Froze %d params (source + encoder). Remaining trainable: %s",
+            n_frozen, f"{n_trainable:,}",
+        )
+        return frozen_names
+
     # --- Training loop ---
     for epoch in range(start_epoch, tr_cfg["n_epochs"] + 1):
+        # Apply freeze at the configured epoch
+        if freeze_epoch > 0 and epoch >= freeze_epoch and not _frozen:
+            frozen_names = freeze_source_and_encoder(model)
+            _frozen = True
+            # Rebuild optimizer with only trainable params
+            optimizer = torch.optim.AdamW(
+                [p for p in model.parameters() if p.requires_grad],
+                lr=tr_cfg["lr"], weight_decay=tr_cfg["weight_decay"],
+            )
+            # Reset scheduler for the remaining epochs
+            remaining_epochs = tr_cfg["n_epochs"] - epoch + 1
+            remaining_steps = opt_steps_per_epoch * remaining_epochs
+            warmup_steps_new = int(remaining_steps * 0.05)
+
+            def cosine_with_warmup_frozen(step, _ws=warmup_steps_new, _ts=remaining_steps):
+                if step < _ws:
+                    return step / max(_ws, 1)
+                progress = (step - _ws) / max(_ts - _ws, 1)
+                return min_lr / base_lr + (1 - min_lr / base_lr) * 0.5 * (1 + pymath.cos(pymath.pi * progress))
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_with_warmup_frozen)
+            # Re-init EMA with only trainable params
+            ema = EMAModel(
+                model, decay=tr_cfg.get("ema_decay", 0.999), store_on_cpu=ema_on_cpu,
+            )
+            logger.info(
+                "Freeze activated at epoch %d. Optimizer & EMA rebuilt for decoder-only training.",
+                epoch,
+            )
+
         model.train()
         train_losses = defaultdict(list)
         micro_accum = 0
@@ -441,6 +526,7 @@ def train(args):
             "scheduler": scheduler.state_dict(),
             "ema": ema.state_dict(),
             "global_step": global_step,
+            "frozen": _frozen,
         }, out_dir / "last.pt")
 
     logger.info("Training complete. Best val PCC: %.4f", best_val_corr)
@@ -470,5 +556,10 @@ if __name__ == "__main__":
     parser.add_argument("--fast_dev_run", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--warmstart", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument(
+        "--output-dir", type=str, default=None,
+        help="Override output_dir from config (used by ensemble scripts).",
+    )
     args = parser.parse_args()
     train(args)
