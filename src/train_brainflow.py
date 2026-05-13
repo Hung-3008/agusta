@@ -263,13 +263,39 @@ def train(args):
     context_bf16 = tr_cfg.get("context_bf16_when_amp", True)
     pin = cfg.get("dataloader", {}).get("pin_memory", False)
 
+    # --- Two-stage training ---
+    warmup_hrf_epochs = tr_cfg.get("warmup_hrf_epochs", 0)
+    if warmup_hrf_epochs > 0 and start_epoch <= warmup_hrf_epochs:
+        logger.info(
+            "Two-stage training enabled: Stage 1 (HRF warmup) epochs 1-%d, "
+            "Stage 2 (flow training) from epoch %d",
+            warmup_hrf_epochs, warmup_hrf_epochs + 1,
+        )
+        if start_epoch == 1:
+            model.freeze_flow_decoder()
+            n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            logger.info("Stage 1 trainable params: %s", f"{n_train:,}")
+
     # --- Training loop ---
     for epoch in range(start_epoch, tr_cfg["n_epochs"] + 1):
+        # --- Two-stage transition ---
+        if warmup_hrf_epochs > 0 and epoch == warmup_hrf_epochs + 1:
+            logger.info("="*60)
+            logger.info("STAGE 2: Unfreezing flow decoder, freezing HRF source")
+            logger.info("="*60)
+            model.unfreeze_flow_decoder()
+            model.freeze_hrf_source_only()
+            n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            logger.info("Stage 2 trainable params: %s", f"{n_train:,}")
+            torch.cuda.empty_cache()
+
         freeze_epoch = tr_cfg.get("freeze_modules_after_epoch", -1)
         if freeze_epoch > 0 and epoch == freeze_epoch + 1:
             logger.info(f"Epoch {epoch} > {freeze_epoch}. Freezing context encoder and HRF source!")
             model.freeze_source_and_context()
             torch.cuda.empty_cache()
+
+        is_hrf_warmup = warmup_hrf_epochs > 0 and epoch <= warmup_hrf_epochs
 
         model.train()
         train_losses = defaultdict(list)
@@ -298,6 +324,7 @@ def train(args):
                     context, target,
                     subject_ids=subject_ids,
                     skip_aux=cfg_drop,
+                    skip_flow=is_hrf_warmup,
                 )
                 raw_loss = losses["total_loss"]
                 loss = raw_loss / accum_steps
@@ -317,11 +344,14 @@ def train(args):
                 global_step += 1
 
                 if global_step % tr_cfg["log_every_n_steps"] == 0:
+                    stage_tag = "[S1-HRF]" if is_hrf_warmup else "[S2-Flow]"
                     postfix = {
+                        "stg": stage_tag,
                         "loss": f"{np.mean(train_losses['total_loss'][-50:]):.4f}",
-                        "flow": f"{losses['flow_loss'].item():.4f}",
                         "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                     }
+                    if not is_hrf_warmup:
+                        postfix["flow"] = f"{losses['flow_loss'].item():.4f}"
                     if model.use_csfm:
                         postfix["pcc"] = f"{losses['pcc_loss'].item():.4f}"
                         postfix["var"] = f"{losses['var_reg_loss'].item():.4f}"
@@ -361,7 +391,7 @@ def train(args):
                         n_timesteps=val_n_timesteps,
                         solver_method=val_solver_method,
                         subject_ids=subject_ids,
-                        temperature=val_temperature,
+                        temperature=0.0 if is_hrf_warmup else val_temperature,
                     )
                     tw = solver_cfg.get("time_grid_warp")
                     if tw:

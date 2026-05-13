@@ -125,6 +125,7 @@ class BrainFlow(nn.Module):
         subject_ids: torch.Tensor = None,
         starting_distribution: torch.Tensor = None,
         skip_aux: bool = False,
+        skip_flow: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Compute flow + regression + contrastive loss.
 
@@ -185,21 +186,17 @@ class BrainFlow(nn.Module):
                 _std = torch.sqrt((_pred_c ** 2).sum(dim=-1) * (_tgt_c ** 2).sum(dim=-1) + 1e-8)
                 csfm_pcc_loss = (1.0 - _cov / _std).mean()
 
-        # 4. Flow matching source distribution (x_0)
-        x_1 = target
-        if self.use_csfm and not skip_aux:
-            x_0 = x_0_csfm
-        else:
-            x_0 = torch.randn_like(x_1)
-
-        # 5. Flow matching (gradient flows to encoder)
+        # 4-5. Flow matching (skipped during HRF warmup stage)
         gamma_reg = _zero
 
-        if self.use_tensor_fm:
+        if skip_flow:
+            flow_loss = _zero
+        elif self.use_tensor_fm:
+            x_1 = target
+            x_0 = x_0_csfm if (self.use_csfm and not skip_aux) else torch.randn_like(x_1)
             t = torch.rand(x_1.shape[0], device=x_1.device, dtype=x_1.dtype)
-            # Use NON-detached pooling so TimeWarpNet gradients flow through encoder
-            ctx_pooled_flow = context_encoded.mean(dim=1)  # ✅ gradient flows
-            gamma = self.time_warp_net(ctx_pooled_flow)     # (B, D)
+            ctx_pooled_flow = context_encoded.mean(dim=1)
+            gamma = self.time_warp_net(ctx_pooled_flow)
             lambda_t, d_lambda_t = tensor_warp_schedule(gamma, t)
 
             x_t = lambda_t * x_1 + (1.0 - lambda_t) * x_0
@@ -211,25 +208,25 @@ class BrainFlow(nn.Module):
                 subject_ids=subject_ids,
             )
             flow_loss = F.mse_loss(v_pred, target_velocity)
-
             gamma_reg = gamma.pow(2).mean()
         else:
+            x_1 = target
+            x_0 = x_0_csfm if (self.use_csfm and not skip_aux) else torch.randn_like(x_1)
             t = flow_train_time_sample(
                 x_1.shape[0],
                 x_1.device,
                 x_1.dtype,
                 sqrt_bias_end=self.indi_train_time_sqrt and self._indi_effective,
             )
-            # Manual OT interpolation — supports both (B, V) and (B, T, V) shapes
             t_bc = t
             while t_bc.dim() < x_1.dim():
-                t_bc = t_bc.unsqueeze(-1)          # (B, 1, 1) for seq mode
+                t_bc = t_bc.unsqueeze(-1)
             x_t = t_bc * x_1 + (1.0 - t_bc) * x_0
 
             if self._indi_effective:
-                target_velocity = x_1 - x_t       # InDI: residual = (1-t)*(x_1-x_0)
+                target_velocity = x_1 - x_t
             else:
-                target_velocity = x_1 - x_0       # OT-CFM: constant velocity
+                target_velocity = x_1 - x_0
 
             v_pred = self.velocity_net(
                 x=x_t,
@@ -446,3 +443,39 @@ class BrainFlow(nn.Module):
                 p.requires_grad = False
         if self.velocity_net.context_pos_emb is not None:
             self.velocity_net.context_pos_emb.requires_grad = False
+
+    # ------------------------------------------------------------------
+    # Two-stage helpers: HRF warmup → Flow training
+    # ------------------------------------------------------------------
+
+    def freeze_flow_decoder(self):
+        """Stage 1: Freeze DiT decoder so only HRF source + encoder train."""
+        _keys = ('input_proj', 'target_pos_emb', 't_embedder', 'backbone',
+                 'final_layer', 'subject_emb', 'rotary_emb_decoder')
+        n = 0
+        for name, p in self.velocity_net.named_parameters():
+            if any(k in name for k in _keys):
+                p.requires_grad = False
+                n += 1
+        logger.info("freeze_flow_decoder: froze %d params", n)
+
+    def unfreeze_flow_decoder(self):
+        """Stage 2: Unfreeze DiT decoder."""
+        _keys = ('input_proj', 'target_pos_emb', 't_embedder', 'backbone',
+                 'final_layer', 'subject_emb', 'rotary_emb_decoder')
+        n = 0
+        for name, p in self.velocity_net.named_parameters():
+            if any(k in name for k in _keys):
+                p.requires_grad = True
+                n += 1
+        logger.info("unfreeze_flow_decoder: unfroze %d params", n)
+
+    def freeze_hrf_source_only(self):
+        """Stage 2: Freeze HRF source only (encoder stays trainable)."""
+        if not self.use_csfm:
+            return
+        n = 0
+        for p in self.hrf_source.parameters():
+            p.requires_grad = False
+            n += 1
+        logger.info("freeze_hrf_source_only: froze %d params", n)
