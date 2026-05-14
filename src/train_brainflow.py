@@ -127,9 +127,19 @@ def train(args):
     if args.val_batch_size is not None:
         cfg.setdefault("dataloader", {})["val_batch_size"] = int(args.val_batch_size)
 
-    logger.info("Loaded config: %s", cfg_path)
+    # --- Seed ---
+    seed = args.seed
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    torch.manual_seed(42)
+    # --- Output dir override ---
+    if args.output_dir is not None:
+        cfg["output_dir"] = args.output_dir
+
+    logger.info("Loaded config: %s (seed=%d)", cfg_path, seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_loader, val_loader = get_dataloaders(cfg)
@@ -467,5 +477,10 @@ if __name__ == "__main__":
     parser.add_argument("--fast_dev_run", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--warmstart", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument(
+        "--output-dir", type=str, default=None,
+        help="Override output_dir from config (used by ensemble scripts).",
+    )
     args = parser.parse_args()
     train(args)
