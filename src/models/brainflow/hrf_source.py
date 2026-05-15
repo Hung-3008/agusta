@@ -26,11 +26,11 @@ class AECNN_HRF_Source(nn.Module):
             groups=latent_dim
         )
         
-        # Per-voxel Sigma Predictor — each voxel gets its own noise scale
+        # Scalar Sigma Predictor — single noise scale broadcast across voxels
         self.sigma_net = nn.Sequential(
-            nn.Linear(context_dim, 512),
+            nn.Linear(context_dim, 256),
             nn.ReLU(),
-            nn.Linear(512, output_dim),
+            nn.Linear(256, 1),
             nn.Softplus()  # Ensure strictly positive variance
         )
 
