@@ -23,8 +23,8 @@
 set -euo pipefail
 
 # --- Configuration ---
-CONFIG="src/configs/brainflow.yaml"
-OUTPUT_BASE="outputs/brainflow_ensemble50"
+CONFIG="src/configs/brainflow_dit_medium.yaml"
+OUTPUT_BASE="outputs/brainflow_dit_medium_ensemble50"
 LOG_DIR="${OUTPUT_BASE}/logs"
 
 # --- 50 diverse seeds (prime-like, well-separated) ---
