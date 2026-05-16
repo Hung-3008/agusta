@@ -5,9 +5,9 @@ class AECNN_HRF_Source(nn.Module):
     """
     Condition-dependent Source Generator using Biological HRF Prior.
     Compresses temporal context into neural events and filters through an HRF conv layer
-    to create a biological base distribution (mu_phi) and variance (sigma_phi).
+    to create a biological base distribution (mu_phi) and per-voxel variance (sigma_phi).
     """
-    def __init__(self, context_dim: int, latent_dim: int, hrf_kernel_size: int = 12):
+    def __init__(self, context_dim: int, latent_dim: int, output_dim: int = 1000, hrf_kernel_size: int = 12):
         super().__init__()
         # Step 1: Neural Event Extractor
         self.neural_event_net = nn.Sequential(
@@ -26,7 +26,7 @@ class AECNN_HRF_Source(nn.Module):
             groups=latent_dim
         )
         
-        # Sigma Predictor (Variance)
+        # Scalar Sigma Predictor — single noise scale broadcast across voxels
         self.sigma_net = nn.Sequential(
             nn.Linear(context_dim, 256),
             nn.ReLU(),
@@ -42,6 +42,6 @@ class AECNN_HRF_Source(nn.Module):
         mu_phi = self.hrf_filter(neural_events)                # [B, latent_dim, T]
         mu_phi = mu_phi.transpose(1, 2)                        # [B, T, latent_dim]
         
-        sigma_phi = self.sigma_net(context_pooled).unsqueeze(1) # [B, 1, 1]
+        sigma_phi = self.sigma_net(context_pooled).unsqueeze(1) # [B, 1, output_dim]
         
         return mu_phi, sigma_phi

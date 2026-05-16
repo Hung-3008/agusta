@@ -73,6 +73,53 @@ class RMSNormLastDim(nn.Module):
         return x * rms * self.weight
 
 
+class RMSNormNoWeight(nn.Module):
+    """RMSNorm without learnable scale — for AttnRes key normalization.
+
+    Prevents representations with large magnitudes (later layers) from
+    dominating the softmax competition in AttnResOperator.
+    Reference: Attention Residuals (Kimi Team, MoonshotAI, 2026).
+    """
+
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x.float() * rms).to(x.dtype)
+
+
+class AttnResOperator(nn.Module):
+    """Per-sub-layer depth-wise Attention Residual operator.
+
+    Replaces fixed additive residual connections with a learned, softmax-weighted
+    combination of prior representations. The pseudo-query is zero-initialized
+    so initial weights are exactly uniform (safe initialization).
+
+    Reference: Attention Residuals (Kimi Team, MoonshotAI, 2026).
+    """
+
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.pseudo_query = nn.Parameter(torch.zeros(d_model))
+        self.key_norm = RMSNormNoWeight(eps=eps)
+
+    def forward(self, sources: torch.Tensor) -> torch.Tensor:
+        """Compute weighted aggregation of source representations.
+
+        Args:
+            sources: (N_src, B, T, D) stack of source representations.
+
+        Returns:
+            (B, T, D) aggregated representation.
+        """
+        K = self.key_norm(sources)                                       # (N, B, T, D)
+        logits = torch.einsum("d, nbtd -> nbt", self.pseudo_query, K)   # (N, B, T)
+        weights = F.softmax(logits, dim=0)                               # depth-softmax
+        return torch.einsum("nbt, nbtd -> btd", weights, sources)        # (B, T, D)
+
+
 class CrossAttention(nn.Module):
     """Cross-attention with RoPE on Q/K for temporally-aligned context.
 
