@@ -4,6 +4,7 @@ Usage:
     python src/train_brainflow.py --config src/configs/brainflow.yaml --fast_dev_run
     python src/train_brainflow.py --config src/configs/brainflow.yaml
     python src/train_brainflow.py --config src/configs/brainflow.yaml --resume
+    python src/train_brainflow.py --config src/configs/brainflow.yaml --resume --freeze_encoder
 """
 
 import argparse
@@ -18,6 +19,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
@@ -187,46 +189,18 @@ def train(args):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Trainable parameters: %s", f"{n_params:,}")
 
-    # --- Optimizer & Scheduler ---
-    tr_cfg = cfg["training"]
-    accum_steps = max(1, int(tr_cfg.get("gradient_accumulation_steps", 1)))
-    opt_steps_per_epoch = max(1, (len(train_loader) + accum_steps - 1) // accum_steps)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=tr_cfg["lr"], weight_decay=tr_cfg["weight_decay"],
-    )
-
-    total_steps = 2 if args.fast_dev_run else opt_steps_per_epoch * tr_cfg["n_epochs"]
-    warmup_steps = int(total_steps * tr_cfg.get("warmup_ratio", 0.05))
-    min_lr = tr_cfg.get("min_lr", 1e-6)
-    base_lr = tr_cfg["lr"]
-
-    def cosine_with_warmup(step):
-        if step < warmup_steps:
-            return step / max(warmup_steps, 1)
-        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        return min_lr / base_lr + (1 - min_lr / base_lr) * 0.5 * (1 + pymath.cos(pymath.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_with_warmup)
-
     # --- Output ---
-    out_dir = Path(PROJECT_ROOT) / cfg.get("output_dir", "outputs/brainflow_direct")
+    _out_base = cfg.get("output_dir", "outputs/brainflow_direct")
+    if args.freeze_encoder and args.output_dir is None:
+        _out_base = _out_base.rstrip("/") + "_finetune"
+    out_dir = Path(PROJECT_ROOT) / _out_base
     out_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(args.config, out_dir / "config.yaml")
+    src_cfg = Path(args.config).resolve()
+    dst_cfg = (out_dir / "config.yaml").resolve()
+    if src_cfg != dst_cfg:
+        shutil.copy2(args.config, out_dir / "config.yaml")
 
-    ema_on_cpu = tr_cfg.get("ema_on_cpu", True)
-    ema = EMAModel(
-        model, decay=tr_cfg.get("ema_decay", 0.999), store_on_cpu=ema_on_cpu,
-    )
-    gckpt = vn_params.get("gradient_checkpointing", False)
-    logger.info(
-        "Memory opts: grad_accum=%d (~%d opt-steps/epoch), EMA_on_cpu=%s, "
-        "velocity_grad_ckpt=%s",
-        accum_steps, opt_steps_per_epoch, ema_on_cpu, gckpt,
-    )
-    logger.info("EMA decay=%.4f", ema.decay)
-
-    # --- Resume / Warmstart ---
+    # --- Resume / Warmstart (load weights BEFORE freezing) ---
     start_epoch, best_val_corr, global_step = 1, -1.0, 0
 
     if args.warmstart:
@@ -246,21 +220,110 @@ def train(args):
         else:
             logger.warning("--warmstart path %s not found.", ws_path)
 
+    resume_ckpt = None
     if args.resume:
         resume_path = out_dir / "last.pt"
         if resume_path.exists():
             ckpt = torch.load(resume_path, map_location=device, weights_only=False)
             model.load_state_dict(ckpt["model"])
-            optimizer.load_state_dict(ckpt["optimizer"])
-            scheduler.load_state_dict(ckpt["scheduler"])
-            if "ema" in ckpt:
-                ema.load_state_dict(ckpt["ema"])
             start_epoch = ckpt["epoch"] + 1
             global_step = ckpt.get("global_step", 0)
-            logger.info("Resumed from epoch %d (step=%d)", ckpt["epoch"], global_step)
-            del ckpt
+            logger.info("Resumed model from epoch %d (step=%d)", ckpt["epoch"], global_step)
+            resume_ckpt = ckpt  # keep for optimizer/scheduler/ema restore below
         else:
             logger.warning("--resume but no last.pt found.")
+
+    # --- Freeze encoder components (after checkpoint loading) ---
+    if args.freeze_encoder:
+        frozen_modules = []
+        # 1) Freeze HRF Source
+        if hasattr(model, 'hrf_source'):
+            for p in model.hrf_source.parameters():
+                p.requires_grad = False
+            frozen_modules.append("hrf_source")
+
+        # 2) Freeze multitoken encoder inside velocity_net:
+        #    fusion_block, temporal_attn, temporal_norm, rotary_emb (encoder), context_pos_emb
+        vn = model.velocity_net
+        for name_m in ['fusion_block', 'temporal_attn', 'temporal_norm']:
+            mod = getattr(vn, name_m, None)
+            if mod is not None:
+                if isinstance(mod, nn.Parameter):
+                    mod.requires_grad = False
+                elif isinstance(mod, (nn.Module, nn.ModuleList)):
+                    for p in mod.parameters():
+                        p.requires_grad = False
+                frozen_modules.append(f"velocity_net.{name_m}")
+        # Freeze encoder rotary_emb (not decoder rotary_emb_decoder)
+        if vn.rotary_emb is not None:
+            for p in vn.rotary_emb.parameters():
+                p.requires_grad = False
+            frozen_modules.append("velocity_net.rotary_emb")
+        if vn.context_pos_emb is not None:
+            vn.context_pos_emb.requires_grad = False
+            frozen_modules.append("velocity_net.context_pos_emb")
+
+        n_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(
+            "Frozen encoder modules: %s", ", ".join(frozen_modules)
+        )
+        logger.info(
+            "Parameters — frozen: %s, trainable: %s",
+            f"{n_frozen:,}", f"{n_trainable:,}",
+        )
+
+    # --- Optimizer & Scheduler (only trainable params) ---
+    tr_cfg = cfg["training"]
+    accum_steps = max(1, int(tr_cfg.get("gradient_accumulation_steps", 1)))
+    opt_steps_per_epoch = max(1, (len(train_loader) + accum_steps - 1) // accum_steps)
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        trainable_params, lr=tr_cfg["lr"], weight_decay=tr_cfg["weight_decay"],
+    )
+
+    total_steps = 2 if args.fast_dev_run else opt_steps_per_epoch * tr_cfg["n_epochs"]
+    warmup_steps = int(total_steps * tr_cfg.get("warmup_ratio", 0.05))
+    min_lr = tr_cfg.get("min_lr", 1e-6)
+    base_lr = tr_cfg["lr"]
+
+    def cosine_with_warmup(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return min_lr / base_lr + (1 - min_lr / base_lr) * 0.5 * (1 + pymath.cos(pymath.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_with_warmup)
+
+    ema_on_cpu = tr_cfg.get("ema_on_cpu", True)
+    ema = EMAModel(
+        model, decay=tr_cfg.get("ema_decay", 0.999), store_on_cpu=ema_on_cpu,
+    )
+
+    # --- Restore optimizer/scheduler/ema from resume checkpoint ---
+    if resume_ckpt is not None:
+        if not args.freeze_encoder:
+            # Only restore optimizer/scheduler state when param groups haven't changed
+            optimizer.load_state_dict(resume_ckpt["optimizer"])
+            scheduler.load_state_dict(resume_ckpt["scheduler"])
+        else:
+            logger.info(
+                "--freeze_encoder: fresh optimizer/scheduler (param groups changed). "
+                "Resuming from epoch %d with new LR schedule.",
+                start_epoch,
+            )
+        if "ema" in resume_ckpt:
+            ema.load_state_dict(resume_ckpt["ema"])
+        del resume_ckpt
+
+    gckpt = vn_params.get("gradient_checkpointing", False)
+    logger.info(
+        "Memory opts: grad_accum=%d (~%d opt-steps/epoch), EMA_on_cpu=%s, "
+        "velocity_grad_ckpt=%s",
+        accum_steps, opt_steps_per_epoch, ema_on_cpu, gckpt,
+    )
+    logger.info("EMA decay=%.4f", ema.decay)
 
     history_file = out_dir / "history.csv"
 
@@ -297,10 +360,22 @@ def train(args):
                 context = torch.zeros_like(context)
 
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
+                # When encoder is frozen, run it under no_grad to avoid
+                # storing its computation graph (saves significant VRAM).
+                if args.freeze_encoder:
+                    with torch.no_grad():
+                        pre_ctx = model.velocity_net.encode_context_from_cond(context)
+                    pre_ctx = pre_ctx.detach()
+                    del context  # free raw context (~418 MiB) — not needed anymore
+                else:
+                    pre_ctx = None
+
                 losses = model.compute_loss(
-                    context, target,
+                    None if args.freeze_encoder else context,
+                    target,
                     subject_ids=subject_ids,
                     skip_aux=cfg_drop,
+                    pre_encoded_context=pre_ctx,
                 )
                 raw_loss = losses["total_loss"]
                 loss = raw_loss / accum_steps
@@ -481,6 +556,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output-dir", type=str, default=None,
         help="Override output_dir from config (used by ensemble scripts).",
+    )
+    parser.add_argument(
+        "--freeze_encoder", action="store_true",
+        help="Freeze HRF source + multitoken encoder; only train velocity net decoder.",
     )
     args = parser.parse_args()
     train(args)

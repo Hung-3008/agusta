@@ -126,6 +126,7 @@ class BrainFlow(nn.Module):
         subject_ids: torch.Tensor = None,
         starting_distribution: torch.Tensor = None,
         skip_aux: bool = False,
+        pre_encoded_context: torch.Tensor = None,
     ) -> dict[str, torch.Tensor]:
         """Compute flow + regression + contrastive loss.
 
@@ -139,12 +140,17 @@ class BrainFlow(nn.Module):
             subject_ids: (B,) long tensor of subject indices.
             skip_aux: if True, skip regression and contrastive losses (used when
                       context is zeroed out for CFG unconditional training).
+            pre_encoded_context: optional pre-computed context encoding (e.g. when
+                      the encoder is frozen and run under torch.no_grad()).
 
         Returns:
             dict with keys: total_loss, flow_loss, align_loss, cont_loss, gamma_reg.
         """
         # 1. Encode context once (shared)
-        context_encoded = self.velocity_net.encode_context_from_cond(context)
+        if pre_encoded_context is not None:
+            context_encoded = pre_encoded_context
+        else:
+            context_encoded = self.velocity_net.encode_context_from_cond(context)
 
         # 2. Regression branch with gradient isolation (NSD improvement)
         # .detach() prevents regression from pulling the shared encoder
@@ -162,29 +168,38 @@ class BrainFlow(nn.Module):
                 ctx_transposed = ctx_detached.transpose(1, 2)
                 ctx_pooled_reg = ctx_detached.mean(dim=1)
                 
-                mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled_reg)
-                
-                if self.velocity_net.use_subject_head:
-                    if subject_ids is None:
-                        subject_ids = torch.zeros(target.shape[0], dtype=torch.long, device=target.device)
-                    fmri_pred = self.velocity_net.subject_layers(mu_phi_latent, subject_ids)
-                else:
-                    fmri_pred = mu_phi_latent
+                # When encoder is frozen (pre_encoded_context provided), run the
+                # entire CSFM branch under no_grad.  HRF source is frozen so its
+                # output is fixed; allowing gradients through subject_layers here
+                # would create conflicting signals with the flow loss path.
+                _csfm_no_grad = pre_encoded_context is not None
+                with torch.set_grad_enabled(not _csfm_no_grad):
+                    mu_phi_latent, sigma_phi = self.hrf_source(ctx_transposed, ctx_pooled_reg)
+                    
+                    if self.velocity_net.use_subject_head:
+                        if subject_ids is None:
+                            subject_ids = torch.zeros(target.shape[0], dtype=torch.long, device=target.device)
+                        fmri_pred = self.velocity_net.subject_layers(mu_phi_latent, subject_ids)
+                    else:
+                        fmri_pred = mu_phi_latent
 
-                epsilon = torch.randn_like(target)
-                x_0_csfm = fmri_pred + sigma_phi * epsilon
-                
-                # CSFM Losses
-                csfm_var_reg_loss = torch.mean(sigma_phi**2 - torch.log(sigma_phi**2 + 1e-8) - 1.0)
-                
-                # PCC loss between the clean base distribution (mu_phi) and target
-                _pred_flat = fmri_pred.flatten(1)  # (B, T*V)
-                _tgt_flat = target.flatten(1)
-                _pred_c = _pred_flat - _pred_flat.mean(dim=1, keepdim=True)
-                _tgt_c = _tgt_flat - _tgt_flat.mean(dim=1, keepdim=True)
-                _cov = (_pred_c * _tgt_c).sum(dim=1)
-                _std = torch.sqrt((_pred_c ** 2).sum(dim=1) * (_tgt_c ** 2).sum(dim=1) + 1e-8)
-                csfm_pcc_loss = (1.0 - _cov / _std).mean()
+                    epsilon = torch.randn_like(target)
+                    x_0_csfm = fmri_pred + sigma_phi * epsilon
+                    
+                    # CSFM Losses (monitoring-only when encoder is frozen)
+                    csfm_var_reg_loss = torch.mean(sigma_phi**2 - torch.log(sigma_phi**2 + 1e-8) - 1.0)
+                    
+                    # PCC loss between the clean base distribution (mu_phi) and target
+                    _pred_flat = fmri_pred.flatten(1)  # (B, T*V)
+                    _tgt_flat = target.flatten(1)
+                    _pred_c = _pred_flat - _pred_flat.mean(dim=1, keepdim=True)
+                    _tgt_c = _tgt_flat - _tgt_flat.mean(dim=1, keepdim=True)
+                    _cov = (_pred_c * _tgt_c).sum(dim=1)
+                    _std = torch.sqrt((_pred_c ** 2).sum(dim=1) * (_tgt_c ** 2).sum(dim=1) + 1e-8)
+                    csfm_pcc_loss = (1.0 - _cov / _std).mean()
+
+                if _csfm_no_grad:
+                    x_0_csfm = x_0_csfm.detach()  # clean break for flow path
 
         # 4. Flow matching source distribution (x_0)
         x_1 = target
