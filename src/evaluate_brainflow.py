@@ -292,6 +292,157 @@ class ModelRunner:
             preds_seed_avg.append(s_avg)
         return pred_avg, valid, preds_seed_avg
 
+    @torch.inference_mode()
+    def run_all_clips(
+        self,
+        clip_windows: dict[str, list[dict]],
+        clip_n_trs: dict[str, int],
+        subject_id: int,
+        n_target_trs: int,
+        batch_size: int,
+        solver: SolverConfig,
+        parcel_seed_map: np.ndarray | None = None,
+        return_seed_preds: bool = False,
+        desc: str = "",
+    ) -> dict[str, tuple]:
+        """Cross-clip batched ODE inference — aggregate windows from ALL clips
+        into large GPU batches for maximum throughput.
+
+        Instead of processing ~40 windows/clip × 49 clips sequentially,
+        this pools ~2000 windows and processes them in ceil(2000/batch_size)
+        large GPU calls.
+
+        Args:
+            clip_windows:  {clip_name: [windows]} from build_seq2seq_windows.
+            clip_n_trs:    {clip_name: n_trs} total TRs per clip.
+            subject_id:    Integer subject index.
+            n_target_trs:  Number of target TRs per window.
+            batch_size:    GPU batch size (now actually used at scale).
+            solver:        ODE solver config.
+            parcel_seed_map: Optional parcel seed map for stitching.
+            return_seed_preds: If True, also return per-seed predictions.
+            desc:          tqdm description string.
+
+        Returns:
+            {clip_name: (pred_avg, valid) or (pred_avg, valid, seed_preds)}
+        """
+        synth_kw = solver.as_synth_kwargs()
+        strategy = solver.as_strategy_config()
+        effective_seeds = strategy.n_seeds if strategy.ensemble_mode not in ("none", "single") else 1
+
+        # --- Phase 1: Flatten all windows into a single array ---
+        clip_names = list(clip_windows.keys())
+        all_contexts = []       # list of (T_ctx, D) arrays
+        all_starts = []         # target_start per window
+        all_clip_idx = []       # which clip each window belongs to
+        clip_name_to_idx = {c: i for i, c in enumerate(clip_names)}
+
+        for clip_name in clip_names:
+            for w in clip_windows[clip_name]:
+                all_contexts.append(w["context"])
+                all_starts.append(w["target_start"])
+                all_clip_idx.append(clip_name_to_idx[clip_name])
+
+        total_windows = len(all_contexts)
+        if total_windows == 0:
+            return {}
+
+        all_ctx_np = np.stack(all_contexts)    # (N_total, T_ctx, D)
+        all_starts_np = np.array(all_starts, dtype=np.int64)
+        all_clip_idx_np = np.array(all_clip_idx, dtype=np.int64)
+        del all_contexts, all_starts, all_clip_idx
+
+        # --- Phase 2: Allocate per-clip accumulators ---
+        accums = {}
+        for clip_name in clip_names:
+            n_trs = clip_n_trs[clip_name]
+            accums[clip_name] = {
+                "pred_sum": np.zeros((n_trs, self.n_voxels), dtype=np.float64),
+                "pred_count": np.zeros(n_trs, dtype=np.float64),
+            }
+            if return_seed_preds:
+                accums[clip_name]["seed_sums"] = [
+                    np.zeros((n_trs, self.n_voxels), dtype=np.float64)
+                    for _ in range(effective_seeds)
+                ]
+                accums[clip_name]["seed_counts"] = [
+                    np.zeros(n_trs, dtype=np.float64)
+                    for _ in range(effective_seeds)
+                ]
+
+        # --- Phase 3: Process in large cross-clip batches ---
+        n_batches = (total_windows + batch_size - 1) // batch_size
+        pbar = tqdm(
+            range(0, total_windows, batch_size),
+            desc=desc or "batches",
+            total=n_batches,
+        )
+
+        for bi in pbar:
+            be = min(bi + batch_size, total_windows)
+            B = be - bi
+
+            ctx = torch.from_numpy(all_ctx_np[bi:be]).to(self.device)
+            subj = torch.full((B,), subject_id, dtype=torch.long, device=self.device)
+
+            pred_agg, preds_by_seed = run_multiseed_synthesis(
+                model=self.model,
+                context=ctx,
+                subject_ids=subj,
+                synth_kwargs=synth_kw,
+                strategy=strategy,
+                parcel_seed_map=parcel_seed_map,
+            )
+            pred_np = pred_agg.float().cpu().numpy()
+            pred_np_by_seed = [p.float().cpu().numpy() for p in preds_by_seed] if return_seed_preds else []
+
+            # Scatter results back to per-clip accumulators
+            batch_clip_idx = all_clip_idx_np[bi:be]
+            batch_starts = all_starts_np[bi:be]
+
+            for j in range(B):
+                clip_name = clip_names[batch_clip_idx[j]]
+                acc = accums[clip_name]
+                n_trs = clip_n_trs[clip_name]
+                ts = batch_starts[j]
+                for off in range(n_target_trs):
+                    tr = ts + off
+                    if tr >= n_trs:
+                        break
+                    acc["pred_sum"][tr] += pred_np[j, off]
+                    acc["pred_count"][tr] += 1
+                    if return_seed_preds:
+                        for si in range(len(pred_np_by_seed)):
+                            acc["seed_sums"][si][tr] += pred_np_by_seed[si][j, off]
+                            acc["seed_counts"][si][tr] += 1
+
+            del ctx, subj, pred_agg, preds_by_seed
+            torch.cuda.empty_cache()
+
+        del all_ctx_np
+
+        # --- Phase 4: Reduce accumulators to final predictions ---
+        results = {}
+        for clip_name in clip_names:
+            acc = accums[clip_name]
+            n_trs = clip_n_trs[clip_name]
+            valid = acc["pred_count"] > 0
+            pred_avg = np.zeros((n_trs, self.n_voxels), dtype=np.float32)
+            pred_avg[valid] = (acc["pred_sum"][valid] / acc["pred_count"][valid, None]).astype(np.float32)
+
+            if not return_seed_preds:
+                results[clip_name] = (pred_avg, valid)
+            else:
+                preds_seed_avg = []
+                for si in range(effective_seeds):
+                    s_valid = acc["seed_counts"][si] > 0
+                    s_avg = np.zeros((n_trs, self.n_voxels), dtype=np.float32)
+                    s_avg[s_valid] = (acc["seed_sums"][si][s_valid] / acc["seed_counts"][si][s_valid, None]).astype(np.float32)
+                    preds_seed_avg.append(s_avg)
+                results[clip_name] = (pred_avg, valid, preds_seed_avg)
+
+        return results
+
 
 # =============================================================================
 # Data helpers
@@ -456,7 +607,12 @@ def pcc(pred: np.ndarray, target: np.ndarray) -> np.ndarray:
 
 def run_s6(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
            args, solver: SolverConfig):
-    """Per-subject S6 PCC evaluation. Saves results under {output_dir}/eval_s6/."""
+    """Per-subject S6 PCC evaluation with cross-clip batching.
+
+    Instead of processing clips one-by-one (~40 windows each × 49 clips =
+    49 tiny GPU calls), this pre-builds ALL windows and processes them in
+    large batches (e.g. 4 batches of 512 = ~2000 windows total).
+    """
     sw = cfg["sliding_window"]
     context_trs  = sw["context_trs"]
     n_target_trs = sw["n_target_trs"]
@@ -516,44 +672,75 @@ def run_s6(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
     for subject in runner.subjects:
         sid = runner.subject_to_idx[subject]
         log.info("\n%s %s %s", "=" * 20, subject, "=" * 20)
-        all_pred, all_tgt = [], []
-        all_tgt_for_calib = []
-        seed_preds_for_calib = [[] for _ in range(max(1, int(solver.n_seeds)))]
-        clip_pccs = {}
 
-        for clip in tqdm(clips, desc=subject):
+        # --- Phase 1: Pre-load all clips & build all windows ---
+        clip_fmri_gt = {}       # {clip: fmri_gt array}
+        clip_windows = {}       # {clip: [windows]}
+        clip_n_trs = {}         # {clip: n_trs}
+        skipped = 0
+
+        for clip in clips:
             norm = clip.removeprefix("friends_")
-
             fmri_gt = load_fmri_clip(fmri_dir, subject, "friends", norm,
                                      excl_s, excl_e, stats if use_stats else None)
             if fmri_gt is None:
                 log.warning("  No fMRI: %s", clip)
+                skipped += 1
                 continue
 
             ctx = load_context_clip(context_dirs, "friends", "s6", clip, expected_dims=cfg.get("modality_dims"))
             if ctx is None:
                 log.warning("  No context: %s", clip)
+                skipped += 1
                 continue
 
             windows = build_seq2seq_windows(ctx, fmri_gt.shape[0], context_trs,
                                             n_target_trs, hrf_delay, excl_s, stride)
             if not windows:
+                skipped += 1
                 continue
 
-            run_out = runner.run_windows(
-                windows,
-                sid,
-                fmri_gt.shape[0],
-                n_target_trs,
-                args.batch_size,
-                solver,
-                parcel_seed_map=None,
-                return_seed_preds=need_calibration,
-            )
+            clip_fmri_gt[clip] = fmri_gt
+            clip_windows[clip] = windows
+            clip_n_trs[clip] = fmri_gt.shape[0]
+
+        total_windows = sum(len(w) for w in clip_windows.values())
+        log.info("  Prepared %d clips (%d skipped), %d total windows → batch_size=%d → %d GPU calls",
+                 len(clip_windows), skipped, total_windows, args.batch_size,
+                 (total_windows + args.batch_size - 1) // args.batch_size)
+
+        if not clip_windows:
+            log.warning("  No valid clips for %s", subject)
+            continue
+
+        # --- Phase 2: Cross-clip batched inference ---
+        batch_results = runner.run_all_clips(
+            clip_windows=clip_windows,
+            clip_n_trs=clip_n_trs,
+            subject_id=sid,
+            n_target_trs=n_target_trs,
+            batch_size=args.batch_size,
+            solver=solver,
+            parcel_seed_map=None,
+            return_seed_preds=need_calibration,
+            desc=subject,
+        )
+
+        # --- Phase 3: Compute per-clip PCC from batched results ---
+        all_pred, all_tgt = [], []
+        all_tgt_for_calib = []
+        seed_preds_for_calib = [[] for _ in range(max(1, int(solver.n_seeds)))]
+        clip_pccs = {}
+
+        for clip in clips:
+            if clip not in batch_results:
+                continue
+
+            fmri_gt = clip_fmri_gt[clip]
             if need_calibration:
-                pred_avg, valid, seed_preds = run_out
+                pred_avg, valid, seed_preds = batch_results[clip]
             else:
-                pred_avg, valid = run_out
+                pred_avg, valid = batch_results[clip]
 
             if valid.sum() < 2:
                 continue
@@ -568,7 +755,6 @@ def run_s6(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
                 all_tgt_for_calib.append(fmri_gt[valid])
                 for si in range(len(seed_preds)):
                     seed_preds_for_calib[si].append(seed_preds[si][valid])
-            del ctx, fmri_gt, pred_avg
 
         if all_pred:
             g_pcc = pcc(np.concatenate(all_pred), np.concatenate(all_tgt))
@@ -603,7 +789,7 @@ def run_s6(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
                 }
                 log.info("Calibration saved in-memory for %s (%d parcels)", subject, best_seed_map.shape[0])
 
-        del all_pred, all_tgt
+        del all_pred, all_tgt, clip_fmri_gt, clip_windows, batch_results
         gc.collect(); torch.cuda.empty_cache()
 
     # Summary table
@@ -634,7 +820,7 @@ def run_s6(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
 
 def run_s7(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
            args, solver: SolverConfig):
-    """Generate Friends S7 blind submission (in-distribution test)."""
+    """Generate Friends S7 blind submission with cross-clip batching."""
     sw = cfg["sliding_window"]
     context_trs  = sw["context_trs"]
     n_target_trs = sw["n_target_trs"]
@@ -694,42 +880,68 @@ def run_s7(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
                 log.warning("No parcel seed map for %s. Falling back to mean ensemble.", subject)
         log.info("\n%s %s %s", "=" * 20, subject, "=" * 20)
         samples = _load_s7_samples(subject)
-        subj_dict = {}
 
-        for epi, n_trs in tqdm(samples.items(), desc=subject):
+        # --- Phase 1: Pre-load all episodes & build all windows ---
+        clip_windows = {}       # {epi: [windows]}
+        clip_n_trs = {}         # {epi: n_trs}
+        zero_episodes = {}      # {epi: n_trs} for episodes with no context
+
+        for epi, n_trs in samples.items():
             clip = f"friends_{epi}"
             ctx = load_context_clip(context_dirs, "friends", "s7", clip, expected_dims=cfg.get("modality_dims"))
 
             if ctx is None or ctx.shape[0] == 0:
                 log.warning("  No context: %s — emitting zeros", clip)
-                subj_dict[epi] = np.zeros((n_trs, n_voxels), dtype=np.float32)
+                zero_episodes[epi] = n_trs
                 continue
 
             windows = build_s7_windows(ctx, n_trs, context_trs, n_target_trs, hrf_delay, stride)
             if not windows:
-                subj_dict[epi] = np.zeros((n_trs, n_voxels), dtype=np.float32)
+                zero_episodes[epi] = n_trs
                 continue
 
-            pred_avg, valid = runner.run_windows(
-                windows,
-                sid,
-                n_trs,
-                n_target_trs,
-                args.batch_size,
-                solver,
+            clip_windows[epi] = windows
+            clip_n_trs[epi] = n_trs
+
+        total_windows = sum(len(w) for w in clip_windows.values())
+        log.info("  Prepared %d episodes (%d zero-fill), %d total windows → %d GPU calls",
+                 len(clip_windows), len(zero_episodes), total_windows,
+                 (total_windows + args.batch_size - 1) // args.batch_size)
+
+        # --- Phase 2: Cross-clip batched inference ---
+        subj_dict = {}
+
+        # Fill zero episodes
+        for epi, n_trs in zero_episodes.items():
+            subj_dict[epi] = np.zeros((n_trs, n_voxels), dtype=np.float32)
+
+        if clip_windows:
+            batch_results = runner.run_all_clips(
+                clip_windows=clip_windows,
+                clip_n_trs=clip_n_trs,
+                subject_id=sid,
+                n_target_trs=n_target_trs,
+                batch_size=args.batch_size,
+                solver=solver,
                 parcel_seed_map=subject_seed_map,
                 return_seed_preds=False,
+                desc=subject,
             )
 
-            # Denormalize if trained with z-score
-            if use_stats and subject in stats:
-                s = stats[subject]
-                pred_avg = pred_avg * s["std"] + s["mean"]
+            # --- Phase 3: Collect results ---
+            for epi in clip_windows:
+                pred_avg, valid = batch_results[epi]
 
-            pred_avg = np.nan_to_num(pred_avg, nan=0.0)
-            subj_dict[epi] = pred_avg.astype(np.float32)
-            log.info("  %s: %d/%d TRs predicted", epi, int(valid.sum()), n_trs)
-            del ctx, windows, pred_avg
+                # Denormalize if trained with z-score
+                if use_stats and subject in stats:
+                    s = stats[subject]
+                    pred_avg = pred_avg * s["std"] + s["mean"]
+
+                pred_avg = np.nan_to_num(pred_avg, nan=0.0)
+                subj_dict[epi] = pred_avg.astype(np.float32)
+                log.info("  %s: %d/%d TRs predicted", epi, int(valid.sum()), clip_n_trs[epi])
+
+            del batch_results
 
         np.save(out_path, subj_dict)
         subj_paths[subject] = out_path
@@ -746,8 +958,7 @@ def run_s7(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
 
 def run_ood(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
             args, solver: SolverConfig):
-    """Generate OOD blind submission (movies: chaplin, mononoke, passepartout,
-    planetearth, pulpfiction, wot — each split into part 1 and 2).
+    """Generate OOD blind submission with cross-clip batching.
 
     Feature path:  {ctx_dir}/ood/{movie}/{clip_key}.npy
     Sample file:   sub-XX_ood_fmri_samples.npy → {'chaplin1': 432, ...}
@@ -810,41 +1021,65 @@ def run_ood(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
                 log.warning("No parcel seed map for %s. Falling back to mean ensemble.", subject)
         log.info("\n%s %s %s", "=" * 20, subject, "=" * 20)
         samples = _load_ood_samples(subject)  # {'chaplin1': 432, 'chaplin2': 405, ...}
-        subj_dict = {}
 
-        for clip_key, n_trs in tqdm(samples.items(), desc=subject):
-            # clip_key = 'chaplin1' → movie = 'chaplin', feature at ood/chaplin/chaplin1.npy
+        # --- Phase 1: Pre-load all clips & build all windows ---
+        clip_windows = {}
+        clip_n_trs = {}
+        zero_clips = {}
+
+        for clip_key, n_trs in samples.items():
             ctx = load_context_clip(context_dirs, "ood", None, clip_key, expected_dims=cfg.get("modality_dims"))
 
             if ctx is None or ctx.shape[0] == 0:
                 log.warning("  No context: %s — emitting zeros", clip_key)
-                subj_dict[clip_key] = np.zeros((n_trs, n_voxels), dtype=np.float32)
+                zero_clips[clip_key] = n_trs
                 continue
 
             windows = build_s7_windows(ctx, n_trs, context_trs, n_target_trs, hrf_delay, stride)
             if not windows:
-                subj_dict[clip_key] = np.zeros((n_trs, n_voxels), dtype=np.float32)
+                zero_clips[clip_key] = n_trs
                 continue
 
-            pred_avg, valid = runner.run_windows(
-                windows,
-                sid,
-                n_trs,
-                n_target_trs,
-                args.batch_size,
-                solver,
+            clip_windows[clip_key] = windows
+            clip_n_trs[clip_key] = n_trs
+
+        total_windows = sum(len(w) for w in clip_windows.values())
+        log.info("  Prepared %d clips (%d zero-fill), %d total windows → %d GPU calls",
+                 len(clip_windows), len(zero_clips), total_windows,
+                 (total_windows + args.batch_size - 1) // args.batch_size)
+
+        # --- Phase 2: Cross-clip batched inference ---
+        subj_dict = {}
+
+        for ck, nt in zero_clips.items():
+            subj_dict[ck] = np.zeros((nt, n_voxels), dtype=np.float32)
+
+        if clip_windows:
+            batch_results = runner.run_all_clips(
+                clip_windows=clip_windows,
+                clip_n_trs=clip_n_trs,
+                subject_id=sid,
+                n_target_trs=n_target_trs,
+                batch_size=args.batch_size,
+                solver=solver,
                 parcel_seed_map=subject_seed_map,
                 return_seed_preds=False,
+                desc=subject,
             )
 
-            if use_stats and subject in stats:
-                s = stats[subject]
-                pred_avg = pred_avg * s["std"] + s["mean"]
+            # --- Phase 3: Collect results ---
+            for clip_key in clip_windows:
+                pred_avg, valid = batch_results[clip_key]
 
-            pred_avg = np.nan_to_num(pred_avg, nan=0.0)
-            subj_dict[clip_key] = pred_avg.astype(np.float32)
-            log.info("  %s: %d/%d TRs predicted", clip_key, int(valid.sum()), n_trs)
-            del ctx, windows, pred_avg
+                if use_stats and subject in stats:
+                    s = stats[subject]
+                    pred_avg = pred_avg * s["std"] + s["mean"]
+
+                pred_avg = np.nan_to_num(pred_avg, nan=0.0)
+                subj_dict[clip_key] = pred_avg.astype(np.float32)
+                log.info("  %s: %d/%d TRs predicted", clip_key, int(valid.sum()), clip_n_trs[clip_key])
+
+            del batch_results
 
         np.save(out_path, subj_dict)
         subj_paths[subject] = out_path
