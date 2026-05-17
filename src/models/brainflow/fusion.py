@@ -104,11 +104,16 @@ class MultiTokenFusion(nn.Module):
                 torch.rand(B, 1, self.n_modalities, device=projected[0].device)
                 > self.modality_dropout
             )
+            # Ensure at least one modality survives
             all_dropped = (keep_mask.sum(dim=2, keepdim=True) == 0)
             keep_mask[:, :, 0:1] = torch.max(keep_mask[:, :, 0:1], all_dropped)
 
+            # Inverted dropout: scale by 1/(1-p) so expected value matches inference.
+            # Without this, concat vector magnitude is lower during training (some
+            # slots zeroed) than inference (all active), causing train/test mismatch.
+            scale = 1.0 / (1.0 - self.modality_dropout)
             for i in range(self.n_modalities):
-                projected[i] = projected[i] * keep_mask[:, :, i:i+1]
+                projected[i] = projected[i] * keep_mask[:, :, i:i+1] * scale
 
         if self.fusion_mode == "mean":
             x = torch.stack(projected, dim=0).mean(dim=0)

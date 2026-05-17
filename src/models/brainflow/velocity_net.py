@@ -6,7 +6,7 @@ from torch.utils.checkpoint import checkpoint
 from .components import SinusoidalPosEmb, RotaryEmbedding, RoPETransformerEncoderLayer
 from .subject_layers import SubjectLayers, NetworkSubjectLayers
 from .fusion import MultiTokenFusion
-from .backbones import DiTXBackbone, DiT1DBackbone
+from .backbones import DiTXBackbone, DiT1DBackbone, DiTOriginalBackbone, DiTHybridBackbone, DiTJointBackbone
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,8 @@ class VelocityNet(nn.Module):
         dit_num_blocks: int | None = None,
         decoder_type: str = "ditx",
         zero_init_network_heads: bool = False,
+        cross_attn_every_n: int = 4,
+        stochastic_depth_rate: float = 0.0,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -154,6 +156,30 @@ class VelocityNet(nn.Module):
                 dit_depth=dit_depth
             )
             logger.info("Backbone: DiTXBackbone (%d blocks)", dit_depth)
+        elif decoder_type == "dit_original":
+            self.backbone = DiTOriginalBackbone(
+                d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
+                dropout=dropout, time_dim=hidden_dim, rotary_emb=self.rotary_emb_decoder,
+                dit_depth=dit_depth
+            )
+            logger.info("Backbone: DiTOriginalBackbone (%d blocks)", dit_depth)
+        elif decoder_type == "dit_hybrid":
+            self.backbone = DiTHybridBackbone(
+                d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
+                dropout=dropout, time_dim=hidden_dim, rotary_emb=self.rotary_emb_decoder,
+                dit_depth=dit_depth, cross_attn_every_n=cross_attn_every_n,
+                stochastic_depth_rate=stochastic_depth_rate,
+            )
+            n_ca = sum(1 for i in range(dit_depth) if (i + 1) % cross_attn_every_n == 0)
+            logger.info("Backbone: DiTHybridBackbone (%d blocks, %d cross-attn every %d)",
+                        dit_depth, n_ca, cross_attn_every_n)
+        elif decoder_type == "dit_joint":
+            self.backbone = DiTJointBackbone(
+                d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
+                dropout=dropout, time_dim=hidden_dim, rotary_emb=self.rotary_emb_decoder,
+                dit_depth=dit_depth
+            )
+            logger.info("Backbone: DiTJointBackbone (MMDiT, %d blocks, bidirectional context)", dit_depth)
         else:
             self.backbone = DiT1DBackbone(
                 d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
