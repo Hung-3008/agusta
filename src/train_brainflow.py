@@ -332,6 +332,12 @@ def train(args):
     val_solver_method = solver_cfg.get("method", "midpoint")
     val_cfg_scale = solver_cfg.get("cfg_scale", 0.0)
     val_temperature = solver_cfg.get("temperature", 0.0)
+    tta_temperatures = solver_cfg.get("tta_temperatures", None)
+    if tta_temperatures:
+        logger.info("Val TTA enabled: averaging over temperatures=%s", tta_temperatures)
+
+    train_cfg_drop_rate = float(bf_cfg.get("train_cfg_drop_rate", 0.1))
+    logger.info("Train CFG drop rate: %.2f", train_cfg_drop_rate)
 
     context_bf16 = tr_cfg.get("context_bf16_when_amp", True)
     pin = cfg.get("dataloader", {}).get("pin_memory", False)
@@ -355,7 +361,7 @@ def train(args):
                 context = context.to(dtype=torch.bfloat16)
                 target = target.to(dtype=torch.bfloat16)
 
-            cfg_drop = random.random() < 0.1
+            cfg_drop = random.random() < train_cfg_drop_rate
             if cfg_drop:
                 context = torch.zeros_like(context)
 
@@ -445,7 +451,15 @@ def train(args):
                     if val_cfg_scale > 0:
                         synth_kwargs["cfg_scale"] = val_cfg_scale
 
-                    gen_fmri = model.synthesise(context, **synth_kwargs)
+                    if tta_temperatures:
+                        gen_acc = None
+                        for tta_t in tta_temperatures:
+                            synth_kwargs["temperature"] = float(tta_t)
+                            g = model.synthesise(context, **synth_kwargs)
+                            gen_acc = g if gen_acc is None else gen_acc + g
+                        gen_fmri = gen_acc / len(tta_temperatures)
+                    else:
+                        gen_fmri = model.synthesise(context, **synth_kwargs)
 
                     clip_keys = batch["clip_key"]
                     target_tr_starts = batch["target_tr_start"]
