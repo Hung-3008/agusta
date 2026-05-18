@@ -89,3 +89,83 @@ class NetworkSubjectLayers(nn.Module):
         """
         parts = [head(x, subject_ids) for head in self.heads]
         return torch.cat(parts, dim=-1)
+
+
+class VoxelPersonalityHead(nn.Module):
+    """Bilinear factorization of per-subject output head.
+
+    Replaces (n_subjects, latent_dim, n_voxels) per-subject weight tensor
+    with a low-rank factorization:
+
+        V  ∈ R^(n_voxels × d_v)             — voxel embeddings (shared across subjects)
+        W  ∈ R^(n_subjects × latent_dim × d_v) — per-subject projector
+        b  ∈ R^(n_subjects × n_voxels)        — per-subject bias (optional)
+
+        y[s, v] = (z · W[s]) · V[v]^T + b[s, v]
+
+    Voxels live in a learned d_v-dimensional embedding space, so functionally
+    similar voxels (same Yeo/Schaefer parcel, nearby cortical surface) naturally
+    cluster and share readout dynamics. Subject-specific variance is captured
+    by the smaller W tensor instead of duplicating the full readout matrix.
+
+    Param count (with n_subjects=4, latent_dim=1024, n_voxels=1000, d_v=128):
+        V:    n_voxels * d_v                    = 128,000
+        W:    n_subjects * latent_dim * d_v     = 524,288
+        b:    n_subjects * n_voxels             =   4,000
+        TOTAL ≈ 656K   vs. NetworkSubjectLayers ≈ 4.1M  (≈ 6× fewer)
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        n_voxels: int,
+        n_subjects: int,
+        voxel_dim: int = 128,
+        bias: bool = True,
+        zero_init_w: bool = True,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.n_voxels = n_voxels
+        self.n_subjects = n_subjects
+        self.voxel_dim = voxel_dim
+
+        # Voxel embeddings — small random init, will learn parcel structure.
+        self.V = nn.Parameter(torch.randn(n_voxels, voxel_dim) * (1.0 / voxel_dim ** 0.5))
+
+        # Per-subject projection. Zero-init keeps warm-started trunk safe:
+        # output at step 0 = bias only.
+        if zero_init_w:
+            self.W = nn.Parameter(torch.zeros(n_subjects, latent_dim, voxel_dim))
+        else:
+            self.W = nn.Parameter(
+                torch.randn(n_subjects, latent_dim, voxel_dim) * (1.0 / latent_dim ** 0.5)
+            )
+
+        self.bias = nn.Parameter(torch.zeros(n_subjects, n_voxels)) if bias else None
+
+        logger.info(
+            "VoxelPersonalityHead: V(%d,%d) + W(%d,%d,%d) + bias=%s = %d params (vs flat %d)",
+            n_voxels, voxel_dim,
+            n_subjects, latent_dim, voxel_dim,
+            bias,
+            n_voxels * voxel_dim + n_subjects * latent_dim * voxel_dim
+                + (n_subjects * n_voxels if bias else 0),
+            n_subjects * latent_dim * n_voxels,
+        )
+
+    def forward(self, z: torch.Tensor, subject_ids: torch.Tensor) -> torch.Tensor:
+        W_s = self.W[subject_ids]  # (B, latent_dim, voxel_dim)
+        if z.dim() == 3:
+            # Seq2seq: (B, T, latent_dim) → (B, T, voxel_dim) → (B, T, n_voxels)
+            q = torch.einsum("btd,bds->bts", z, W_s)
+            y = torch.einsum("bts,vs->btv", q, self.V)
+            if self.bias is not None:
+                y = y + self.bias[subject_ids].unsqueeze(1)
+        else:
+            # Single-step: (B, latent_dim) → (B, voxel_dim) → (B, n_voxels)
+            q = torch.einsum("bd,bds->bs", z, W_s)
+            y = torch.einsum("bs,vs->bv", q, self.V)
+            if self.bias is not None:
+                y = y + self.bias[subject_ids]
+        return y

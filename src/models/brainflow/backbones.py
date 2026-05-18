@@ -367,9 +367,11 @@ class DiTXBackbone(nn.Module):
     following the paper convention for aggregating depth information.
     """
 
-    def __init__(self, d_model, nhead, dim_feedforward, dropout, time_dim, rotary_emb, dit_depth):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout, time_dim, rotary_emb,
+                 dit_depth, stochastic_depth_rate: float = 0.0):
         super().__init__()
         self.gradient_checkpointing = False
+        self.stochastic_depth_rate = stochastic_depth_rate
         self.blocks = nn.ModuleList([
             DiTXBlock(
                 d_model=d_model,
@@ -386,8 +388,22 @@ class DiTXBackbone(nn.Module):
         # Block sources: list of completed block summaries
         # b_0 = initial token embedding (always included)
         block_list = [h]  # list of (B, T, D) tensors
+        depth = len(self.blocks)
 
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            # Stochastic depth: linearly increasing drop probability across depth.
+            # When dropped, the block's contribution to the final sum is zero;
+            # the running tensor h is left unchanged so subsequent blocks see
+            # an intact source list (with the dropped slot occupied by zeros).
+            if (
+                self.training
+                and self.stochastic_depth_rate > 0
+                and depth > 1
+                and torch.rand(1).item() < i / (depth - 1) * self.stochastic_depth_rate
+            ):
+                block_list.append(torch.zeros_like(h))
+                continue
+
             sources = torch.stack(block_list, dim=0)  # (N_src, B, T, D)
             if self.gradient_checkpointing and self.training:
                 h, block_summary = checkpoint(
