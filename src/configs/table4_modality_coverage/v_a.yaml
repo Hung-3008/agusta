@@ -1,0 +1,121 @@
+# =====================================================================
+# Table 4 — Modality Coverage: Row 4 — V + A
+# Vision + Audio: V-JEPA2, DINOv2-G, InternVL3-8B, InternVL3-14B, VLM2Vec, Whisper
+# Architecture: DiT-L, full SISFM, all subjects, 80 epochs (ablation scale)
+# =====================================================================
+
+data_root: Data
+
+fmri:
+  dir: algonauts_2025.competitors/fmri
+  n_voxels: 1000
+  excluded_samples_start: 5
+  excluded_samples_end: 5
+  hrf_delay: 2
+  use_global_stats: true
+
+# Vision + Audio: 6 backbones
+context_latent_dirs:
+  - Data/features_npy_pooled/vjepa2_avg_feat      # V-JEPA2        [V]
+  - Data/features_npy_pooled/dinov2_giant          # DINOv2-Giant   [V]
+  - Data/features_npy_pooled/internvl3_8b_8bit     # InternVL3-8B   [V]
+  - Data/features_npy_pooled/InternVL3_14B         # InternVL3-14B  [V]
+  - Data/features_npy_pooled/vlm2vec_7b            # VLM2Vec        [V]
+  - Data/features_npy_pooled/whisper               # Whisper        [A]
+
+modality_dims:
+  - 1408   # V-JEPA2
+  - 6144   # DINOv2-Giant
+  - 3584   # InternVL3-8B
+  - 5120   # InternVL3-14B
+  - 3584   # VLM2Vec
+  - 1280   # Whisper
+
+subjects:
+  - sub-01
+  - sub-02
+  - sub-03
+  - sub-05
+
+splits:
+  friends:
+    train: [s1, s2, s3, s4, s5]
+    val: [s6]
+  movie10:
+    train: [bourne, figures, life, wolf]
+    val: []
+
+sliding_window:
+  context_trs: 101
+  n_target_trs: 50
+  stride: 10
+  temporal_jitter: 2
+
+dataloader:
+  batch_size: 64
+  val_batch_size: 64
+  num_workers: 0
+  pin_memory: true
+
+model_version: v6
+
+brainflow:
+  output_dim: 1000
+
+  use_regression: false
+  use_csfm: true
+  csfm_var_reg_weight: 0.1
+  csfm_pcc_weight: 1.0
+  indi_flow_matching: true
+  indi_train_time_sqrt: false
+  indi_min_denom: 1.0e-3
+  flow_loss_weight: 1.0
+
+  velocity_net:
+    hidden_dim: 1024
+    dit_num_blocks: 24
+    n_heads: 16
+    dropout: 0.1
+    context_trs: 101
+    n_target_trs: 50
+    temporal_attn_layers: 4
+    gradient_checkpointing: true
+    use_subject_head: true
+    network_head: true
+    use_rope: true
+    latent_dim: 1024
+    context_encoder: multitoken
+    use_dit_decoder: true
+    decoder_type: ditx
+    zero_init_network_heads: true
+    proj_dim: 256
+    n_blocks: 4
+    modality_dropout: 0.0
+    max_seq_len: 101
+    fusion_mode: concat
+    fusion_proj_dim: 512
+
+solver_args:
+  method: midpoint
+  time_points: 30
+  cfg_scale: 0.0
+  temperature: 0.05
+  time_grid_warp: sqrt
+
+training:
+  n_epochs: 80
+  lr: 1.0e-4
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  use_amp: true
+  log_every_n_steps: 20
+  val_every_n_epochs: 10
+  ema_decay: 0.999
+  gradient_accumulation_steps: 8
+  ema_on_cpu: true
+  context_bf16_when_amp: true
+  empty_cuda_cache_each_epoch: false
+
+output_dir: outputs/table4_modality/v_a

@@ -15,8 +15,13 @@ Decoder types:
         Context is added once to x_t_emb before entering the block stack.
     ``use_dit_decoder: false``: FiLM + cross-attention (oldest legacy path).
 
+Ablation mode — ``use_regression=True``:
+    Same DiT-X architecture, deterministic MSE regression (Table 3 ablation).
+    The backbone is called at t=0 with x=zeros; no ODE integration at inference.
+
 Usage:
         python src/train_brainflow.py --config src/configs/brainflow.yaml
+        python src/train_brainflow_regression.py --config src/configs/brainflow_ablation_regression_ditx.yaml
 """
 
 import logging
@@ -54,6 +59,8 @@ class BrainFlow(nn.Module):
         csfm_var_reg_weight: float = 0.1,
         csfm_pcc_weight: float = 1.0,
         flow_loss_weight: float = 1.0,
+        # --- Regression ablation (Table 3) ---
+        use_regression: bool = False,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -64,6 +71,13 @@ class BrainFlow(nn.Module):
         self.csfm_var_reg_weight = csfm_var_reg_weight
         self.csfm_pcc_weight = csfm_pcc_weight
         self.flow_loss_weight = flow_loss_weight
+        self.use_regression = use_regression
+        if use_regression and use_csfm:
+            warnings.warn(
+                "use_regression=True overrides use_csfm (SISFM is not used in regression mode).",
+                stacklevel=2,
+            )
+            self.use_csfm = False
 
         vn_cfg = dict(velocity_net_params or {})
         vn_cfg.setdefault("output_dim", output_dim)
@@ -112,10 +126,11 @@ class BrainFlow(nn.Module):
         if self.use_csfm:
             logger.info("  + HRF Source: %s params", f"{csfm_params:,}")
         logger.info(
-            "Total params: %s (csfm=%s, tensor_fm=%s, modality_dims=%s)",
+            "Total params: %s (csfm=%s, tensor_fm=%s, regression=%s, modality_dims=%s)",
             f"{vn_params + csfm_params:,}",
             self.use_csfm,
             self.use_tensor_fm,
+            self.use_regression,
             vn_cfg.get('modality_dims'),
         )
 
@@ -146,6 +161,37 @@ class BrainFlow(nn.Module):
         Returns:
             dict with keys: total_loss, flow_loss, align_loss, cont_loss, gamma_reg.
         """
+        # ------------------------------------------------------------------ #
+        # Regression mode (Table 3 ablation: Regression DiT-X)               #
+        # Same DiT-X backbone; no flow matching, no SISFM; pure MSE loss.    #
+        # x is set to zeros and t=0, so the backbone acts as a deterministic #
+        # encoder-decoder mapping context → fMRI.                            #
+        # ------------------------------------------------------------------ #
+        if self.use_regression:
+            if pre_encoded_context is not None:
+                context_encoded = pre_encoded_context
+            else:
+                context_encoded = self.velocity_net.encode_context_from_cond(context)
+
+            B = target.shape[0]
+            x_zeros = torch.zeros_like(target)           # no noise input
+            t_zeros = torch.zeros(B, device=target.device, dtype=target.dtype)
+
+            pred = self.velocity_net(
+                x=x_zeros,
+                t=t_zeros,
+                pre_encoded_context=context_encoded,
+                subject_ids=subject_ids,
+            )
+            mse_loss = F.mse_loss(pred, target)
+            _zero = torch.tensor(0.0, device=target.device)
+            return {
+                "total_loss": mse_loss,
+                "flow_loss":  mse_loss,    # alias so training loop logs are consistent
+                "pcc_loss":   _zero,
+                "var_reg_loss": _zero,
+                "gamma_reg": _zero,
+            }
         # 1. Encode context once (shared)
         if pre_encoded_context is not None:
             context_encoded = pre_encoded_context
@@ -311,7 +357,13 @@ class BrainFlow(nn.Module):
         time_grid_max: float = 1.0,
         final_jump: bool = False,
     ) -> torch.Tensor:
-        """Generate fMRI by solving ODE. Supports single-TR and seq2seq modes.
+        """Generate fMRI by solving ODE (or single forward pass in regression mode).
+
+        In ``use_regression`` mode the ODE is bypassed: the backbone is called
+        once at t=0 with x=zeros, matching the training-time setup exactly.
+        This ensures the ablation inference is identical to training.
+
+        Supports single-TR and seq2seq modes.
 
         Single-step: returns (B, output_dim).
         Seq2seq:     returns (B, n_target_trs, output_dim).
@@ -337,6 +389,23 @@ class BrainFlow(nn.Module):
 
         # --- Encode context ---
         context_encoded = self.velocity_net.encode_context_from_cond(context)
+
+        # ------------------------------------------------------------------ #
+        # Regression mode: single deterministic forward pass, no ODE.        #
+        # ------------------------------------------------------------------ #
+        if self.use_regression:
+            x_zeros = torch.zeros(
+                (B, n_target, self.output_dim) if n_target > 1 else (B, self.output_dim),
+                device=device, dtype=dtype,
+            )
+            t_zeros = torch.zeros(B, device=device, dtype=dtype)
+            return self.velocity_net(
+                x=x_zeros,
+                t=t_zeros,
+                pre_encoded_context=context_encoded,
+                subject_ids=subject_ids,
+            )
+
         uncond_encoded = None
         if cfg_scale > 0:
             uncond_encoded = self.velocity_net.encode_context_from_cond(

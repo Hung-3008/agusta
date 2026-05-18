@@ -184,6 +184,7 @@ def train(args):
         csfm_var_reg_weight=bf_cfg.get("csfm_var_reg_weight", 0.1),
         csfm_pcc_weight=bf_cfg.get("csfm_pcc_weight", 1.0),
         flow_loss_weight=bf_cfg.get("flow_loss_weight", 1.0),
+        use_regression=bf_cfg.get("use_regression", False),
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -338,6 +339,13 @@ def train(args):
 
     train_cfg_drop_rate = float(bf_cfg.get("train_cfg_drop_rate", 0.1))
     logger.info("Train CFG drop rate: %.2f", train_cfg_drop_rate)
+    train_subject_drop_rate = float(bf_cfg.get("train_subject_drop_rate", 0.0))
+    n_subjects_train = len(cfg["subjects"])
+    if train_subject_drop_rate > 0:
+        logger.info(
+            "Train Subject dropout: %.2f (random subject swap, B3)",
+            train_subject_drop_rate,
+        )
 
     context_bf16 = tr_cfg.get("context_bf16_when_amp", True)
     pin = cfg.get("dataloader", {}).get("pin_memory", False)
@@ -364,6 +372,15 @@ def train(args):
             cfg_drop = random.random() < train_cfg_drop_rate
             if cfg_drop:
                 context = torch.zeros_like(context)
+
+            # B3 — Subject token dropout: randomize subject_ids occasionally so the
+            # shared trunk + subject AdaLN must produce sensible predictions even
+            # when the subject signal is corrupted, pushing generalization into
+            # the trunk instead of memorizing per-subject patterns at the head.
+            if train_subject_drop_rate > 0 and random.random() < train_subject_drop_rate:
+                subject_ids = torch.randint(
+                    0, n_subjects_train, subject_ids.shape, device=subject_ids.device
+                )
 
             with torch.amp.autocast("cuda", enabled=tr_cfg["use_amp"], dtype=torch.bfloat16):
                 # When encoder is frozen, run it under no_grad to avoid
