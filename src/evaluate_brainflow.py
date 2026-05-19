@@ -347,10 +347,9 @@ class ModelRunner:
         if total_windows == 0:
             return {}
 
-        all_ctx_np = np.stack(all_contexts)    # (N_total, T_ctx, D)
         all_starts_np = np.array(all_starts, dtype=np.int64)
         all_clip_idx_np = np.array(all_clip_idx, dtype=np.int64)
-        del all_contexts, all_starts, all_clip_idx
+        del all_starts, all_clip_idx
 
         # --- Phase 2: Allocate per-clip accumulators ---
         accums = {}
@@ -382,7 +381,8 @@ class ModelRunner:
             be = min(bi + batch_size, total_windows)
             B = be - bi
 
-            ctx = torch.from_numpy(all_ctx_np[bi:be]).to(self.device)
+            ctx_batch = np.stack(all_contexts[bi:be])
+            ctx = torch.from_numpy(ctx_batch).to(self.device)
             subj = torch.full((B,), subject_id, dtype=torch.long, device=self.device)
 
             pred_agg, preds_by_seed = run_multiseed_synthesis(
@@ -416,10 +416,10 @@ class ModelRunner:
                             acc["seed_sums"][si][tr] += pred_np_by_seed[si][j, off]
                             acc["seed_counts"][si][tr] += 1
 
-            del ctx, subj, pred_agg, preds_by_seed
+            del ctx_batch, ctx, subj, pred_agg, preds_by_seed
             torch.cuda.empty_cache()
 
-        del all_ctx_np
+        del all_contexts
 
         # --- Phase 4: Reduce accumulators to final predictions ---
         results = {}
@@ -863,6 +863,32 @@ def run_s7(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
 
     subj_paths = {}
 
+    # --- Pre-cache: load context features once into RAM (shared across subjects) ---
+    # Discover episodes from first non-resumed subject's sample counts
+    _ref_subject = None
+    for s in runner.subjects:
+        out_path = out_dir / f"{s}_predictions.npy"
+        if not (args.resume and out_path.exists()):
+            _ref_subject = s
+            break
+    if _ref_subject is None:
+        # All subjects resumed
+        for s in runner.subjects:
+            subj_paths[s] = out_dir / f"{s}_predictions.npy"
+        _save_submission(subj_paths, out_dir, tag="s7")
+        return
+
+    ref_samples = _load_s7_samples(_ref_subject)
+    context_cache = {}  # {epi: np.ndarray (T, D_total) or None}
+    log.info("Pre-caching context features for %d episodes...", len(ref_samples))
+    for epi in ref_samples:
+        clip = f"friends_{epi}"
+        ctx = load_context_clip(context_dirs, "friends", "s7", clip, expected_dims=cfg.get("modality_dims"))
+        context_cache[epi] = ctx
+        if ctx is not None:
+            log.info("  Cached %s: shape=%s", epi, ctx.shape)
+    log.info("Context cache ready (%d episodes in RAM)", len(context_cache))
+
     for subject in runner.subjects:
         out_path = out_dir / f"{subject}_predictions.npy"
         if args.resume and out_path.exists():
@@ -881,16 +907,16 @@ def run_s7(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
         log.info("\n%s %s %s", "=" * 20, subject, "=" * 20)
         samples = _load_s7_samples(subject)
 
-        # --- Phase 1: Pre-load all episodes & build all windows ---
+        # --- Phase 1: Build windows from cached context ---
         clip_windows = {}       # {epi: [windows]}
         clip_n_trs = {}         # {epi: n_trs}
         zero_episodes = {}      # {epi: n_trs} for episodes with no context
 
         for epi, n_trs in samples.items():
-            clip = f"friends_{epi}"
-            ctx = load_context_clip(context_dirs, "friends", "s7", clip, expected_dims=cfg.get("modality_dims"))
+            ctx = context_cache.get(epi)
 
             if ctx is None or ctx.shape[0] == 0:
+                clip = f"friends_{epi}"
                 log.warning("  No context: %s — emitting zeros", clip)
                 zero_episodes[epi] = n_trs
                 continue
@@ -949,6 +975,7 @@ def run_s7(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
         del subj_dict
         gc.collect(); torch.cuda.empty_cache()
 
+    del context_cache
     _save_submission(subj_paths, out_dir, tag="s7")
 
 
@@ -1004,6 +1031,29 @@ def run_ood(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
 
     subj_paths = {}
 
+    # --- Pre-cache: load OOD context features once into RAM ---
+    _ref_subject = None
+    for s in runner.subjects:
+        out_path = out_dir / f"{s}_predictions.npy"
+        if not (args.resume and out_path.exists()):
+            _ref_subject = s
+            break
+    if _ref_subject is None:
+        for s in runner.subjects:
+            subj_paths[s] = out_dir / f"{s}_predictions.npy"
+        _save_submission(subj_paths, out_dir, tag="ood")
+        return
+
+    ref_samples = _load_ood_samples(_ref_subject)
+    context_cache = {}
+    log.info("Pre-caching OOD context features for %d clips...", len(ref_samples))
+    for clip_key in ref_samples:
+        ctx = load_context_clip(context_dirs, "ood", None, clip_key, expected_dims=cfg.get("modality_dims"))
+        context_cache[clip_key] = ctx
+        if ctx is not None:
+            log.info("  Cached %s: shape=%s", clip_key, ctx.shape)
+    log.info("Context cache ready (%d clips in RAM)", len(context_cache))
+
     for subject in runner.subjects:
         out_path = out_dir / f"{subject}_predictions.npy"
         if args.resume and out_path.exists():
@@ -1022,15 +1072,15 @@ def run_ood(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
         log.info("\n%s %s %s", "=" * 20, subject, "=" * 20)
         samples = _load_ood_samples(subject)  # {'chaplin1': 432, 'chaplin2': 405, ...}
 
-        # --- Phase 1: Pre-load all clips & build all windows ---
+        # --- Phase 1: Build windows from cached context ---
         clip_windows = {}
         clip_n_trs = {}
         zero_clips = {}
 
         for clip_key, n_trs in samples.items():
-            ctx = load_context_clip(context_dirs, "ood", None, clip_key, expected_dims=cfg.get("modality_dims"))
+            ctx = context_cache.get(clip_key)
 
-            if ctx is None or ctx.shape[0] == 0:
+            if ctx is None or (hasattr(ctx, 'shape') and ctx.shape[0] == 0):
                 log.warning("  No context: %s — emitting zeros", clip_key)
                 zero_clips[clip_key] = n_trs
                 continue
@@ -1087,6 +1137,7 @@ def run_ood(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
         del subj_dict
         gc.collect(); torch.cuda.empty_cache()
 
+    del context_cache
     _save_submission(subj_paths, out_dir, tag="ood")
 
 

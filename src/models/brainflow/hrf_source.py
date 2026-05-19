@@ -7,7 +7,8 @@ class AECNN_HRF_Source(nn.Module):
     Compresses temporal context into neural events and filters through an HRF conv layer
     to create a biological base distribution (mu_phi) and per-voxel variance (sigma_phi).
     """
-    def __init__(self, context_dim: int, latent_dim: int, output_dim: int = 1000, hrf_kernel_size: int = 12):
+    def __init__(self, context_dim: int, latent_dim: int, output_dim: int = 1000,
+                 hrf_kernel_size: int = 12, scalar_sigma: bool = True):
         super().__init__()
         # Step 1: Neural Event Extractor
         self.neural_event_net = nn.Sequential(
@@ -26,13 +27,23 @@ class AECNN_HRF_Source(nn.Module):
             groups=latent_dim
         )
         
-        # Scalar Sigma Predictor — single noise scale broadcast across voxels
-        self.sigma_net = nn.Sequential(
-            nn.Linear(context_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-            nn.Softplus()  # Ensure strictly positive variance
-        )
+        # Sigma Predictor
+        if scalar_sigma:
+            # Scalar: single noise scale broadcast across voxels
+            self.sigma_net = nn.Sequential(
+                nn.Linear(context_dim, 256),
+                nn.ReLU(),
+                nn.Linear(256, 1),
+                nn.Softplus()
+            )
+        else:
+            # Per-voxel: each voxel gets its own noise scale (legacy)
+            self.sigma_net = nn.Sequential(
+                nn.Linear(context_dim, 512),
+                nn.ReLU(),
+                nn.Linear(512, output_dim),
+                nn.Softplus()
+            )
 
     def forward(self, context_sequence: torch.Tensor, context_pooled: torch.Tensor):
         # context_sequence: [B, C, T]
