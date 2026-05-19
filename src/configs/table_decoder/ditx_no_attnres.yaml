@@ -1,6 +1,27 @@
 # =====================================================================
-# Ablation: DiT-Original Backbone (Peebles & Xie, 2022)
-# Scale: DiT-L (1024/24/16) — GELU FFN, no RoPE, no cross-attention
+# Ablation: DiT-X without Attention Residuals (Table 4, Row 3)
+# "Decoder backbone — Effect of cross-attention and sub-layer Attention Residuals"
+#
+# This config implements DiT-X (cross-attention at every block) but with
+# standard additive residuals instead of sub-layer Attention Residuals.
+# Uses DiTHybridBackbone with cross_attn_every_n=1 so every block has
+# cross-attention, SwiGLU FFN, and RoPE — identical to DiT-X except
+# the AttnRes operators are replaced by identity skips.
+#
+# Architecture:
+#   Encoder: same as DiT-L (multitoken fusion, RoPE temporal encoder)
+#   Decoder: 24 × DiTHybridBlock (Self-Attn + Cross-Attn + SwiGLU, 1024-dim)
+#            cross_attn_every_n=1 → cross-attention at ALL blocks
+#            NO AttnRes → standard h_{l+1} = h_l + f_l(h_l) residuals
+#
+# Counterparts (Table 4):
+#   MLP (8-layer):            decoder_type: mlp
+#   DiT (no cross-attn):      decoder_type: dit1d
+#   DiT-X + AttnRes (ours):   decoder_type: ditx (full config)
+#
+# Usage:
+#   python src/train_brainflow.py \
+#       --config src/configs/table4_decoder/ditx_no_attnres.yaml
 # =====================================================================
 
 data_root: Data
@@ -37,11 +58,9 @@ modality_dims:
   - 6144
   - 3584
 
+# Ablation setting: single subject only (sub-01)
 subjects:
   - sub-01
-  - sub-02
-  - sub-03
-  - sub-05
 
 splits:
   friends:
@@ -58,8 +77,8 @@ sliding_window:
   temporal_jitter: 2
 
 dataloader:
-  batch_size: 128
-  val_batch_size: 128
+  batch_size: 64
+  val_batch_size: 64
   num_workers: 0
   pin_memory: true
 
@@ -67,19 +86,19 @@ model_version: v6
 
 brainflow:
   output_dim: 1000
-
-  indi_flow_matching: true
-  indi_train_time_sqrt: false
-  indi_min_denom: 1.0e-3
   use_csfm: true
-  flow_loss_weight: 1.0
   csfm_var_reg_weight: 0.1
   csfm_pcc_weight: 1.0
+  indi_flow_matching: false
+  indi_train_time_sqrt: false
+  indi_min_denom: 1.0e-3
+  flow_loss_weight: 1.0
 
   velocity_net:
-    hidden_dim: 768
-    dit_num_blocks: 12
-    n_heads: 12
+    # Encoder: DiT-L dimensions (1024-dim, 16-head) — shared across all Table 4 rows
+    hidden_dim: 1024
+    dit_num_blocks: 24
+    n_heads: 16
     dropout: 0.1
     context_trs: 101
     n_target_trs: 50
@@ -88,23 +107,26 @@ brainflow:
     use_subject_head: true
     network_head: true
     use_rope: true
-    latent_dim: 768
+    latent_dim: 1024
     context_encoder: multitoken
     use_dit_decoder: true
-    decoder_type: dit_original        # ← Standard DiT (GELU, no RoPE in decoder)
+    # ---- DiT-X without AttnRes: DiTHybrid with cross-attn at every block ----
+    decoder_type: dit_hybrid
+    cross_attn_every_n: 1            # cross-attention at ALL 24 blocks
+    stochastic_depth_rate: 0.0       # no stochastic depth for fair comparison
     zero_init_network_heads: true
     proj_dim: 256
     n_blocks: 4
     modality_dropout: 0.0
     max_seq_len: 101
     fusion_mode: concat
-    fusion_proj_dim: 384
+    fusion_proj_dim: 512
 
 solver_args:
   method: midpoint
   time_points: 30
   cfg_scale: 0.0
-  temperature: 0.05
+  temperature: 0.0
   time_grid_warp: sqrt
 
 training:
@@ -123,4 +145,4 @@ training:
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
-output_dir: outputs/ablation_dit_original
+output_dir: outputs/ablation_decoder_ditx_no_attnres

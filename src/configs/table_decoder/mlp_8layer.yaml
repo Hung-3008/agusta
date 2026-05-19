@@ -1,6 +1,23 @@
 # =====================================================================
-# Ablation: DiT-Original Backbone (Peebles & Xie, 2022)
-# Scale: DiT-L (1024/24/16) — GELU FFN, no RoPE, no cross-attention
+# Ablation: MLP Decoder Backbone (Table 4, Row 1)
+# "Decoder backbone — Effect of cross-attention and sub-layer Attention Residuals"
+#
+# This config implements the MLP (8-layer) decoder backbone baseline.
+# No self-attention, no cross-attention — pure time-conditioned SwiGLU
+# FFN blocks with AdaLN-Zero modulation.
+#
+# Architecture:
+#   Encoder: same as DiT-L (multitoken fusion, RoPE temporal encoder)
+#   Decoder: 8 × MLPBlock (SwiGLU FFN + AdaLN-Zero, 1024-dim)
+#
+# Counterparts (Table 4):
+#   DiT (no cross-attn):       decoder_type: dit1d
+#   DiT-X (with cross-attn):   decoder_type: ditx (+ stochastic_depth_rate: 0)
+#   DiT-X + AttnRes (ours):    decoder_type: ditx (full config)
+#
+# Usage:
+#   python src/train_brainflow.py \
+#       --config src/configs/table4_decoder/mlp_8layer.yaml
 # =====================================================================
 
 data_root: Data
@@ -37,11 +54,9 @@ modality_dims:
   - 6144
   - 3584
 
+# Ablation setting: single subject only (sub-01)
 subjects:
   - sub-01
-  - sub-02
-  - sub-03
-  - sub-05
 
 splits:
   friends:
@@ -58,8 +73,8 @@ sliding_window:
   temporal_jitter: 2
 
 dataloader:
-  batch_size: 128
-  val_batch_size: 128
+  batch_size: 64
+  val_batch_size: 64
   num_workers: 0
   pin_memory: true
 
@@ -67,19 +82,18 @@ model_version: v6
 
 brainflow:
   output_dim: 1000
-
-  indi_flow_matching: true
-  indi_train_time_sqrt: false
-  indi_min_denom: 1.0e-3
   use_csfm: true
-  flow_loss_weight: 1.0
   csfm_var_reg_weight: 0.1
   csfm_pcc_weight: 1.0
+  indi_flow_matching: false
+  indi_train_time_sqrt: false
+  indi_min_denom: 1.0e-3
+  flow_loss_weight: 1.0
 
   velocity_net:
-    hidden_dim: 768
-    dit_num_blocks: 12
-    n_heads: 12
+    # Encoder: DiT-L dimensions (1024-dim, 16-head) — shared across all Table 4 rows
+    hidden_dim: 1024
+    n_heads: 16
     dropout: 0.1
     context_trs: 101
     n_target_trs: 50
@@ -88,23 +102,25 @@ brainflow:
     use_subject_head: true
     network_head: true
     use_rope: true
-    latent_dim: 768
+    latent_dim: 1024
     context_encoder: multitoken
     use_dit_decoder: true
-    decoder_type: dit_original        # ← Standard DiT (GELU, no RoPE in decoder)
+    # ---- MLP backbone (8 layers, no attention) ----
+    decoder_type: mlp
+    mlp_depth: 8
     zero_init_network_heads: true
     proj_dim: 256
     n_blocks: 4
     modality_dropout: 0.0
     max_seq_len: 101
     fusion_mode: concat
-    fusion_proj_dim: 384
+    fusion_proj_dim: 512
 
 solver_args:
   method: midpoint
   time_points: 30
   cfg_scale: 0.0
-  temperature: 0.05
+  temperature: 0.0
   time_grid_warp: sqrt
 
 training:
@@ -123,4 +139,4 @@ training:
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
-output_dir: outputs/ablation_dit_original
+output_dir: outputs/ablation_decoder_mlp_8layer
