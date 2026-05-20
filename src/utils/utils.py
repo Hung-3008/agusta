@@ -121,8 +121,13 @@ def run_multiseed_synthesis(
 	synth_kwargs: dict,
 	strategy: InferenceStrategyConfig,
 	parcel_seed_map: np.ndarray | None = None,
+	pre_encoded_context: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
 	"""Run multi-seed synthesis and aggregate prediction per strategy mode.
+
+	Args:
+		pre_encoded_context: optional pre-encoded context tensor. When provided,
+			skips context encoding inside synthesise() (for multi-subject parallel mode).
 
 	Returns:
 		pred_agg: aggregated prediction tensor.
@@ -148,12 +153,15 @@ def run_multiseed_synthesis(
 			kw = dict(synth_kwargs)
 			kw["starting_distribution"] = start
 			kw["temperature"] = 0.0
-			pred = model.synthesise(context, subject_ids=subject_ids, **kw)
+			pred = model.synthesise(context, subject_ids=subject_ids,
+									pre_encoded_context=pre_encoded_context, **kw)
 		else:
 			torch.manual_seed(seed)
-			if context.device.type == "cuda":
+			if (context is not None and context.device.type == "cuda") or \
+			   (pre_encoded_context is not None and pre_encoded_context.device.type == "cuda"):
 				torch.cuda.manual_seed_all(seed)
-			pred = model.synthesise(context, subject_ids=subject_ids, **synth_kwargs)
+			pred = model.synthesise(context, subject_ids=subject_ids,
+									pre_encoded_context=pre_encoded_context, **synth_kwargs)
 		preds_by_seed.append(pred)
 
 	if seeds == 1 or mode in ("none", "single"):

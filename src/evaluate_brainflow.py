@@ -443,6 +443,178 @@ class ModelRunner:
 
         return results
 
+    @torch.inference_mode()
+    def run_all_clips_multisubject(
+        self,
+        clip_windows: dict[str, list[dict]],
+        clip_n_trs_per_subject: dict[str, dict[str, int]],
+        subject_ids_list: list[int],
+        n_target_trs: int,
+        batch_size: int,
+        solver: SolverConfig,
+        encode_batch_size: int | None = None,
+        desc: str = "",
+    ) -> dict[str, dict[str, tuple]]:
+        """Multi-subject parallel inference: encode context ONCE, decode for ALL subjects.
+
+        Phase 1: Pre-encode all context windows (subject-independent).
+        Phase 2: For each decode batch, replicate encoded context × N_subjects,
+                 run ODE with mixed subject_ids, scatter results to per-subject accumulators.
+
+        Args:
+            clip_windows:           {clip_name: [windows]} — shared across subjects.
+            clip_n_trs_per_subject: {subject_name: {clip_name: n_trs}} per subject.
+            subject_ids_list:       list of integer subject indices to decode simultaneously.
+            n_target_trs:           Number of target TRs per window.
+            batch_size:             GPU batch size for decode (per-subject, total = batch_size × n_subjects).
+            solver:                 ODE solver config.
+            encode_batch_size:      GPU batch size for context encoding (default: batch_size).
+            desc:                   tqdm description string.
+
+        Returns:
+            {subject_name: {clip_name: (pred_avg, valid)}}
+        """
+        synth_kw = solver.as_synth_kwargs()
+        strategy = solver.as_strategy_config()
+        n_subjects = len(subject_ids_list)
+        subjects = list(clip_n_trs_per_subject.keys())
+
+        if encode_batch_size is None:
+            encode_batch_size = batch_size
+
+        # --- Phase 1: Flatten all windows ---
+        clip_names = list(clip_windows.keys())
+        all_contexts = []
+        all_starts = []
+        all_clip_idx = []
+        clip_name_to_idx = {c: i for i, c in enumerate(clip_names)}
+
+        for clip_name in clip_names:
+            for w in clip_windows[clip_name]:
+                all_contexts.append(w["context"])
+                all_starts.append(w["target_start"])
+                all_clip_idx.append(clip_name_to_idx[clip_name])
+
+        total_windows = len(all_contexts)
+        if total_windows == 0:
+            return {s: {} for s in subjects}
+
+        all_starts_np = np.array(all_starts, dtype=np.int64)
+        all_clip_idx_np = np.array(all_clip_idx, dtype=np.int64)
+        del all_starts, all_clip_idx
+
+        # --- Phase 2: Pre-encode all context (subject-independent) ---
+        log.info("  Phase 1: Pre-encoding %d windows (batch_size=%d)...",
+                 total_windows, encode_batch_size)
+        # Encode in batches, store on CPU to save VRAM
+        all_encoded = []
+        for bi in tqdm(range(0, total_windows, encode_batch_size),
+                       desc="encoding", total=(total_windows + encode_batch_size - 1) // encode_batch_size):
+            be = min(bi + encode_batch_size, total_windows)
+            ctx_batch = np.stack(all_contexts[bi:be])
+            ctx = torch.from_numpy(ctx_batch).to(self.device)
+            encoded = self.model.velocity_net.encode_context_from_cond(ctx)
+            all_encoded.append(encoded.cpu())
+            del ctx, encoded
+            torch.cuda.empty_cache()
+
+        all_encoded_cat = torch.cat(all_encoded, dim=0)  # (total_windows, n_target_trs, hidden_dim)
+        del all_encoded, all_contexts
+        log.info("  Encoded context: shape=%s (%.1f MB on CPU)",
+                 list(all_encoded_cat.shape),
+                 all_encoded_cat.element_size() * all_encoded_cat.numel() / 1e6)
+
+        # --- Phase 3: Allocate per-subject, per-clip accumulators ---
+        accums = {}  # {subject_name: {clip_name: {pred_sum, pred_count}}}
+        for subj_name in subjects:
+            accums[subj_name] = {}
+            for clip_name in clip_names:
+                n_trs = clip_n_trs_per_subject[subj_name].get(clip_name, 0)
+                if n_trs > 0:
+                    accums[subj_name][clip_name] = {
+                        "pred_sum": np.zeros((n_trs, self.n_voxels), dtype=np.float64),
+                        "pred_count": np.zeros(n_trs, dtype=np.float64),
+                    }
+
+        # --- Phase 4: Decode in batches for ALL subjects simultaneously ---
+        # Per decode batch: take `batch_size` windows, replicate × n_subjects
+        decode_batch = max(1, batch_size // n_subjects)  # per-subject windows per GPU call
+        n_batches = (total_windows + decode_batch - 1) // decode_batch
+        log.info("  Phase 2: Decoding %d windows × %d subjects (decode_batch=%d, %d GPU calls)...",
+                 total_windows, n_subjects, decode_batch, n_batches)
+
+        pbar = tqdm(range(0, total_windows, decode_batch), desc=desc or "multi-subj",
+                    total=n_batches)
+
+        for bi in pbar:
+            be = min(bi + decode_batch, total_windows)
+            W = be - bi  # windows in this batch
+
+            # Get pre-encoded context for this batch and replicate for each subject
+            enc_batch = all_encoded_cat[bi:be].to(self.device)  # (W, T_enc, H)
+
+            # Replicate: (W*n_subjects, T_enc, H)
+            enc_rep = enc_batch.repeat(n_subjects, 1, 1)
+
+            # Build subject_ids: [s0,s0,...,s1,s1,...,s2,s2,...,s3,s3,...]
+            subj_ids = torch.cat([
+                torch.full((W,), sid, dtype=torch.long, device=self.device)
+                for sid in subject_ids_list
+            ])
+
+            # Run multi-seed synthesis with pre-encoded context
+            pred_agg, _ = run_multiseed_synthesis(
+                model=self.model,
+                context=None,
+                subject_ids=subj_ids,
+                synth_kwargs=synth_kw,
+                strategy=strategy,
+                parcel_seed_map=None,
+                pre_encoded_context=enc_rep,
+            )
+            pred_np = pred_agg.float().cpu().numpy()  # (W*n_subjects, T_target, V)
+
+            # Scatter results to per-subject accumulators
+            batch_clip_idx = all_clip_idx_np[bi:be]
+            batch_starts = all_starts_np[bi:be]
+
+            for si, subj_name in enumerate(subjects):
+                pred_subj = pred_np[si * W : (si + 1) * W]  # (W, T_target, V)
+                for j in range(W):
+                    clip_name = clip_names[batch_clip_idx[j]]
+                    if clip_name not in accums[subj_name]:
+                        continue
+                    acc = accums[subj_name][clip_name]
+                    n_trs = clip_n_trs_per_subject[subj_name].get(clip_name, 0)
+                    ts = batch_starts[j]
+                    for off in range(n_target_trs):
+                        tr = ts + off
+                        if tr >= n_trs:
+                            break
+                        acc["pred_sum"][tr] += pred_subj[j, off]
+                        acc["pred_count"][tr] += 1
+
+            del enc_batch, enc_rep, subj_ids, pred_agg
+            torch.cuda.empty_cache()
+
+        del all_encoded_cat
+
+        # --- Phase 5: Reduce to final predictions ---
+        results = {}
+        for subj_name in subjects:
+            results[subj_name] = {}
+            for clip_name in clip_names:
+                if clip_name not in accums[subj_name]:
+                    continue
+                acc = accums[subj_name][clip_name]
+                n_trs = clip_n_trs_per_subject[subj_name][clip_name]
+                valid = acc["pred_count"] > 0
+                pred_avg = np.zeros((n_trs, self.n_voxels), dtype=np.float32)
+                pred_avg[valid] = (acc["pred_sum"][valid] / acc["pred_count"][valid, None]).astype(np.float32)
+                results[subj_name][clip_name] = (pred_avg, valid)
+
+        return results
+
 
 # =============================================================================
 # Data helpers
@@ -980,6 +1152,181 @@ def run_s7(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
 
 
 # =============================================================================
+# S7 Parallel — All subjects decoded simultaneously
+# =============================================================================
+
+def run_s7_parallel(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
+                    args, solver: SolverConfig):
+    """Generate Friends S7 blind submission with multi-subject parallel inference.
+
+    Encodes context ONCE (subject-independent), then decodes for all subjects
+    simultaneously using mixed subject_ids batches. ~2.5-3× faster than sequential.
+    """
+    sw = cfg["sliding_window"]
+    context_trs  = sw["context_trs"]
+    n_target_trs = sw["n_target_trs"]
+    stride = args.stride or sw.get("stride", 10)
+    fmri_dir = cfg["_fmri_dir"]
+    n_voxels = runner.n_voxels
+    hrf_delay = cfg["fmri"].get("hrf_delay", 5)
+
+    use_stats = cfg["fmri"].get("use_global_stats", False)
+    stats = load_fmri_stats(fmri_dir, runner.subjects) if use_stats else {}
+
+    run_name = Path(cfg.get("output_dir", "outputs/brainflow")).name
+    out_dir = PROJECT_ROOT / "outputs" / "submissions" / run_name / "s7"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    log.info("S7 PARALLEL submission — output: %s", out_dir)
+    log.info(
+        "Solver: %s, steps=%d, temp=%.3f, stride=%d, n_subjects=%d",
+        solver.method, solver.n_timesteps, solver.temperature, stride,
+        len(runner.subjects),
+    )
+
+    # Check which subjects still need processing
+    subj_paths = {}
+    subjects_to_run = []
+    for s in runner.subjects:
+        out_path = out_dir / f"{s}_predictions.npy"
+        if args.resume and out_path.exists():
+            log.info("[RESUME] %s already done.", s)
+            subj_paths[s] = out_path
+        else:
+            subjects_to_run.append(s)
+
+    if not subjects_to_run:
+        _save_submission(subj_paths, out_dir, tag="s7")
+        return
+
+    # Load S7 sample counts for all subjects to run
+    def _load_s7_samples(subject):
+        p = (Path(PROJECT_ROOT) / "Data" / "algonauts_2025.competitors" / "fmri"
+             / subject / "target_sample_number"
+             / f"{subject}_friends-s7_fmri_samples.npy")
+        return np.load(p, allow_pickle=True).item()
+
+    all_samples = {s: _load_s7_samples(s) for s in subjects_to_run}
+
+    # Get union of all episodes across subjects
+    all_episodes = set()
+    for samples in all_samples.values():
+        all_episodes.update(samples.keys())
+    all_episodes = sorted(all_episodes)
+
+    # Pre-cache context features (shared across subjects)
+    log.info("Pre-caching context features for %d episodes...", len(all_episodes))
+    context_cache = {}
+    for epi in all_episodes:
+        clip = f"friends_{epi}"
+        ctx = load_context_clip(context_dirs, "friends", "s7", clip,
+                                expected_dims=cfg.get("modality_dims"))
+        context_cache[epi] = ctx
+        if ctx is not None:
+            log.info("  Cached %s: shape=%s", epi, ctx.shape)
+    log.info("Context cache ready (%d episodes in RAM)", len(context_cache))
+
+    # Build windows (shared across subjects — same context, same starts)
+    clip_windows = {}
+    clip_n_trs_per_subject = {s: {} for s in subjects_to_run}
+    zero_episodes_per_subject = {s: {} for s in subjects_to_run}
+
+    # Use max n_trs across subjects for window building (windows are shared)
+    max_n_trs = {}
+    for epi in all_episodes:
+        max_n_trs[epi] = max(
+            all_samples[s].get(epi, 0) for s in subjects_to_run
+        )
+
+    for epi in all_episodes:
+        n_trs_max = max_n_trs[epi]
+        ctx = context_cache.get(epi)
+
+        # Track per-subject n_trs
+        for s in subjects_to_run:
+            n_trs_s = all_samples[s].get(epi, 0)
+            if n_trs_s > 0:
+                clip_n_trs_per_subject[s][epi] = n_trs_s
+
+        if ctx is None or ctx.shape[0] == 0:
+            for s in subjects_to_run:
+                n_trs_s = all_samples[s].get(epi, 0)
+                if n_trs_s > 0:
+                    zero_episodes_per_subject[s][epi] = n_trs_s
+            continue
+
+        # Build windows using max n_trs (superset)
+        windows = build_s7_windows(ctx, n_trs_max, context_trs, n_target_trs,
+                                   hrf_delay, stride)
+        if not windows:
+            for s in subjects_to_run:
+                n_trs_s = all_samples[s].get(epi, 0)
+                if n_trs_s > 0:
+                    zero_episodes_per_subject[s][epi] = n_trs_s
+            continue
+
+        clip_windows[epi] = windows
+
+    total_windows = sum(len(w) for w in clip_windows.values())
+    n_subjects = len(subjects_to_run)
+    subject_ids_list = [runner.subject_to_idx[s] for s in subjects_to_run]
+
+    log.info("Prepared %d episodes, %d total windows × %d subjects",
+             len(clip_windows), total_windows, n_subjects)
+
+    # Run multi-subject parallel inference
+    if clip_windows:
+        batch_results = runner.run_all_clips_multisubject(
+            clip_windows=clip_windows,
+            clip_n_trs_per_subject=clip_n_trs_per_subject,
+            subject_ids_list=subject_ids_list,
+            n_target_trs=n_target_trs,
+            batch_size=args.batch_size,
+            solver=solver,
+            desc="s7-parallel",
+        )
+    else:
+        batch_results = {s: {} for s in subjects_to_run}
+
+    del context_cache
+
+    # Collect and save per-subject results
+    for subject in subjects_to_run:
+        out_path = out_dir / f"{subject}_predictions.npy"
+        subj_dict = {}
+
+        # Fill zero episodes
+        for epi, n_trs in zero_episodes_per_subject[subject].items():
+            subj_dict[epi] = np.zeros((n_trs, n_voxels), dtype=np.float32)
+
+        # Fill predicted episodes
+        for epi in clip_windows:
+            if epi not in batch_results[subject]:
+                continue
+            pred_avg, valid = batch_results[subject][epi]
+
+            # Denormalize if trained with z-score
+            if use_stats and subject in stats:
+                s = stats[subject]
+                pred_avg = pred_avg * s["std"] + s["mean"]
+
+            pred_avg = np.nan_to_num(pred_avg, nan=0.0)
+            subj_dict[epi] = pred_avg.astype(np.float32)
+            log.info("  %s/%s: %d/%d TRs predicted", subject, epi,
+                     int(valid.sum()), clip_n_trs_per_subject[subject].get(epi, 0))
+
+        np.save(out_path, subj_dict)
+        subj_paths[subject] = out_path
+        log.info("  Saved %s (%.1f MB)", out_path.name, out_path.stat().st_size / 1e6)
+        del subj_dict
+
+    del batch_results
+    gc.collect(); torch.cuda.empty_cache()
+
+    _save_submission(subj_paths, out_dir, tag="s7")
+
+
+# =============================================================================
 # OOD — blind submission (out-of-distribution)
 # =============================================================================
 
@@ -1199,6 +1546,10 @@ def main():
                    help="[S7] Skip already-completed subjects")
     p.add_argument("--no_resume",      dest="resume", action="store_false")
     p.add_argument("--output_dir",     default=None, help="Override output directory")
+    p.add_argument("--parallel_subjects", action="store_true", default=True,
+                   help="[S7/OOD] Decode all subjects simultaneously (default: enabled)")
+    p.add_argument("--sequential_subjects", dest="parallel_subjects", action="store_false",
+                   help="[S7/OOD] Decode subjects sequentially (legacy mode)")
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -1230,7 +1581,10 @@ def main():
     if args.eval_session == "s6":
         run_s6(runner, cfg, context_dirs, args, solver)
     elif args.eval_session == "s7":
-        run_s7(runner, cfg, context_dirs, args, solver)
+        if args.parallel_subjects:
+            run_s7_parallel(runner, cfg, context_dirs, args, solver)
+        else:
+            run_s7(runner, cfg, context_dirs, args, solver)
     else:  # ood
         run_ood(runner, cfg, context_dirs, args, solver)
 

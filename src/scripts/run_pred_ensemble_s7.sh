@@ -11,7 +11,7 @@ set -e
 
 CONFIG="outputs/agusta_ensemble_50_medium/config.yaml"
 BATCH_SIZE=128
-STRIDE=5
+STRIDE=10
 
 # 4 seed checkpoints
 SEEDS=(1001 1234 3137 5347)

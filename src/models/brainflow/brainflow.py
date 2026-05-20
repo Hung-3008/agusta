@@ -360,6 +360,7 @@ class BrainFlow(nn.Module):
         time_grid_warp: str | None = None,
         time_grid_max: float = 1.0,
         final_jump: bool = False,
+        pre_encoded_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate fMRI by solving ODE (or single forward pass in regression mode).
 
@@ -374,6 +375,7 @@ class BrainFlow(nn.Module):
 
         Args:
             context:               (B, T_ctx, total_dim) concatenated context.
+                                   Can be None when pre_encoded_context is provided.
             n_timesteps:           Number of ODE steps.
             solver_method:         ``'midpoint'`` (default) or ``'euler'``.
             subject_ids:           (B,) subject indices.
@@ -382,17 +384,24 @@ class BrainFlow(nn.Module):
             time_grid_warp:        ``'sqrt'`` = finer steps near t→1.
             time_grid_max:         Upper integration bound in [0,1] to avoid t→1 singularity.
             final_jump:            If True and time_grid_max<1, perform a final residual jump.
+            pre_encoded_context:   (B, n_target_trs, hidden_dim) pre-encoded context.
+                                   When provided, skips encode_context_from_cond (saves compute
+                                   when running the same context for multiple subjects).
 
         Returns:
             fmri_pred: (B, output_dim) or (B, n_target_trs, output_dim).
         """
-        B = context.shape[0]
-        device = context.device
-        dtype = context.dtype
+        if pre_encoded_context is not None:
+            context_encoded = pre_encoded_context
+            B = context_encoded.shape[0]
+            device = context_encoded.device
+            dtype = context_encoded.dtype
+        else:
+            B = context.shape[0]
+            device = context.device
+            dtype = context.dtype
+            context_encoded = self.velocity_net.encode_context_from_cond(context)
         n_target = getattr(self.velocity_net, 'n_target_trs', 1)
-
-        # --- Encode context ---
-        context_encoded = self.velocity_net.encode_context_from_cond(context)
 
         # ------------------------------------------------------------------ #
         # Regression mode: single deterministic forward pass, no ODE.        #
@@ -412,9 +421,13 @@ class BrainFlow(nn.Module):
 
         uncond_encoded = None
         if cfg_scale > 0:
-            uncond_encoded = self.velocity_net.encode_context_from_cond(
-                torch.zeros_like(context)
-            )
+            if context is not None:
+                uncond_encoded = self.velocity_net.encode_context_from_cond(
+                    torch.zeros_like(context)
+                )
+            else:
+                # pre_encoded_context mode: create zero unconditional encoding directly
+                uncond_encoded = torch.zeros_like(context_encoded)
 
         # --- Initialise x_0 ---
         if self.use_csfm:
