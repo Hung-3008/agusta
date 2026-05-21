@@ -214,7 +214,8 @@ class BrainFlow(nn.Module):
             cont_loss = _zero
         else:
             if self.use_csfm:
-                ctx_detached = context_encoded.detach()  # ⛔ no gradient to fusion
+                # Allow gradients to flow from CSFM loss back to fusion/encoder
+                ctx_detached = context_encoded
                 ctx_transposed = ctx_detached.transpose(1, 2)
                 ctx_pooled_reg = ctx_detached.mean(dim=1)
                 
