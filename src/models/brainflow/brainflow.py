@@ -230,7 +230,13 @@ class BrainFlow(nn.Module):
                         fmri_pred = mu_phi_latent
 
                     epsilon = torch.randn_like(target)
-                    x_0_csfm = fmri_pred + sigma_phi * epsilon
+                    if target.dim() == 2:
+                        fmri_pred_compat = fmri_pred.squeeze(1)
+                        sigma_phi_compat = sigma_phi.squeeze(1)
+                    else:
+                        fmri_pred_compat = fmri_pred
+                        sigma_phi_compat = sigma_phi
+                    x_0_csfm = fmri_pred_compat + sigma_phi_compat * epsilon
                     
                     # CSFM Losses (monitoring-only when encoder is frozen)
                     csfm_var_reg_loss = torch.mean(sigma_phi**2 - torch.log(sigma_phi**2 + 1e-8) - 1.0)
@@ -437,10 +443,18 @@ class BrainFlow(nn.Module):
                 mu_phi_fmri = self.velocity_net.subject_layers(mu_phi_latent, subject_ids)
             else:
                 mu_phi_fmri = mu_phi_latent
-            x = mu_phi_fmri.to(device=device, dtype=dtype)
+            
+            if n_target == 1:
+                mu_phi_fmri_compat = mu_phi_fmri.squeeze(1)
+                sigma_phi_compat = sigma_phi.squeeze(1)
+            else:
+                mu_phi_fmri_compat = mu_phi_fmri
+                sigma_phi_compat = sigma_phi
+
+            x = mu_phi_fmri_compat.to(device=device, dtype=dtype)
             if temperature > 0:
                 epsilon = torch.randn_like(x)
-                x = x + temperature * sigma_phi * epsilon
+                x = x + temperature * sigma_phi_compat * epsilon
         elif temperature > 0:
             shape = (B, n_target, self.output_dim) if n_target > 1 else (B, self.output_dim)
             x = temperature * torch.randn(*shape, device=device, dtype=dtype)

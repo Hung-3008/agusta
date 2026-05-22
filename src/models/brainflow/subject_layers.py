@@ -70,6 +70,17 @@ class NetworkSubjectLayers(nn.Module):
                 if head.bias is not None:
                     nn.init.zeros_(head.bias)
 
+        # Precompute and register anatomical indices for correct routing
+        lh_offset = 0
+        rh_offset = 500
+        for i, count in enumerate(self.SCHAEFER_7NET_PER_HEMI):
+            lh_idx = list(range(lh_offset, lh_offset + count))
+            rh_idx = list(range(rh_offset, rh_offset + count))
+            indices = torch.tensor(lh_idx + rh_idx, dtype=torch.long)
+            self.register_buffer(f"net_indices_{i}", indices)
+            lh_offset += count
+            rh_offset += count
+
         logger.info(
             "NetworkSubjectLayers: %d heads: %s = %d total voxels",
             self.n_networks,
@@ -78,14 +89,25 @@ class NetworkSubjectLayers(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, subject_ids: torch.Tensor) -> torch.Tensor:
-        """Run all network heads and concatenate outputs.
+        """Run all network heads and route outputs to correct anatomical order.
 
         Args:
-            x: (B, in_channels) shared latent representation.
+            x: (B, in_channels) or (B, T, in_channels) shared latent representation.
             subject_ids: (B,) subject index.
 
         Returns:
-            (B, total_output_dim) concatenated per-network predictions.
+            Concatenated and anatomically routed per-network predictions.
         """
         parts = [head(x, subject_ids) for head in self.heads]
-        return torch.cat(parts, dim=-1)
+        
+        out_shape = list(parts[0].shape)
+        out_shape[-1] = self.total_output_dim
+        out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
+        
+        for i, part in enumerate(parts):
+            idx = getattr(self, f"net_indices_{i}")
+            if len(out_shape) == 3:
+                out[:, :, idx] = part.to(dtype=out.dtype)
+            else:
+                out[:, idx] = part.to(dtype=out.dtype)
+        return out
