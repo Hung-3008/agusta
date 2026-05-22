@@ -77,11 +77,19 @@ class ModelRunner:
                     ema.apply_shadow(self.model)
                     log.info("  Applied EMA shadow weights from %s", path.name)
                 else:
-                    self.model.load_state_dict(ckpt["model"])
-                    log.info("  Loaded model weights from %s", path.name)
+                    missing, unexpected = self.model.load_state_dict(ckpt["model"], strict=False)
+                    log.info("  Loaded model weights from %s (strict=False)", path.name)
+                    if missing:
+                        log.warning("  Missing keys in state_dict: %s", missing)
+                    if unexpected:
+                        log.warning("  Unexpected keys in state_dict: %s", unexpected)
             else:
-                self.model.load_state_dict(ckpt)
-                log.info("  Loaded plain state_dict from %s", path.name)
+                missing, unexpected = self.model.load_state_dict(ckpt, strict=False)
+                log.info("  Loaded plain state_dict from %s (strict=False)", path.name)
+                if missing:
+                    log.warning("  Missing keys in state_dict: %s", missing)
+                if unexpected:
+                    log.warning("  Unexpected keys in state_dict: %s", unexpected)
             del ckpt
 
         if override:
@@ -95,8 +103,12 @@ class ModelRunner:
             log.info("Loading best.pt: %s", p)
             try:
                 ckpt = torch.load(p, map_location=self.device, weights_only=True)
-                self.model.load_state_dict(ckpt)
-                log.info("  Loaded plain state_dict from best.pt")
+                missing, unexpected = self.model.load_state_dict(ckpt, strict=False)
+                log.info("  Loaded plain state_dict from best.pt (strict=False)")
+                if missing:
+                    log.warning("  Missing keys in state_dict: %s", missing)
+                if unexpected:
+                    log.warning("  Unexpected keys in state_dict: %s", unexpected)
                 del ckpt
             except Exception:
                 _load_full(p)
