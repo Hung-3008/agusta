@@ -44,8 +44,8 @@ subjects:
 
 splits:
   friends:
-    train: [s1, s2, s3, s4, s5, s6]
-    val: []
+    train: [s1, s2, s3, s4, s5]
+    val: [s6]
   movie10:
     train: [bourne, figures, life, wolf]
     val: []
@@ -67,7 +67,7 @@ model_version: v6
 brainflow:
   output_dim: 1000
 
-  indi_flow_matching: false
+  indi_flow_matching: true
   indi_train_time_sqrt: false
   indi_min_denom: 1.0e-3
   use_csfm: true
@@ -85,8 +85,7 @@ brainflow:
     temporal_attn_layers: 4
     gradient_checkpointing: true
     use_subject_head: true
-    network_head: false
-    head_type: voxel_personality
+    network_head: true
     use_rope: true
     latent_dim: 1024
     context_encoder: multitoken
@@ -95,7 +94,7 @@ brainflow:
     zero_init_network_heads: true
     proj_dim: 256
     n_blocks: 4
-    modality_dropout: 0.3
+    modality_dropout: 0.0
     max_seq_len: 101
     fusion_mode: concat
     fusion_proj_dim: 512
@@ -108,7 +107,7 @@ solver_args:
   time_grid_warp: sqrt
 
 training:
-  n_epochs: 150
+  n_epochs: 200
   lr: 1.0e-4
   weight_decay: 0.05
   warmup_ratio: 0.05
@@ -116,11 +115,11 @@ training:
   grad_clip: 1.0
   use_amp: true
   log_every_n_steps: 20
-  val_every_n_epochs: 9999
+  val_every_n_epochs: 10
   ema_decay: 0.999
   gradient_accumulation_steps: 8
   ema_on_cpu: true
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
-output_dir: outputs/brainflow_dit_medium_all_data
+output_dir: outputs/brainflow_dit_large

@@ -82,9 +82,6 @@ class BrainFlow(nn.Module):
         vn_cfg = dict(velocity_net_params or {})
         vn_cfg.setdefault("output_dim", output_dim)
         vn_cfg.setdefault("n_subjects", n_subjects)
-        # Pop keys consumed by BrainFlow / HRF source but not by VelocityNet
-        _scalar_sigma = vn_cfg.pop("scalar_sigma", True)
-        _hrf_kernel_size = vn_cfg.pop("hrf_kernel_size", 12)
         self.velocity_net = VelocityNet(**vn_cfg)
 
         hidden_dim = vn_cfg.get("hidden_dim", 1024)
@@ -117,8 +114,7 @@ class BrainFlow(nn.Module):
                 context_dim=hidden_dim,
                 latent_dim=latent_dim,
                 output_dim=output_dim,
-                hrf_kernel_size=_hrf_kernel_size,
-                scalar_sigma=_scalar_sigma,
+                hrf_kernel_size=vn_cfg.get("hrf_kernel_size", 12)
             )
 
         # Log parameters

@@ -4,9 +4,9 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from .components import SinusoidalPosEmb, RotaryEmbedding, RoPETransformerEncoderLayer
-from .subject_layers import SubjectLayers, NetworkSubjectLayers, VoxelPersonalityHead
+from .subject_layers import SubjectLayers, NetworkSubjectLayers
 from .fusion import MultiTokenFusion
-from .backbones import DiTXBackbone, DiT1DBackbone, DiTOriginalBackbone, DiTHybridBackbone, DiTJointBackbone, MLPBackbone, UDiT1DBackbone
+from .backbones import DiTXBackbone, DiT1DBackbone, DiTOriginalBackbone, DiTHybridBackbone, DiTJointBackbone
 
 logger = logging.getLogger(__name__)
 
@@ -43,14 +43,6 @@ class VelocityNet(nn.Module):
         zero_init_network_heads: bool = False,
         cross_attn_every_n: int = 4,
         stochastic_depth_rate: float = 0.0,
-        mlp_depth: int = 8,
-        head_type: str = "auto",
-        voxel_personality_dim: int = 128,
-        voxel_personality_bias: bool = True,
-        subject_adaln: bool = True,
-        # U-DiT specific params
-        udit_depth: list[int] = None,
-        udit_channel_mult: list[float] = None,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -138,26 +130,9 @@ class VelocityNet(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Subject Heads (B1 — head selection)
-        # head_type:
-        #   "auto"               — legacy: use SubjectLayers / NetworkSubjectLayers (based on network_head)
-        #   "flat"               — force SubjectLayers
-        #   "network"            — force NetworkSubjectLayers
-        #   "voxel_personality"  — VoxelPersonalityHead (bilinear factorization, B1)
-        self.head_type = head_type if head_type != "auto" else (
-            "network" if self.network_head else "flat"
-        )
+        # Subject Heads
         if use_subject_head:
-            if self.head_type == "voxel_personality":
-                self.subject_layers = VoxelPersonalityHead(
-                    latent_dim=self.latent_dim,
-                    n_voxels=output_dim,
-                    n_subjects=n_subjects,
-                    voxel_dim=voxel_personality_dim,
-                    bias=voxel_personality_bias,
-                    zero_init_w=True,
-                )
-            elif self.head_type == "network":
+            if self.network_head:
                 self.subject_layers = NetworkSubjectLayers(
                     self.latent_dim,
                     n_subjects,
@@ -165,18 +140,10 @@ class VelocityNet(nn.Module):
                 )
             else:
                 self.subject_layers = SubjectLayers(self.latent_dim, output_dim, n_subjects)
+            self.subject_emb = None
         else:
             self.subject_layers = None
-
-        # B2 — Subject AdaLN: always create subject embedding so DiT trunk
-        # receives subject conditioning via t_emb. Zero-init when a subject
-        # head is present so warm-starting from old checkpoints is identity-safe.
-        if subject_adaln:
             self.subject_emb = nn.Embedding(n_subjects, hidden_dim)
-            if use_subject_head:
-                nn.init.zeros_(self.subject_emb.weight)
-        else:
-            self.subject_emb = None
 
         # Modular Backbone
         dec_max = max(n_target_trs, 64)
@@ -186,10 +153,9 @@ class VelocityNet(nn.Module):
             self.backbone = DiTXBackbone(
                 d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
                 dropout=dropout, time_dim=hidden_dim, rotary_emb=self.rotary_emb_decoder,
-                dit_depth=dit_depth, stochastic_depth_rate=stochastic_depth_rate,
+                dit_depth=dit_depth
             )
-            logger.info("Backbone: DiTXBackbone (%d blocks, stoch_depth=%.2f)",
-                        dit_depth, stochastic_depth_rate)
+            logger.info("Backbone: DiTXBackbone (%d blocks)", dit_depth)
         elif decoder_type == "dit_original":
             self.backbone = DiTOriginalBackbone(
                 d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
@@ -214,30 +180,6 @@ class VelocityNet(nn.Module):
                 dit_depth=dit_depth
             )
             logger.info("Backbone: DiTJointBackbone (MMDiT, %d blocks, bidirectional context)", dit_depth)
-        elif decoder_type == "udit":
-            _udit_depth = udit_depth if udit_depth is not None else [2, 4, 6, 4, 2]
-            _udit_ch_mult = udit_channel_mult if udit_channel_mult is not None else [1, 2, 4]
-            self.backbone = UDiT1DBackbone(
-                d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
-                dropout=dropout, time_dim=hidden_dim, rotary_emb=self.rotary_emb_decoder,
-                udit_depth=_udit_depth,
-                channel_mult=_udit_ch_mult,
-                cross_attn_every_n=cross_attn_every_n,
-                stochastic_depth_rate=stochastic_depth_rate,
-                n_target_trs=n_target_trs,
-            )
-            _total_blocks = sum(_udit_depth)
-            logger.info(
-                "Backbone: UDiT1DBackbone (depth=%s, ch_mult=%s, %d total blocks, cross_attn_every=%d)",
-                _udit_depth, _udit_ch_mult, _total_blocks, cross_attn_every_n,
-            )
-        elif decoder_type == "mlp":
-            self.backbone = MLPBackbone(
-                d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
-                dropout=dropout, time_dim=hidden_dim, rotary_emb=self.rotary_emb_decoder,
-                mlp_depth=mlp_depth,
-            )
-            logger.info("Backbone: MLPBackbone (%d layers, no attention)", mlp_depth)
         else:
             self.backbone = DiT1DBackbone(
                 d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
@@ -317,9 +259,7 @@ class VelocityNet(nn.Module):
 
         t_emb = self.time_mlp(self.time_embed(t))
 
-        # B2 — inject subject conditioning into AdaLN modulation of every DiT block.
-        # Active for both use_subject_head=True (zero-init → warm-start safe) and =False.
-        if self.subject_emb is not None and subject_ids is not None:
+        if not self.use_subject_head and self.subject_emb is not None and subject_ids is not None:
             t_emb = t_emb + self.subject_emb(subject_ids)
 
         h = self.input_proj(x)

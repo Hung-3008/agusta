@@ -1,23 +1,16 @@
 # =====================================================================
-# Ablation: MLP Decoder Backbone (Table 4, Row 1)
-# "Decoder backbone — Effect of cross-attention and sub-layer Attention Residuals"
+# Ablation: DiT-Hybrid Backbone (Sparse Cross-Attention + SwiGLU + RoPE)
+# Scale: DiT-L (1024/24/16) — cross-attn every 2 blocks (12/24 blocks)
 #
-# This config implements the MLP (8-layer) decoder backbone baseline.
-# No self-attention, no cross-attention — pure time-conditioned SwiGLU
-# FFN blocks with AdaLN-Zero modulation.
-#
-# Architecture:
-#   Encoder: same as DiT-L (multitoken fusion, RoPE temporal encoder)
-#   Decoder: 8 × MLPBlock (SwiGLU FFN + AdaLN-Zero, 1024-dim)
-#
-# Counterparts (Table 4):
-#   DiT (no cross-attn):       decoder_type: dit1d
-#   DiT-X (with cross-attn):   decoder_type: ditx (+ stochastic_depth_rate: 0)
-#   DiT-X + AttnRes (ours):    decoder_type: ditx (full config)
-#
-# Usage:
-#   python src/train_brainflow.py \
-#       --config src/configs/table4_decoder/mlp_8layer.yaml
+# Anti-overfit improvements (vs DiT-medium baseline):
+#   - cross_attn_every_n: 2 (12/24 CA blocks, denser context refresh)
+#   - modality_dropout: 0.15 (was 0.0)
+#   - dropout: 0.15 (was 0.1)
+#   - stochastic_depth_rate: 0.1 (new — linearly drops SA-only blocks)
+#   - weight_decay: 0.1 (was 0.05)
+#   - csfm_var_reg_weight: 0.3 (was 0.1 — prevents σ collapse)
+#   - temporal_jitter: 3 (was 2)
+#   - val_every_n_epochs: 5 (was 10 — earlier overfit detection)
 # =====================================================================
 
 data_root: Data
@@ -54,9 +47,11 @@ modality_dims:
   - 6144
   - 3584
 
-# Ablation setting: single subject only (sub-01)
 subjects:
   - sub-01
+  - sub-02
+  - sub-03
+  - sub-05
 
 splits:
   friends:
@@ -70,11 +65,11 @@ sliding_window:
   context_trs: 101
   n_target_trs: 50
   stride: 10
-  temporal_jitter: 2
+  temporal_jitter: 3            # ← was 2, more temporal diversity
 
 dataloader:
-  batch_size: 64
-  val_batch_size: 64
+  batch_size: 128
+  val_batch_size: 128
   num_workers: 0
   pin_memory: true
 
@@ -82,19 +77,20 @@ model_version: v6
 
 brainflow:
   output_dim: 1000
-  use_csfm: true
-  csfm_var_reg_weight: 0.1
-  csfm_pcc_weight: 1.0
-  indi_flow_matching: false
+
+  indi_flow_matching: true
   indi_train_time_sqrt: false
   indi_min_denom: 1.0e-3
+  use_csfm: true
   flow_loss_weight: 1.0
+  csfm_var_reg_weight: 0.3      # ← was 0.1, prevents σ collapse
+  csfm_pcc_weight: 1.0
 
   velocity_net:
-    # Encoder: DiT-L dimensions (1024-dim, 16-head) — shared across all Table 4 rows
     hidden_dim: 1024
+    dit_num_blocks: 24
     n_heads: 16
-    dropout: 0.1
+    dropout: 0.15               # ← was 0.1, stronger regularization
     context_trs: 101
     n_target_trs: 50
     temporal_attn_layers: 4
@@ -105,13 +101,13 @@ brainflow:
     latent_dim: 1024
     context_encoder: multitoken
     use_dit_decoder: true
-    # ---- MLP backbone (8 layers, no attention) ----
-    decoder_type: mlp
-    mlp_depth: 8
+    decoder_type: dit_hybrid
+    cross_attn_every_n: 2       # ← was 4, denser context refresh (12/24)
+    stochastic_depth_rate: 0.1  # ← NEW, linearly drops SA-only blocks
     zero_init_network_heads: true
     proj_dim: 256
     n_blocks: 4
-    modality_dropout: 0.0
+    modality_dropout: 0.15      # ← was 0.0, critical regularizer
     max_seq_len: 101
     fusion_mode: concat
     fusion_proj_dim: 512
@@ -120,23 +116,23 @@ solver_args:
   method: midpoint
   time_points: 30
   cfg_scale: 0.0
-  temperature: 0.0
+  temperature: 0.05
   time_grid_warp: sqrt
 
 training:
-  n_epochs: 80
+  n_epochs: 200
   lr: 1.0e-4
-  weight_decay: 0.05
+  weight_decay: 0.1             # ← was 0.05, stronger L2 penalty
   warmup_ratio: 0.05
   min_lr: 1.0e-6
   grad_clip: 1.0
   use_amp: true
   log_every_n_steps: 20
-  val_every_n_epochs: 10
+  val_every_n_epochs: 10         # ← was 10, earlier overfit detection
   ema_decay: 0.999
   gradient_accumulation_steps: 8
   ema_on_cpu: true
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
-output_dir: outputs/ablation_decoder_mlp_8layer
+output_dir: outputs/ablation_dit_hybrid

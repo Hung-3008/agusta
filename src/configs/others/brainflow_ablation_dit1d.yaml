@@ -1,27 +1,6 @@
 # =====================================================================
-# Ablation: U-DiT 1D Backbone (Table — Decoder backbone comparison)
-# "U-shaped multi-scale DiT with skip connections"
-#
-# This config implements the U-DiT backbone adapted for 1D sequences
-# (Tian et al., NeurIPS 2024). The key architectural ideas:
-#   - Multi-scale encoder → latent → decoder with skip connections
-#   - Token downsampling: T→T/2→T/4 reduces attention cost
-#   - Per-level adaLN time conditioning with channel scaling
-#   - Sparse cross-attention in decoder levels for context injection
-#
-# Architecture:
-#   Encoder: same as DiT-L (multitoken fusion, RoPE temporal encoder)
-#   Decoder: U-DiT-1D (512-dim base, [1,2,4] channel mults)
-#     Level 1: 512-dim, 2+2 blocks (enc+dec), T=50 tokens
-#     Level 2: 1024-dim, 4+4 blocks, T=25 tokens
-#     Latent:  2048-dim, 6 blocks, T=12 tokens
-#     Skip connections between matching encoder/decoder levels
-#     Cross-attention every 2 blocks in decoder levels
-#     Total: 18 blocks across 5 levels
-#
-# Usage:
-#   python src/train_brainflow.py \
-#       --config src/configs/table_decoder/udit_backbone.yaml
+# Ablation: DiT-1D Backbone (SwiGLU + RoPE, no cross-attention)
+# Scale: DiT-L (1024/24/16) — upgraded FFN & pos encoding
 # =====================================================================
 
 data_root: Data
@@ -58,9 +37,11 @@ modality_dims:
   - 6144
   - 3584
 
-# Ablation setting: single subject only (sub-01)
 subjects:
   - sub-01
+  - sub-02
+  - sub-03
+  - sub-05
 
 splits:
   friends:
@@ -86,18 +67,18 @@ model_version: v6
 
 brainflow:
   output_dim: 1000
-  use_csfm: true
-  csfm_var_reg_weight: 0.1
-  csfm_pcc_weight: 1.0
-  indi_flow_matching: false
+
+  indi_flow_matching: true
   indi_train_time_sqrt: false
   indi_min_denom: 1.0e-3
+  use_csfm: true
   flow_loss_weight: 1.0
+  csfm_var_reg_weight: 0.1
+  csfm_pcc_weight: 1.0
 
   velocity_net:
-    # Encoder: shared across all Table decoder ablation rows
-    hidden_dim: 512
-    dit_num_blocks: 18           # total blocks (informational; udit_depth controls per-level)
+    hidden_dim: 1024
+    dit_num_blocks: 24
     n_heads: 16
     dropout: 0.1
     context_trs: 101
@@ -107,15 +88,10 @@ brainflow:
     use_subject_head: true
     network_head: true
     use_rope: true
-    latent_dim: 512
+    latent_dim: 1024
     context_encoder: multitoken
     use_dit_decoder: true
-    # ---- U-DiT 1D backbone ----
-    decoder_type: udit
-    udit_depth: [2, 4, 6, 4, 2]           # [enc1, enc2, latent, dec2, dec1]
-    udit_channel_mult: [1, 2, 4]           # channel multipliers [lvl1, lvl2, latent]
-    cross_attn_every_n: 2                  # cross-attention at even-numbered decoder blocks
-    stochastic_depth_rate: 0.0             # no stochastic depth for fair comparison
+    decoder_type: dit1d                # ← SwiGLU + RoPE, no cross-attention
     zero_init_network_heads: true
     proj_dim: 256
     n_blocks: 4
@@ -128,11 +104,11 @@ solver_args:
   method: midpoint
   time_points: 30
   cfg_scale: 0.0
-  temperature: 0.0
+  temperature: 0.05
   time_grid_warp: sqrt
 
 training:
-  n_epochs: 80
+  n_epochs: 200
   lr: 1.0e-4
   weight_decay: 0.05
   warmup_ratio: 0.05
@@ -147,4 +123,4 @@ training:
   context_bf16_when_amp: true
   empty_cuda_cache_each_epoch: false
 
-output_dir: outputs/ablation_decoder_udit
+output_dir: outputs/ablation_dit1d

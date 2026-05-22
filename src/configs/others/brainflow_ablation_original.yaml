@@ -77,9 +77,9 @@ brainflow:
   csfm_pcc_weight: 1.0
 
   velocity_net:
-    hidden_dim: 768
-    dit_num_blocks: 12
-    n_heads: 12
+    hidden_dim: 1024
+    dit_num_blocks: 24
+    n_heads: 16
     dropout: 0.1
     context_trs: 101
     n_target_trs: 50
@@ -88,7 +88,7 @@ brainflow:
     use_subject_head: true
     network_head: true
     use_rope: true
-    latent_dim: 768
+    latent_dim: 1024
     context_encoder: multitoken
     use_dit_decoder: true
     decoder_type: dit_original        # ← Standard DiT (GELU, no RoPE in decoder)
@@ -98,7 +98,7 @@ brainflow:
     modality_dropout: 0.0
     max_seq_len: 101
     fusion_mode: concat
-    fusion_proj_dim: 384
+    fusion_proj_dim: 512
 
 solver_args:
   method: midpoint
@@ -108,7 +108,7 @@ solver_args:
   time_grid_warp: sqrt
 
 training:
-  n_epochs: 80
+  n_epochs: 200
   lr: 1.0e-4
   weight_decay: 0.05
   warmup_ratio: 0.05
