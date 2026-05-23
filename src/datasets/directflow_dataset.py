@@ -35,8 +35,34 @@ class DirectFlowDataset(Dataset):
     def __init__(self, cfg, split="train"):
         self.cfg = cfg
         self.split = split
-        self.subjects = cfg["subjects"]
         self.splits_cfg = cfg.get("splits", {})
+
+        # Cross-subject mode: optionally restrict which subjects are active
+        # per split.  If ``subjects_train`` / ``subject_test`` are absent the
+        # dataset falls back to the original behaviour (all subjects for every
+        # split).
+        all_subjects: list = cfg["subjects"]
+        subjects_train: list | None = cfg.get("subjects_train", None)
+        subject_test: str | None = cfg.get("subject_test", None)
+
+        if split == "train" and subjects_train is not None:
+            self.subjects = subjects_train
+            logger.info(
+                "Cross-subject mode — train split active subjects: %s",
+                self.subjects,
+            )
+        elif split == "val" and subject_test is not None:
+            self.subjects = [subject_test]
+            logger.info(
+                "Cross-subject mode — val split active subject: %s",
+                subject_test,
+            )
+        else:
+            self.subjects = all_subjects
+
+        # subject_to_idx is always built from the FULL subjects list so that
+        # subject-head indices are consistent across train / val.
+        self.subject_to_idx = {s: i for i, s in enumerate(all_subjects)}
 
         self.fmri_dir = Path(cfg["_fmri_dir"])
 
@@ -74,7 +100,7 @@ class DirectFlowDataset(Dataset):
             self.context_extra_past = None
             self.context_extra_future = None
 
-        self.subject_to_idx = {s: i for i, s in enumerate(self.subjects)}
+        # NOTE: subject_to_idx is already built above in the cross-subject block.
 
         self.use_global_stats = cfg["fmri"].get("use_global_stats", False)
         self.fmri_stats = {}
