@@ -96,8 +96,26 @@ class ModelRunner:
                                 torch.nn.Linear(hidden_dim, output_dim),
                                 torch.nn.Softplus()
                             ).to(self.device)
+
+                # Check for NetworkSubjectLayers anatomical routing support in checkpoint
+                has_routing = False
+                if isinstance(state_dict, dict):
+                    for k in state_dict.keys():
+                        if k.endswith("subject_layers.net_indices_0"):
+                            has_routing = True
+                            break
+
+                if hasattr(self.model, "velocity_net") and hasattr(self.model.velocity_net, "subject_layers"):
+                    subject_layers = self.model.velocity_net.subject_layers
+                    if hasattr(subject_layers, "use_anatomical_routing"):
+                        if not has_routing:
+                            log.info("Checkpoint does not contain net_indices_0. Disabling anatomical routing to match training format.")
+                            subject_layers.use_anatomical_routing = False
+                        else:
+                            log.info("Checkpoint contains net_indices_0. Enabling anatomical routing.")
+                            subject_layers.use_anatomical_routing = True
             except Exception as e:
-                log.warning("Could not auto-adapt sigma_net: %s", e)
+                log.warning("Could not auto-adapt sigma_net or routing: %s", e)
 
         def _load_full(path: Path):
             ckpt = torch.load(path, map_location=self.device, weights_only=False)

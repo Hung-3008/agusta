@@ -81,6 +81,8 @@ class NetworkSubjectLayers(nn.Module):
             lh_offset += count
             rh_offset += count
 
+        self.use_anatomical_routing = True
+
         logger.info(
             "NetworkSubjectLayers: %d heads: %s = %d total voxels",
             self.n_networks,
@@ -99,6 +101,8 @@ class NetworkSubjectLayers(nn.Module):
             Concatenated and anatomically routed per-network predictions.
         """
         parts = [head(x, subject_ids) for head in self.heads]
+        if not getattr(self, "use_anatomical_routing", True):
+            return torch.cat(parts, dim=-1)
         
         out_shape = list(parts[0].shape)
         out_shape[-1] = self.total_output_dim
