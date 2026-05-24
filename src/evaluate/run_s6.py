@@ -106,6 +106,7 @@ def run_s6(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
         # --- Phase 1: Pre-load all clips & build all windows ---
         clip_fmri_gt = {}       # {clip: fmri_gt array}
         clip_windows = {}       # {clip: [windows]}
+        clip_contexts = {}      # {clip: ctx array}
         clip_n_trs = {}         # {clip: n_trs}
         skipped = 0
 
@@ -132,6 +133,7 @@ def run_s6(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
 
             clip_fmri_gt[clip] = fmri_gt
             clip_windows[clip] = windows
+            clip_contexts[clip] = ctx
             clip_n_trs[clip] = fmri_gt.shape[0]
 
         total_windows = sum(len(w) for w in clip_windows.values())
@@ -145,6 +147,7 @@ def run_s6(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
 
         # --- Phase 2: Cross-clip batched inference ---
         batch_results = runner.run_all_clips(
+            clip_contexts=clip_contexts,
             clip_windows=clip_windows,
             clip_n_trs=clip_n_trs,
             subject_id=sid,
@@ -154,6 +157,8 @@ def run_s6(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
             parcel_seed_map=None,
             return_seed_preds=need_calibration,
             desc=subject,
+            hrf_delay=hrf_delay,
+            excl_start=excl_s,
         )
 
         # --- Phase 3: Compute per-clip PCC from batched results ---

@@ -121,40 +121,37 @@ def load_fmri_stats(fmri_dir: str, subjects: list[str]) -> dict:
     return stats
 
 
+def get_window_context(ctx: np.ndarray, ts: int, context_trs: int,
+                       n_target_trs: int, hrf_delay: int, excl_start: int = 0) -> np.ndarray:
+    """Slice a window's context on-the-fly from the full-clip context."""
+    extra_past = (context_trs - n_target_trs) // 2
+    feat0 = (ts + excl_start) - hrf_delay
+    c0 = feat0 - extra_past
+    c1 = c0 + context_trs
+    chunk = ctx[max(0, c0):min(ctx.shape[0], c1)]
+    if chunk.shape[0] < context_trs:
+        pb = max(0, -c0)
+        pa = context_trs - chunk.shape[0] - pb
+        chunk = np.pad(chunk, ((pb, pa), (0, 0)))
+    return chunk[:context_trs]
+
+
 def build_seq2seq_windows(ctx: np.ndarray, n_trs: int, context_trs: int,
                           n_target_trs: int, hrf_delay: int, excl_start: int,
                           stride: int) -> list[dict]:
     """Sliding-window builder for S6 evaluation (with HRF shift)."""
-    extra_past = (context_trs - n_target_trs) // 2
     windows = []
     for ts in range(0, max(0, n_trs - n_target_trs + 1), stride):
-        feat0 = (ts + excl_start) - hrf_delay
-        c0 = feat0 - extra_past
-        c1 = c0 + context_trs
-        chunk = ctx[max(0, c0):min(ctx.shape[0], c1)]
-        if chunk.shape[0] < context_trs:
-            pb = max(0, -c0)
-            pa = context_trs - chunk.shape[0] - pb
-            chunk = np.pad(chunk, ((pb, pa), (0, 0)))
-        windows.append({"target_start": ts, "context": chunk[:context_trs]})
+        windows.append({"target_start": ts})
     return windows
 
 
 def build_s7_windows(ctx: np.ndarray, n_trs: int, context_trs: int,
                      n_target_trs: int, hrf_delay: int, stride: int) -> list[dict]:
     """Sliding-window builder for S7/OOD submission (with HRF shift)."""
-    extra_past = (context_trs - n_target_trs) // 2
     windows = []
     for ts in range(0, max(0, n_trs - n_target_trs + 1), stride):
-        feat0 = ts - hrf_delay
-        c0 = feat0 - extra_past
-        c1 = c0 + context_trs
-        chunk = ctx[max(0, c0):min(ctx.shape[0], c1)]
-        if chunk.shape[0] < context_trs:
-            pb = max(0, -c0)
-            pa = context_trs - chunk.shape[0] - pb
-            chunk = np.pad(chunk, ((pb, pa), (0, 0)))
-        windows.append({"target_start": ts, "context": chunk[:context_trs]})
+        windows.append({"target_start": ts})
     return windows
 
 

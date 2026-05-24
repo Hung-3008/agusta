@@ -150,6 +150,7 @@ def run_s7(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
 
         if clip_windows:
             batch_results = runner.run_all_clips(
+                clip_contexts=context_cache,
                 clip_windows=clip_windows,
                 clip_n_trs=clip_n_trs,
                 subject_id=sid,
@@ -159,6 +160,8 @@ def run_s7(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
                 parcel_seed_map=subject_seed_map,
                 return_seed_preds=False,
                 desc=subject,
+                hrf_delay=hrf_delay,
+                excl_start=0,
             )
 
             # --- Phase 3: Collect results ---
@@ -305,6 +308,7 @@ def run_s7_parallel(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
     # Run multi-subject parallel inference
     if clip_windows:
         batch_results = runner.run_all_clips_multisubject(
+            clip_contexts=context_cache,
             clip_windows=clip_windows,
             clip_n_trs_per_subject=clip_n_trs_per_subject,
             subject_ids_list=subject_ids_list,
@@ -312,6 +316,8 @@ def run_s7_parallel(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
             batch_size=args.batch_size,
             solver=solver,
             desc="s7-parallel",
+            hrf_delay=hrf_delay,
+            excl_start=0,
         )
     else:
         batch_results = {s: {} for s in subjects_to_run}

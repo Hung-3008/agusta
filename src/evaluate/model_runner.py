@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from src.evaluate.config import SolverConfig
 from src.models.brainflow.brainflow import BrainFlow
+from src.evaluate.data_helpers import get_window_context
 from src.utils.utils import run_multiseed_synthesis
 
 log = logging.getLogger("evaluate")
@@ -262,6 +263,7 @@ class ModelRunner:
     @torch.inference_mode()
     def run_all_clips(
         self,
+        clip_contexts: dict[str, np.ndarray],
         clip_windows: dict[str, list[dict]],
         clip_n_trs: dict[str, int],
         subject_id: int,
@@ -271,6 +273,8 @@ class ModelRunner:
         parcel_seed_map: np.ndarray | None = None,
         return_seed_preds: bool = False,
         desc: str = "",
+        hrf_delay: int = 2,
+        excl_start: int = 0,
     ) -> dict[str, tuple]:
         """Cross-clip batched ODE inference — aggregate windows from ALL clips
         into large GPU batches for maximum throughput.
@@ -280,6 +284,7 @@ class ModelRunner:
         large GPU calls.
 
         Args:
+            clip_contexts: {clip_name: ctx_full} of full context arrays.
             clip_windows:  {clip_name: [windows]} from build_seq2seq_windows.
             clip_n_trs:    {clip_name: n_trs} total TRs per clip.
             subject_id:    Integer subject index.
@@ -289,6 +294,8 @@ class ModelRunner:
             parcel_seed_map: Optional parcel seed map for stitching.
             return_seed_preds: If True, also return per-seed predictions.
             desc:          tqdm description string.
+            hrf_delay:     HRF delay shift.
+            excl_start:    Excluded samples start index.
 
         Returns:
             {clip_name: (pred_avg, valid) or (pred_avg, valid, seed_preds)}
@@ -296,21 +303,22 @@ class ModelRunner:
         synth_kw = solver.as_synth_kwargs()
         strategy = solver.as_strategy_config()
         effective_seeds = strategy.n_seeds if strategy.ensemble_mode not in ("none", "single") else 1
+        
+        sw = self.cfg.get("sliding_window", {})
+        context_trs = sw.get("context_trs", 101)
 
         # --- Phase 1: Flatten all windows into a single array ---
         clip_names = list(clip_windows.keys())
-        all_contexts = []       # list of (T_ctx, D) arrays
         all_starts = []         # target_start per window
         all_clip_idx = []       # which clip each window belongs to
         clip_name_to_idx = {c: i for i, c in enumerate(clip_names)}
 
         for clip_name in clip_names:
             for w in clip_windows[clip_name]:
-                all_contexts.append(w["context"])
                 all_starts.append(w["target_start"])
                 all_clip_idx.append(clip_name_to_idx[clip_name])
 
-        total_windows = len(all_contexts)
+        total_windows = len(all_starts)
         if total_windows == 0:
             return {}
 
@@ -348,7 +356,26 @@ class ModelRunner:
             be = min(bi + batch_size, total_windows)
             B = be - bi
 
-            ctx_batch = np.stack(all_contexts[bi:be])
+            # Slice context on-the-fly for this batch
+            batch_clip_idx = all_clip_idx_np[bi:be]
+            batch_starts = all_starts_np[bi:be]
+
+            ctx_batch_list = []
+            for j in range(B):
+                clip_name = clip_names[batch_clip_idx[j]]
+                ctx_full = clip_contexts[clip_name]
+                ts = batch_starts[j]
+                chunk = get_window_context(
+                    ctx=ctx_full,
+                    ts=ts,
+                    context_trs=context_trs,
+                    n_target_trs=n_target_trs,
+                    hrf_delay=hrf_delay,
+                    excl_start=excl_start,
+                )
+                ctx_batch_list.append(chunk)
+
+            ctx_batch = np.stack(ctx_batch_list)
             ctx = torch.from_numpy(ctx_batch).to(self.device)
             subj = torch.full((B,), subject_id, dtype=torch.long, device=self.device)
 
@@ -364,9 +391,6 @@ class ModelRunner:
             pred_np_by_seed = [p.float().cpu().numpy() for p in preds_by_seed] if return_seed_preds else []
 
             # Scatter results back to per-clip accumulators
-            batch_clip_idx = all_clip_idx_np[bi:be]
-            batch_starts = all_starts_np[bi:be]
-
             for j in range(B):
                 clip_name = clip_names[batch_clip_idx[j]]
                 acc = accums[clip_name]
@@ -385,8 +409,6 @@ class ModelRunner:
 
             del ctx_batch, ctx, subj, pred_agg, preds_by_seed
             torch.cuda.empty_cache()
-
-        del all_contexts
 
         # --- Phase 4: Reduce accumulators to final predictions ---
         results = {}
@@ -413,6 +435,7 @@ class ModelRunner:
     @torch.inference_mode()
     def run_all_clips_multisubject(
         self,
+        clip_contexts: dict[str, np.ndarray],
         clip_windows: dict[str, list[dict]],
         clip_n_trs_per_subject: dict[str, dict[str, int]],
         subject_ids_list: list[int],
@@ -421,6 +444,8 @@ class ModelRunner:
         solver: SolverConfig,
         encode_batch_size: int | None = None,
         desc: str = "",
+        hrf_delay: int = 5,
+        excl_start: int = 0,
     ) -> dict[str, dict[str, tuple]]:
         """Multi-subject parallel inference: encode context ONCE, decode for ALL subjects.
 
@@ -429,6 +454,7 @@ class ModelRunner:
                  run ODE with mixed subject_ids, scatter results to per-subject accumulators.
 
         Args:
+            clip_contexts:           {clip_name: ctx_full} of full context arrays.
             clip_windows:           {clip_name: [windows]} — shared across subjects.
             clip_n_trs_per_subject: {subject_name: {clip_name: n_trs}} per subject.
             subject_ids_list:       list of integer subject indices to decode simultaneously.
@@ -437,6 +463,8 @@ class ModelRunner:
             solver:                 ODE solver config.
             encode_batch_size:      GPU batch size for context encoding (default: batch_size).
             desc:                   tqdm description string.
+            hrf_delay:              HRF delay shift.
+            excl_start:             Excluded samples start index.
 
         Returns:
             {subject_name: {clip_name: (pred_avg, valid)}}
@@ -449,20 +477,21 @@ class ModelRunner:
         if encode_batch_size is None:
             encode_batch_size = batch_size
 
+        sw = self.cfg.get("sliding_window", {})
+        context_trs = sw.get("context_trs", 101)
+
         # --- Phase 1: Flatten all windows ---
         clip_names = list(clip_windows.keys())
-        all_contexts = []
         all_starts = []
         all_clip_idx = []
         clip_name_to_idx = {c: i for i, c in enumerate(clip_names)}
 
         for clip_name in clip_names:
             for w in clip_windows[clip_name]:
-                all_contexts.append(w["context"])
                 all_starts.append(w["target_start"])
                 all_clip_idx.append(clip_name_to_idx[clip_name])
 
-        total_windows = len(all_contexts)
+        total_windows = len(all_starts)
         if total_windows == 0:
             return {s: {} for s in subjects}
 
@@ -478,7 +507,28 @@ class ModelRunner:
         for bi in tqdm(range(0, total_windows, encode_batch_size),
                        desc="encoding", total=(total_windows + encode_batch_size - 1) // encode_batch_size):
             be = min(bi + encode_batch_size, total_windows)
-            ctx_batch = np.stack(all_contexts[bi:be])
+            B = be - bi
+
+            # Slice context on-the-fly for this batch
+            batch_clip_idx = all_clip_idx_np[bi:be]
+            batch_starts = all_starts_np[bi:be]
+
+            ctx_batch_list = []
+            for j in range(B):
+                clip_name = clip_names[batch_clip_idx[j]]
+                ctx_full = clip_contexts[clip_name]
+                ts = batch_starts[j]
+                chunk = get_window_context(
+                    ctx=ctx_full,
+                    ts=ts,
+                    context_trs=context_trs,
+                    n_target_trs=n_target_trs,
+                    hrf_delay=hrf_delay,
+                    excl_start=excl_start,
+                )
+                ctx_batch_list.append(chunk)
+
+            ctx_batch = np.stack(ctx_batch_list)
             ctx = torch.from_numpy(ctx_batch).to(self.device)
             encoded = self.model.velocity_net.encode_context_from_cond(ctx)
             all_encoded.append(encoded.cpu())
@@ -486,7 +536,7 @@ class ModelRunner:
             torch.cuda.empty_cache()
 
         all_encoded_cat = torch.cat(all_encoded, dim=0)  # (total_windows, n_target_trs, hidden_dim)
-        del all_encoded, all_contexts
+        del all_encoded
         log.info("  Encoded context: shape=%s (%.1f MB on CPU)",
                  list(all_encoded_cat.shape),
                  all_encoded_cat.element_size() * all_encoded_cat.numel() / 1e6)

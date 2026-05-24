@@ -145,6 +145,7 @@ def run_ood(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
 
         if clip_windows:
             batch_results = runner.run_all_clips(
+                clip_contexts=context_cache,
                 clip_windows=clip_windows,
                 clip_n_trs=clip_n_trs,
                 subject_id=sid,
@@ -154,6 +155,8 @@ def run_ood(runner: ModelRunner, cfg: dict, context_dirs: list[Path],
                 parcel_seed_map=subject_seed_map,
                 return_seed_preds=False,
                 desc=subject,
+                hrf_delay=hrf_delay,
+                excl_start=0,
             )
 
             # --- Phase 3: Collect results ---
