@@ -67,6 +67,38 @@ class ModelRunner:
 
         Priority: override → best.pt (state_dict) → last.pt (EMA).
         """
+        def _adapt_sigma_net_if_needed(path: Path):
+            try:
+                ckpt = torch.load(path, map_location="cpu", weights_only=False)
+                state_dict = ckpt
+                if isinstance(ckpt, dict):
+                    if "model" in ckpt:
+                        state_dict = ckpt["model"]
+                    elif "ema" in ckpt and "shadow" in ckpt["ema"]:
+                        state_dict = ckpt["ema"]["shadow"]
+                    elif "shadow" in ckpt:
+                        state_dict = ckpt["shadow"]
+
+                weight_key = "hrf_source.sigma_net.0.weight"
+                if isinstance(state_dict, dict) and weight_key in state_dict:
+                    ckpt_shape = state_dict[weight_key].shape
+                    if hasattr(self.model, "hrf_source") and hasattr(self.model.hrf_source, "sigma_net"):
+                        current_shape = self.model.hrf_source.sigma_net[0].weight.shape
+                        if current_shape != ckpt_shape:
+                            log.info("Dynamically adapting hrf_source.sigma_net to match checkpoint shape %s", ckpt_shape)
+                            context_dim = ckpt_shape[1]
+                            hidden_dim = ckpt_shape[0]
+                            out_weight_key = "hrf_source.sigma_net.2.weight"
+                            output_dim = state_dict[out_weight_key].shape[0] if out_weight_key in state_dict else 1000
+                            self.model.hrf_source.sigma_net = torch.nn.Sequential(
+                                torch.nn.Linear(context_dim, hidden_dim),
+                                torch.nn.ReLU(),
+                                torch.nn.Linear(hidden_dim, output_dim),
+                                torch.nn.Softplus()
+                            ).to(self.device)
+            except Exception as e:
+                log.warning("Could not auto-adapt sigma_net: %s", e)
+
         def _load_full(path: Path):
             ckpt = torch.load(path, map_location=self.device, weights_only=False)
             if isinstance(ckpt, dict) and ("ema" in ckpt or "model" in ckpt):
@@ -92,14 +124,28 @@ class ModelRunner:
                     log.warning("  Unexpected keys in state_dict: %s", unexpected)
             del ckpt
 
+        # Determine target checkpoint path
+        p = None
         if override:
             p = Path(override)
             if not p.exists():
                 raise FileNotFoundError(f"Checkpoint not found: {p}")
-            log.info("Loading checkpoint (override): %s", p)
-            _load_full(p)
         elif not ema_only and (out_dir / "best.pt").exists():
             p = out_dir / "best.pt"
+        elif (out_dir / "last.pt").exists():
+            p = out_dir / "last.pt"
+        else:
+            raise FileNotFoundError(
+                f"No checkpoint found in {out_dir}. Use --checkpoint to specify a path."
+            )
+
+        # Adapt hrf_source.sigma_net layers dynamically if checkpoint size mismatch is detected
+        _adapt_sigma_net_if_needed(p)
+
+        if override:
+            log.info("Loading checkpoint (override): %s", p)
+            _load_full(p)
+        elif not ema_only and p == out_dir / "best.pt":
             log.info("Loading best.pt: %s", p)
             try:
                 ckpt = torch.load(p, map_location=self.device, weights_only=True)
@@ -112,13 +158,9 @@ class ModelRunner:
                 del ckpt
             except Exception:
                 _load_full(p)
-        elif (out_dir / "last.pt").exists():
-            log.info("Loading EMA from last.pt: %s", out_dir / 'last.pt')
-            _load_full(out_dir / "last.pt")
         else:
-            raise FileNotFoundError(
-                f"No checkpoint found in {out_dir}. Use --checkpoint to specify a path."
-            )
+            log.info("Loading EMA from last.pt: %s", p)
+            _load_full(p)
 
         self.model.eval()
 

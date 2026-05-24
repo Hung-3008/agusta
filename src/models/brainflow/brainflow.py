@@ -82,7 +82,13 @@ class BrainFlow(nn.Module):
         vn_cfg = dict(velocity_net_params or {})
         vn_cfg.setdefault("output_dim", output_dim)
         vn_cfg.setdefault("n_subjects", n_subjects)
-        self.velocity_net = VelocityNet(**vn_cfg)
+
+        # Filter out keys not accepted by VelocityNet.__init__ for backward compatibility
+        import inspect
+        vn_sig = inspect.signature(VelocityNet.__init__)
+        vn_cfg_filtered = {k: v for k, v in vn_cfg.items() if k in vn_sig.parameters}
+
+        self.velocity_net = VelocityNet(**vn_cfg_filtered)
 
         hidden_dim = vn_cfg.get("hidden_dim", 1024)
         use_subject_head = vn_cfg.get("use_subject_head", True)
